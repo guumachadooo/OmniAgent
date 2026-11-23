@@ -9,17 +9,17 @@ using Javax.Crypto.Spec;
 namespace OmniAgentAndroid.Services;
 
 /// <summary>
-/// Encrypted settings store and live activity journal for OmniAgent Companion.
-/// Secrets (256-bit Pairing Key &amp; optional GitHub Fine-Grained PAT) are encrypted strictly
-/// in Android Keystore (AES-256-GCM) and never logged or exposed in plaintext.
+/// Android Keystore AES-256-GCM encrypted persistence for OmniAgent Companion.
+/// Defaults to Always-On (<see cref="ServiceEnabled"/> = <c>true</c>) so the user never has to manually click Start.
 /// </summary>
 public sealed class OmniSettingsStore {
     const string PrefsName = "omni_agent_prefs_v1";
-    const string KeyAlias = "omni_agent_keystore_aes_v1";
+    const string KeyAlias = "omni_agent_master_aes_v1";
     const string KsPrefix = "ks1:";
 
     static readonly object logLock = new();
     static readonly List<string> activityLog = [];
+
     public static event Action ActivityChanged;
 
     readonly ISharedPreferences prefs;
@@ -29,13 +29,13 @@ public sealed class OmniSettingsStore {
     }
 
     public string RelayUrl {
-        get => prefs.GetString("relay_url", "") ?? "";
+        get => prefs.GetString("relay_url", "https://cavernize-diag-relay.gustavomponciano2.workers.dev") ?? "";
         set => prefs.Edit().PutString("relay_url", (value ?? "").Trim().TrimEnd('/')).Apply();
     }
 
     public string GitHubRepo {
         get => prefs.GetString("github_repo", "guumachadooo/Cavern") ?? "guumachadooo/Cavern";
-        set => prefs.Edit().PutString("github_repo", (value ?? "").Trim()).Apply();
+        set => prefs.Edit().PutString("github_repo", string.IsNullOrWhiteSpace(value) ? "guumachadooo/Cavern" : value.Trim()).Apply();
     }
 
     public string GitHubBranch {
@@ -43,24 +43,23 @@ public sealed class OmniSettingsStore {
         set => prefs.Edit().PutString("github_branch", string.IsNullOrWhiteSpace(value) ? "master" : value.Trim()).Apply();
     }
 
-    /// <summary>Security mode: "smart" (default, zero nagging), "biometric" (fingerprint on critical ops), or "trusted".</summary>
     public string SecurityMode {
         get => prefs.GetString("security_mode", "smart") ?? "smart";
         set => prefs.Edit().PutString("security_mode", string.IsNullOrWhiteSpace(value) ? "smart" : value.Trim().ToLowerInvariant()).Apply();
     }
 
     public string TermuxStartScript {
-        get => prefs.GetString("termux_script", "/data/data/com.termux/files/home/.omni_agent/start.sh")
-            ?? "/data/data/com.termux/files/home/.omni_agent/start.sh";
-        set => prefs.Edit().PutString("termux_script", (value ?? "").Trim()).Apply();
+        get => prefs.GetString("termux_start_script", "/data/data/com.termux/files/home/.omni_agent/start.sh") ?? "";
+        set => prefs.Edit().PutString("termux_start_script", (value ?? "").Trim()).Apply();
     }
 
+    /// <summary>Defaults to true so OmniAgent starts &amp; stays alive automatically with zero manual Start tap.</summary>
     public bool ServiceEnabled {
-        get => prefs.GetBoolean("service_enabled", false);
+        get => prefs.GetBoolean("service_enabled", true);
         set => prefs.Edit().PutBoolean("service_enabled", value).Apply();
     }
 
-    /// <summary>Enables Zero-Secret P-256 ECDH Smart Knock approval overlay when running.</summary>
+    /// <summary>Enables Zero-Secret P-256 ECDH Smart Knock native system biometric prompt.</summary>
     public bool SmartKnockEnabled {
         get => prefs.GetBoolean("smart_knock_enabled", true);
         set => prefs.Edit().PutBoolean("smart_knock_enabled", value).Apply();
@@ -80,6 +79,26 @@ public sealed class OmniSettingsStore {
     public string CloudflareWorkerName {
         get => prefs.GetString("cf_worker_name", "") ?? "";
         set => prefs.Edit().PutString("cf_worker_name", (value ?? "").Trim()).Apply();
+    }
+
+    public int LocalFsPort {
+        get => prefs.GetInt("local_fs_port", 47921);
+        set => prefs.Edit().PutInt("local_fs_port", Math.Clamp(value, 1024, 65535)).Apply();
+    }
+
+    public string LastExplorerPath {
+        get => prefs.GetString("last_explorer_path", "/root/.gemini/antigravity/scratch/Cavern") ?? "/root/.gemini/antigravity/scratch/Cavern";
+        set => prefs.Edit().PutString("last_explorer_path", string.IsNullOrWhiteSpace(value) ? "/root" : value.Trim()).Apply();
+    }
+
+    public string CachedCavernizeDesignTokensJson {
+        get => prefs.GetString("cavernize_design_tokens_json", "") ?? "";
+        set => prefs.Edit().PutString("cavernize_design_tokens_json", value ?? "").Apply();
+    }
+
+    public string LastDesignSyncUtc {
+        get => prefs.GetString("last_design_sync_utc", "") ?? "";
+        set => prefs.Edit().PutString("last_design_sync_utc", value ?? "").Apply();
     }
 
     public bool HasPairSecret => !string.IsNullOrEmpty(LoadPairSecretHex());
@@ -162,8 +181,8 @@ public sealed class OmniSettingsStore {
         string line = $"[{DateTime.Now:HH:mm:ss}] [{tag}] {message}";
         lock (logLock) {
             activityLog.Insert(0, line);
-            if (activityLog.Count > 120) {
-                activityLog.RemoveRange(120, activityLog.Count - 120);
+            if (activityLog.Count > 140) {
+                activityLog.RemoveRange(140, activityLog.Count - 140);
             }
         }
         try {

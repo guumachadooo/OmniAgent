@@ -2,94 +2,104 @@ using Android.App;
 using Android.Content;
 using Android.Content.PM;
 using Android.Graphics;
-using Android.Graphics.Drawables;
 using Android.OS;
-using Android.Provider;
 using Android.Text;
-using Android.Util;
 using Android.Views;
 using Android.Widget;
+using Android.Window;
 
+using CavernizeAndroid.Theme;
+using CavernizeAndroid.Views;
+
+using OmniAgentAndroid.Language;
 using OmniAgentAndroid.Services;
 
 namespace OmniAgentAndroid;
 
 /// <summary>
-/// One UI 9 inspired AMOLED dashboard for OmniAgent Companion (Phase 2).
-/// Zero stock AlertDialog/Spinner, strict BaselineAligned=false anti-clipping,
-/// dynamic WindowInsets safe-area padding, runtime Termux RUN_COMMAND permission flow,
-/// and system-following locale with live Auto / PT-BR / EN switcher.
+/// Main One UI 9 shell for OmniAgent Companion v2.1+.
+/// Inherits CavernizeAndroid's exact One UI 9 design kit (<see cref="OneUiTheme"/>,
+/// <see cref="OneUiBackdropView"/>, <see cref="OneUiFrostedCapsuleView"/>, <see cref="OneUiModalDialog"/>,
+/// <see cref="OneUiInlineSelector"/>, <see cref="OneUiIconView"/>) with zero-quota automatic design sync.
 /// </summary>
 [Activity(
     Label = "OmniAgent",
     MainLauncher = true,
-    Exported = true,
-    ConfigurationChanges = ConfigChanges.Orientation | ConfigChanges.ScreenSize | ConfigChanges.UiMode | ConfigChanges.Locale | ConfigChanges.LayoutDirection)]
-public sealed class MainActivity : Activity {
-    const int ReqPostNotifications = 101;
-    const int ReqTermuxRunCommand = 102;
+    Theme = "@style/OmniAgentTheme",
+    LaunchMode = LaunchMode.SingleTask,
+    ConfigurationChanges = ConfigChanges.Orientation | ConfigChanges.ScreenSize | ConfigChanges.ScreenLayout | ConfigChanges.SmallestScreenSize | ConfigChanges.UiMode | ConfigChanges.KeyboardHidden)]
+public sealed partial class MainActivity : Activity {
+    const int ReqPostNotifications = 4101;
+    const int ReqTermuxRunCommand = 4102;
 
-    const string TermuxBootstrapCmd =
-        "mkdir -p ~/.termux && (grep -qxF 'allow-external-apps=true' ~/.termux/termux.properties 2>/dev/null || echo 'allow-external-apps=true' >> ~/.termux/termux.properties) && (termux-reload-settings 2>/dev/null || true) && proot-distro login debian -- bash -lc 'cd /root/.gemini/antigravity/scratch/Cavern && (git stash push -u -m \"backup-pre-w41\" || true) && git pull --rebase origin master && bash .agents/agent/install_termux_agent.sh --bg'";
-
-    static readonly Color BgDark = Color.ParseColor("#09090B");
-    static readonly Color CardBg = Color.ParseColor("#16161B");
-    static readonly Color CardElevated = Color.ParseColor("#202028");
-    static readonly Color AccentBlue = Color.ParseColor("#2F7CF6");
-    static readonly Color AccentGreen = Color.ParseColor("#22C55E");
-    static readonly Color AccentRed = Color.ParseColor("#EF4444");
-    static readonly Color TextPrimary = Color.ParseColor("#F4F4F6");
-    static readonly Color TextSecondary = Color.ParseColor("#9CA3AF");
-    static readonly Color StrokeColor = Color.ParseColor("#2A2A35");
+    const int TabHubIndex = 0;
+    const int TabFilesIndex = 1;
+    const int TabBridgeIndex = 2;
+    const int TabSettingsIndex = 3;
 
     OmniSettingsStore store;
-    bool isPt;
-    bool pendingTermuxWake;
-    int insetTopPx;
-    int insetBottomPx;
+    OneUiBackdropView backdropView;
+    FrameLayout contentHost;
+    OneUiFrostedCapsuleView bottomDock;
+    readonly ScrollView[] tabScrolls = new ScrollView[4];
+    readonly LinearLayout[] tabRoots = new LinearLayout[4];
+    readonly LinearLayout[] dockTabItems = new LinearLayout[4];
+    readonly OneUiIconView[] dockTabIcons = new OneUiIconView[4];
+    readonly TextView[] dockTabLabels = new TextView[4];
+    int activeTabIndex = TabHubIndex;
+    int topInsetPx;
+    int bottomInsetPx;
+    bool designSyncChecked;
+    IOnBackInvokedCallback predictiveBackCallback;
 
-    LinearLayout contentLayout;
-    TextView statusBadge;
-    TextView statusSubtitle;
-    Button toggleServiceBtn;
-    Button langBtn;
-    Button modeSmartBtn;
-    Button modeBioBtn;
-    Button modeTrustedBtn;
-    TextView relaySummaryTv;
-    TextView githubSummaryTv;
-    TextView cloudflareSummaryTv;
-    TextView logViewTv;
-    Button overlayPermBtn;
-    Button batteryPermBtn;
-    Button cavernizeLinkBtn;
-    FrameLayout modalOverlay;
+    static OmniStrings S => OmniStrings.Active;
+    Typeface FontBold => OneUiTheme.GetAppleFontBold(this);
+    Typeface FontMedium => OneUiTheme.GetAppleFontMedium(this);
+    Typeface FontRegular => OneUiTheme.GetAppleFontRegular(this);
 
     protected override void OnCreate(Bundle savedInstanceState) {
         base.OnCreate(savedInstanceState);
+
         store = new OmniSettingsStore(this);
-        isPt = ResolveIsPt();
+        OmniStrings.Refresh(store.UiLanguage);
 
-        if (OperatingSystem.IsAndroidVersionAtLeast(33)) {
-            if (CheckSelfPermission(Android.Manifest.Permission.PostNotifications) != Permission.Granted) {
-                RequestPermissions([Android.Manifest.Permission.PostNotifications], ReqPostNotifications);
-            }
-        }
+        // Apply shared Cavernize One UI 9 theme + cached live Cavernize design tokens immediately.
+        OneUiTheme.Initialize(this);
+        CavernizeDesignSyncService.ApplyCachedTokensIfPresent(this);
 
-        BuildUi();
-        OmniAgentForegroundService.StateChanged += OnServiceOrLogChanged;
-        OmniSettingsStore.ActivityChanged += OnServiceOrLogChanged;
-        RefreshUi();
+        ConfigureEdgeToEdge();
+        BuildShellUi();
+        RegisterPredictiveBack();
+        RequestInitialPermissions();
+
+        // Zero-click Always-On automation: ensure foreground bridge & persisted watchdog run automatically.
+        OmniAgentForegroundService.EnsureAlwaysOn(this);
+
+        OmniAgentForegroundService.StateChanged += OnServiceOrActivityChanged;
+        OmniSettingsStore.ActivityChanged += OnServiceOrActivityChanged;
+
+        RefreshAllVisibleState();
+        _ = LoadHubSnapshotAsync(silent: false);
+        _ = SyncCavernizeDesignInBackgroundAsync();
     }
 
     protected override void OnResume() {
         base.OnResume();
-        RefreshUi();
+        OmniAgentForegroundService.EnsureAlwaysOn(this);
+        RefreshAllVisibleState();
+        bottomDock?.RefreshBlur(force: true);
     }
 
     protected override void OnDestroy() {
-        OmniAgentForegroundService.StateChanged -= OnServiceOrLogChanged;
-        OmniSettingsStore.ActivityChanged -= OnServiceOrLogChanged;
+        OmniAgentForegroundService.StateChanged -= OnServiceOrActivityChanged;
+        OmniSettingsStore.ActivityChanged -= OnServiceOrActivityChanged;
+        if (OperatingSystem.IsAndroidVersionAtLeast(33) && predictiveBackCallback != null) {
+            try {
+                OnBackInvokedDispatcher?.UnregisterOnBackInvokedCallback(predictiveBackCallback);
+            } catch {
+                // Ignore if already unregistered during teardown.
+            }
+        }
         base.OnDestroy();
     }
 
@@ -97,864 +107,534 @@ public sealed class MainActivity : Activity {
         base.OnRequestPermissionsResult(requestCode, permissions, grantResults);
         if (requestCode == ReqTermuxRunCommand) {
             bool granted = grantResults is { Length: > 0 } && grantResults[0] == Permission.Granted;
-            bool shouldRetry = pendingTermuxWake;
-            pendingTermuxWake = false;
             if (granted) {
-                OmniSettingsStore.AppendActivity("PERM", T("Termux RUN_COMMAND permission granted.", "Permissão Termux RUN_COMMAND concedida."));
-                if (shouldRetry) {
-                    DispatchSmartTermuxWake();
+                (bool ok, _, _, string msg) = OmniAgentForegroundService.LaunchTermuxSmartDaemon(this, store.TermuxStartScript);
+                OmniSettingsStore.AppendActivity("TERMUX", msg);
+                ShowToast(msg);
+                if (ok) {
+                    _ = DelayedRefreshAfterTermuxWakeAsync();
                 }
             } else {
-                OmniSettingsStore.AppendActivity("ERR", T("Termux RUN_COMMAND permission denied.", "Permissão Termux RUN_COMMAND negada."));
-                ShowTermuxSetupSheet(permissionDenied: true);
+                ShowToast(S["TermuxOpenPermsBtn"]);
             }
         }
+        RefreshAllVisibleState();
     }
 
-    void OnServiceOrLogChanged() => RunOnUiThread(RefreshUi);
-
-    bool ResolveIsPt() {
-        string pref = store?.UiLanguage ?? "auto";
-        if (pref == "pt") {
-            return true;
+    void ConfigureEdgeToEdge() {
+        if (Window == null) {
+            return;
         }
-        if (pref == "en") {
-            return false;
+        if (OperatingSystem.IsAndroidVersionAtLeast(30)) {
+            Window.SetDecorFitsSystemWindows(false);
+        } else {
+#pragma warning disable CA1422
+            Window.DecorView.SystemUiVisibility = (StatusBarVisibility)(
+                SystemUiFlags.LayoutStable |
+                SystemUiFlags.LayoutFullscreen |
+                SystemUiFlags.LayoutHideNavigation);
+#pragma warning restore CA1422
         }
-        try {
-            if (OperatingSystem.IsAndroidVersionAtLeast(24)) {
-                LocaleList locales = Resources?.Configuration?.Locales;
-                if (locales != null && locales.Size() > 0) {
-                    string primaryLang = locales.Get(0)?.Language;
-                    if (!string.IsNullOrEmpty(primaryLang)) {
-                        return string.Equals(primaryLang, "pt", StringComparison.OrdinalIgnoreCase);
-                    }
-                }
-            }
-        } catch {
-            // Fall back to JVM default locale below
+        if (!OperatingSystem.IsAndroidVersionAtLeast(35)) {
+#pragma warning disable CA1422
+            Window.SetStatusBarColor(Color.Transparent);
+            Window.SetNavigationBarColor(Color.Transparent);
+#pragma warning restore CA1422
         }
-        return string.Equals(Java.Util.Locale.Default?.Language, "pt", StringComparison.OrdinalIgnoreCase);
-    }
-
-    void CycleLanguage() {
-        string next = store.UiLanguage switch {
-            "auto" => "pt",
-            "pt" => "en",
-            _ => "auto"
-        };
-        store.UiLanguage = next;
-        isPt = ResolveIsPt();
-        BuildUi();
-        RefreshUi();
-    }
-
-    string FormatLangBadge() => store.UiLanguage switch {
-        "pt" => "PT-BR",
-        "en" => "EN",
-        _ => isPt ? "Auto · PT" : "Auto · EN"
-    };
-
-    string T(string en, string pt) => isPt ? pt : en;
-
-    int Dp(int v) => (int)Math.Round(TypedValue.ApplyDimension(ComplexUnitType.Dip, v, Resources.DisplayMetrics));
-
-    GradientDrawable Pill(Color fill, int radiusDp, Color? stroke = null) {
-        GradientDrawable g = new();
-        g.SetColor(fill);
-        g.SetCornerRadius(Dp(radiusDp));
-        if (stroke.HasValue) {
-            g.SetStroke(Dp(1), stroke.Value);
-        }
-        return g;
-    }
-
-    void ApplySafeAreaPadding() {
-        if (contentLayout != null) {
-            int hPad = Dp(18);
-            int topPad = Math.Max(Dp(20), insetTopPx + Dp(14));
-            int bottomPad = Math.Max(Dp(32), insetBottomPx + Dp(24));
-            contentLayout.SetPadding(hPad, topPad, hPad, bottomPad);
-        }
-        if (modalOverlay != null) {
-            modalOverlay.SetPadding(0, insetTopPx, 0, insetBottomPx);
+        if (OperatingSystem.IsAndroidVersionAtLeast(29)) {
+            Window.NavigationBarContrastEnforced = false;
         }
     }
 
-    void BuildUi() {
-        FrameLayout rootFrame = new(this) {
-            LayoutParameters = new ViewGroup.LayoutParams(ViewGroup.LayoutParams.MatchParent, ViewGroup.LayoutParams.MatchParent)
+    void RegisterPredictiveBack() {
+        if (!OperatingSystem.IsAndroidVersionAtLeast(33)) {
+            return;
+        }
+        predictiveBackCallback = new OmniBackCallback(HandleBackNavigation);
+        OnBackInvokedDispatcher?.RegisterOnBackInvokedCallback(0, predictiveBackCallback);
+    }
+
+    void HandleBackNavigation() {
+        if (OneUiModalDialog.DismissAllActiveDialogs() > 0) {
+            return;
+        }
+        if (activeTabIndex == TabFilesIndex && TryNavigateFilesUp()) {
+            return;
+        }
+        if (activeTabIndex != TabHubIndex) {
+            SelectTab(TabHubIndex);
+            return;
+        }
+        MoveTaskToBack(true);
+    }
+
+    void RequestInitialPermissions() {
+        if (OperatingSystem.IsAndroidVersionAtLeast(33) &&
+            CheckSelfPermission(Android.Manifest.Permission.PostNotifications) != Permission.Granted) {
+            RequestPermissions([Android.Manifest.Permission.PostNotifications], ReqPostNotifications);
+        }
+    }
+
+    void BuildShellUi() {
+        FrameLayout root = new(this);
+        root.SetBackgroundColor(OneUiTheme.BgScreen);
+
+        backdropView = new OneUiBackdropView(this);
+        root.AddView(backdropView, new FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MatchParent, ViewGroup.LayoutParams.MatchParent));
+
+        contentHost = new FrameLayout(this);
+        root.AddView(contentHost, new FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MatchParent, ViewGroup.LayoutParams.MatchParent));
+
+        for (int i = 0; i < 4; i++) {
+            ScrollView sv = new(this) {
+                FillViewport = true,
+                VerticalScrollBarEnabled = false,
+                OverScrollMode = OverScrollMode.Always,
+                Visibility = i == activeTabIndex ? ViewStates.Visible : ViewStates.Gone,
+            };
+            sv.SetClipToPadding(false);
+
+            LinearLayout container = new(this) { Orientation = Orientation.Vertical };
+            container.SetPadding(Dp(16), Dp(14), Dp(16), Dp(116));
+            sv.AddView(container, new ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MatchParent, ViewGroup.LayoutParams.WrapContent));
+
+            sv.ViewTreeObserver.ScrollChanged += (_, _) => bottomDock?.RefreshBlur(force: false);
+
+            tabScrolls[i] = sv;
+            tabRoots[i] = container;
+            contentHost.AddView(sv, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MatchParent, ViewGroup.LayoutParams.MatchParent));
+        }
+
+        BuildHubTab(tabRoots[TabHubIndex]);
+        BuildFilesTab(tabRoots[TabFilesIndex]);
+        BuildBridgeTab(tabRoots[TabBridgeIndex]);
+        BuildSettingsTab(tabRoots[TabSettingsIndex]);
+
+        bottomDock = BuildFloatingBottomDock();
+        FrameLayout.LayoutParams dockLp = new(ViewGroup.LayoutParams.MatchParent, ViewGroup.LayoutParams.WrapContent) {
+            Gravity = GravityFlags.Bottom | GravityFlags.CenterHorizontal,
+            LeftMargin = Dp(18),
+            RightMargin = Dp(18),
+            BottomMargin = Dp(16),
         };
-        rootFrame.SetBackgroundColor(BgDark);
+        root.AddView(bottomDock, dockLp);
 
-        ScrollView scroll = new(this) {
-            LayoutParameters = new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MatchParent, ViewGroup.LayoutParams.MatchParent),
-            FillViewport = true
-        };
-        scroll.SetClipToPadding(false);
-
-        contentLayout = new LinearLayout(this) {
-            Orientation = Orientation.Vertical,
-            LayoutParameters = new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MatchParent, ViewGroup.LayoutParams.WrapContent)
-        };
-
-        // Header Row (Title + Live Auto/PT-BR/EN Language Switcher)
-        LinearLayout headerRow = MakeRow();
-        TextView title = new(this) { Text = "OmniAgent", TextSize = 28 };
-        title.SetTextColor(TextPrimary);
-        title.SetTypeface(Typeface.DefaultBold, TypefaceStyle.Bold);
-        headerRow.AddView(title, MakeWeightedLp(1f, rightMarginDp: 8));
-
-        langBtn = MakeButton(FormatLangBadge(), CardElevated, TextPrimary, false);
-        langBtn.SetPadding(Dp(12), Dp(6), Dp(12), Dp(6));
-        langBtn.SetMinHeight(Dp(34));
-        langBtn.Background = Pill(CardElevated, 18, StrokeColor);
-        langBtn.Click += (_, _) => CycleLanguage();
-        headerRow.AddView(langBtn);
-        contentLayout.AddView(headerRow);
-
-        TextView subtitle = new(this) {
-            Text = T("Unified Hub v6 • Zero-Trust E2E • Cavernize Bridge", "Hub Unificado v6 • E2E Zero-Trust • Ponte Cavernize"),
-            TextSize = 13
-        };
-        subtitle.SetTextColor(TextSecondary);
-        subtitle.SetPadding(0, Dp(2), 0, Dp(16));
-        contentLayout.AddView(subtitle);
-
-        // 1. Live Status Card
-        LinearLayout statusCard = MakeCard();
-        LinearLayout statusRow = MakeRow();
-        statusBadge = new TextView(this) { TextSize = 13 };
-        statusBadge.SetTypeface(Typeface.DefaultBold, TypefaceStyle.Bold);
-        statusBadge.SetPadding(Dp(12), Dp(5), Dp(12), Dp(5));
-        statusBadge.SetSingleLine(true);
-        statusRow.AddView(statusBadge);
-        statusCard.AddView(statusRow);
-
-        statusSubtitle = new TextView(this) { TextSize = 13 };
-        statusSubtitle.SetTextColor(TextSecondary);
-        statusSubtitle.SetPadding(0, Dp(8), 0, Dp(14));
-        statusCard.AddView(statusSubtitle);
-
-        LinearLayout actionRow = MakeRow();
-        toggleServiceBtn = MakeButton(T("Start Agent", "Ligar Agente"), AccentBlue, TextPrimary, true);
-        toggleServiceBtn.Click += (_, _) => ToggleService();
-        actionRow.AddView(toggleServiceBtn, MakeWeightedLp(1f, rightMarginDp: 8));
-
-        Button termuxBtn = MakeButton(T("Wake Termux", "Acordar Termux"), CardElevated, TextPrimary, false);
-        termuxBtn.Click += (_, _) => TriggerWakeTermux();
-        actionRow.AddView(termuxBtn, MakeWeightedLp(1f, leftMarginDp: 0));
-        statusCard.AddView(actionRow);
-        contentLayout.AddView(statusCard);
-
-        // 2. Instant Popup & Background Resilience Card
-        LinearLayout sysCard = MakeCard();
-        sysCard.AddView(MakeCardTitle(T("Instant Fingerprint Popup & Background", "Popup Instantâneo & 2º Plano")));
-        TextView sysDesc = new(this) {
-            Text = T(
-                "Grant 'Appear on top' so biometric approval pops instantly over any app without tapping a notification, and set Battery to Unrestricted.",
-                "Ative 'Sobrepor a outros apps' para a digital aparecer direto na tela sem tocar em notificação, e deixe Bateria sem restrições."),
-            TextSize = 12
-        };
-        sysDesc.SetTextColor(TextSecondary);
-        sysDesc.SetPadding(0, Dp(4), 0, Dp(12));
-        sysCard.AddView(sysDesc);
-
-        LinearLayout permRow = MakeRow();
-        overlayPermBtn = MakeButton(T("Instant Popup", "Popup Tela"), CardElevated, TextPrimary, false);
-        overlayPermBtn.Click += (_, _) => OpenOverlayPermissionSettings();
-        permRow.AddView(overlayPermBtn, MakeWeightedLp(1f, rightMarginDp: 8));
-
-        batteryPermBtn = MakeButton(T("Battery", "Bateria"), CardElevated, TextPrimary, false);
-        batteryPermBtn.Click += (_, _) => RequestUnrestrictedBattery();
-        permRow.AddView(batteryPermBtn, MakeWeightedLp(1f));
-        sysCard.AddView(permRow);
-
-        cavernizeLinkBtn = MakeButton(T("Cavernize Local IPC", "Ponte Local Cavernize"), CardElevated, TextPrimary, false);
-        LinearLayout.LayoutParams cavLp = new(ViewGroup.LayoutParams.MatchParent, ViewGroup.LayoutParams.WrapContent);
-        cavLp.SetMargins(0, Dp(8), 0, 0);
-        cavernizeLinkBtn.Click += (_, _) => OpenCavernizeApp();
-        sysCard.AddView(cavernizeLinkBtn, cavLp);
-        contentLayout.AddView(sysCard);
-
-        // 3. Security Mode Card (never nags with fingerprint in Smart mode!)
-        LinearLayout secCard = MakeCard();
-        secCard.AddView(MakeCardTitle(T("Approval Policy", "Política de Aprovação")));
-        TextView secDesc = new(this) {
-            Text = T(
-                "Smart mode uses 256-bit E2E HMAC silently with zero fingerprint popups. Switch to Biometric only if you want fingerprint prompts on push/deploy/install.",
-                "Modo Smart usa HMAC E2E de 256 bits sem popups chatos de digital. Troque para Digital apenas se quiser confirmar push/deploy/instalação."),
-            TextSize = 12
-        };
-        secDesc.SetTextColor(TextSecondary);
-        secDesc.SetPadding(0, Dp(4), 0, Dp(12));
-        secCard.AddView(secDesc);
-
-        LinearLayout modeRow = MakeRow();
-        modeSmartBtn = MakeModeButton("Smart", "smart");
-        modeBioBtn = MakeModeButton(T("Biometric", "Digital"), "biometric");
-        modeTrustedBtn = MakeModeButton(T("Trusted", "Livre"), "trusted");
-        modeRow.AddView(modeSmartBtn, MakeWeightedLp(1f, rightMarginDp: 6));
-        modeRow.AddView(modeBioBtn, MakeWeightedLp(1f, rightMarginDp: 6));
-        modeRow.AddView(modeTrustedBtn, MakeWeightedLp(1f));
-        secCard.AddView(modeRow);
-        contentLayout.AddView(secCard);
-
-        // 4. Unified Connections Card (Cloudflare Relay + Cloudflare Auto-Deploy + Direct GitHub Push + Termux Setup)
-        LinearLayout connCard = MakeCard();
-        connCard.AddView(MakeCardTitle(T("Hub, Cloudflare & GitHub", "Hub, Cloudflare & GitHub")));
-
-        relaySummaryTv = new TextView(this) { TextSize = 12 };
-        relaySummaryTv.SetTextColor(TextSecondary);
-        relaySummaryTv.SetPadding(0, Dp(6), 0, Dp(4));
-        connCard.AddView(relaySummaryTv);
-
-        cloudflareSummaryTv = new TextView(this) { TextSize = 12 };
-        cloudflareSummaryTv.SetTextColor(TextSecondary);
-        cloudflareSummaryTv.SetPadding(0, 0, 0, Dp(4));
-        connCard.AddView(cloudflareSummaryTv);
-
-        githubSummaryTv = new TextView(this) { TextSize = 12 };
-        githubSummaryTv.SetTextColor(TextSecondary);
-        githubSummaryTv.SetPadding(0, 0, 0, Dp(12));
-        connCard.AddView(githubSummaryTv);
-
-        LinearLayout cfgRow = MakeRow();
-        Button cfgRelayBtn = MakeButton(T("Relay & Key", "Worker & Chave"), CardElevated, TextPrimary, false);
-        cfgRelayBtn.Click += (_, _) => ShowRelayConfigSheet();
-        cfgRow.AddView(cfgRelayBtn, MakeWeightedLp(1f, rightMarginDp: 8));
-
-        Button cfgCfBtn = MakeButton(T("CF Auto-Deploy", "Deploy CF"), CardElevated, TextPrimary, false);
-        cfgCfBtn.Click += (_, _) => ShowCloudflareDeploySheet();
-        cfgRow.AddView(cfgCfBtn, MakeWeightedLp(1f));
-        connCard.AddView(cfgRow);
-
-        LinearLayout cfgRow2 = MakeRow();
-        cfgRow2.SetPadding(0, Dp(8), 0, 0);
-        Button cfgGhBtn = MakeButton(T("GitHub Push", "GitHub Push"), CardElevated, TextPrimary, false);
-        cfgGhBtn.Click += (_, _) => ShowGitHubConfigSheet();
-        cfgRow2.AddView(cfgGhBtn, MakeWeightedLp(1f, rightMarginDp: 8));
-
-        Button termuxSetupBtn = MakeButton(T("Termux / Debian", "Termux / Debian"), CardElevated, TextSecondary, false);
-        termuxSetupBtn.Click += (_, _) => ShowTermuxSetupSheet(permissionDenied: false);
-        cfgRow2.AddView(termuxSetupBtn, MakeWeightedLp(1f));
-        connCard.AddView(cfgRow2);
-        contentLayout.AddView(connCard);
-
-        // 5. Live Activity Journal
-        LinearLayout logCard = MakeCard();
-        LinearLayout logHeader = MakeRow();
-        TextView logTitle = MakeCardTitle(T("Live Agent Activity", "Atividade do Agente"));
-        logHeader.AddView(logTitle, MakeWeightedLp(1f));
-        Button clearBtn = MakeButton(T("Clear", "Limpar"), CardElevated, TextSecondary, false);
-        clearBtn.SetPadding(Dp(12), Dp(4), Dp(12), Dp(4));
-        clearBtn.Click += (_, _) => OmniSettingsStore.ClearActivity();
-        logHeader.AddView(clearBtn);
-        logCard.AddView(logHeader);
-
-        logViewTv = new TextView(this) { TextSize = 11 };
-        logViewTv.SetTypeface(Typeface.Monospace, TypefaceStyle.Normal);
-        logViewTv.SetTextColor(TextSecondary);
-        logViewTv.SetPadding(0, Dp(10), 0, 0);
-        logCard.AddView(logViewTv);
-        contentLayout.AddView(logCard);
-
-        scroll.AddView(contentLayout);
-        rootFrame.AddView(scroll);
-
-        // Custom One UI 9 Modal Overlay (zero stock AlertDialog!)
-        modalOverlay = new FrameLayout(this) {
-            Visibility = ViewStates.Gone,
-            Clickable = true,
-            Focusable = true,
-            LayoutParameters = new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MatchParent, ViewGroup.LayoutParams.MatchParent)
-        };
-        modalOverlay.SetBackgroundColor(Color.Argb(185, 0, 0, 0));
-        modalOverlay.Click += (_, _) => HideModal();
-        rootFrame.AddView(modalOverlay);
-
-        ApplySafeAreaPadding();
-        rootFrame.SetOnApplyWindowInsetsListener(new SafeAreaInsetsListener((top, bottom) => {
-            insetTopPx = top;
-            insetBottomPx = bottom;
-            ApplySafeAreaPadding();
+        root.SetOnApplyWindowInsetsListener(new OmniInsetsListener((top, bottom) => {
+            topInsetPx = top;
+            bottomInsetPx = bottom;
+            ApplySafeAreaInsets();
         }));
 
-        SetContentView(rootFrame);
-        rootFrame.RequestApplyInsets();
+        SetContentView(root);
+        SelectTab(TabHubIndex);
     }
 
-    void OpenOverlayPermissionSettings() {
-        try {
-            if (OperatingSystem.IsAndroidVersionAtLeast(23)) {
-                Intent intent = new(Settings.ActionManageOverlayPermission, Android.Net.Uri.Parse($"package:{PackageName}"));
-                StartActivity(intent);
-            }
-        } catch {
-            Toast.MakeText(this, T("Open Settings -> Apps -> OmniAgent -> Appear on top", "Abra Configurações -> Apps -> OmniAgent -> Aparecer sobre outros"), ToastLength.Long)?.Show();
+    OneUiFrostedCapsuleView BuildFloatingBottomDock() {
+        OneUiFrostedCapsuleView dock = new(this) {
+            CornerRadiusDp = 30f,
+            BehindViewsProvider = () => [backdropView, contentHost],
+        };
+        dock.SetPadding(Dp(6), Dp(6), Dp(6), Dp(6));
+
+        LinearLayout row = new(this) {
+            Orientation = Orientation.Horizontal,
+            BaselineAligned = false,
+        };
+        row.SetGravity(GravityFlags.CenterVertical);
+
+        (string label, OneUiIconType icon)[] tabs = [
+            (S["TabHub"], OneUiIconType.Sparkles),
+            (S["TabFiles"], OneUiIconType.Folder),
+            (S["TabBridge"], OneUiIconType.Bolt),
+            (S["TabSettings"], OneUiIconType.Gear),
+        ];
+
+        for (int i = 0; i < tabs.Length; i++) {
+            int idx = i;
+            LinearLayout item = new(this) {
+                Orientation = Orientation.Vertical,
+                Clickable = true,
+                Focusable = true,
+            };
+            item.SetGravity(GravityFlags.Center);
+            item.SetPadding(Dp(4), Dp(8), Dp(4), Dp(8));
+
+            OneUiIconView iconView = new(this, tabs[i].icon, OneUiTheme.TextMuted);
+            item.AddView(iconView, new LinearLayout.LayoutParams(Dp(20), Dp(20)));
+
+            TextView labelTv = new(this) {
+                Text = tabs[i].label,
+                TextSize = 11f,
+                Typeface = FontMedium,
+                Gravity = GravityFlags.Center,
+            };
+            labelTv.SetSingleLine(true);
+            labelTv.Ellipsize = TextUtils.TruncateAt.End;
+            labelTv.SetPadding(0, Dp(3), 0, 0);
+            item.AddView(labelTv, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MatchParent, ViewGroup.LayoutParams.WrapContent));
+
+            OneUiTheme.AttachRecoil(item, 0.94f);
+            item.Click += (_, _) => SelectTab(idx);
+
+            dockTabItems[i] = item;
+            dockTabIcons[i] = iconView;
+            dockTabLabels[i] = labelTv;
+
+            row.AddView(item, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WrapContent, 1f));
+        }
+
+        dock.AddView(row, new FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MatchParent, ViewGroup.LayoutParams.WrapContent));
+        return dock;
+    }
+
+    void ApplySafeAreaInsets() {
+        int topPad = Math.Max(Dp(14), topInsetPx + Dp(8));
+        int bottomPad = Math.Max(Dp(116), bottomInsetPx + Dp(106));
+        for (int i = 0; i < tabRoots.Length; i++) {
+            tabRoots[i]?.SetPadding(Dp(16), topPad, Dp(16), bottomPad);
+        }
+        if (bottomDock?.LayoutParameters is FrameLayout.LayoutParams lp) {
+            lp.BottomMargin = Math.Max(Dp(16), bottomInsetPx + Dp(10));
+            bottomDock.LayoutParameters = lp;
         }
     }
 
-    void RequestUnrestrictedBattery() {
-        try {
-            if (OperatingSystem.IsAndroidVersionAtLeast(23)) {
-                Intent intent = new(Settings.ActionRequestIgnoreBatteryOptimizations, Android.Net.Uri.Parse($"package:{PackageName}"));
-                StartActivity(intent);
-                return;
+    void SelectTab(int index) {
+        activeTabIndex = Math.Clamp(index, 0, 3);
+        for (int i = 0; i < 4; i++) {
+            bool selected = i == activeTabIndex;
+            if (tabScrolls[i] != null) {
+                tabScrolls[i].Visibility = selected ? ViewStates.Visible : ViewStates.Gone;
             }
-        } catch {
-            // Fallback to battery optimization list
-        }
-        try {
-            if (OperatingSystem.IsAndroidVersionAtLeast(23)) {
-                StartActivity(new Intent(Settings.ActionIgnoreBatteryOptimizationSettings));
+            if (dockTabItems[i] != null) {
+                dockTabItems[i].Background = selected
+                    ? OneUiTheme.CreateRoundedDrawable(
+                        this,
+                        OneUiTheme.WithAlpha(OneUiTheme.Primary, 56),
+                        24f,
+                        OneUiTheme.WithAlpha(OneUiTheme.Primary, 110),
+                        1f)
+                    : null;
             }
-        } catch {
-            Intent details = new(Settings.ActionApplicationDetailsSettings, Android.Net.Uri.FromParts("package", PackageName, null));
-            StartActivity(details);
+            if (dockTabIcons[i] != null) {
+                dockTabIcons[i].IconColor = selected ? OneUiTheme.Primary : OneUiTheme.TextMuted;
+            }
+            if (dockTabLabels[i] != null) {
+                dockTabLabels[i].SetTextColor(selected ? OneUiTheme.TextPrimary : OneUiTheme.TextMuted);
+                dockTabLabels[i].Typeface = selected ? FontBold : FontMedium;
+            }
         }
+
+        if (activeTabIndex == TabFilesIndex && !filesInitialized) {
+            _ = LoadDirectoryAsync(store.LastExplorerPath, showSpinner: true);
+        }
+        if (activeTabIndex == TabBridgeIndex) {
+            RefreshBridgeTabState();
+        }
+        if (activeTabIndex == TabSettingsIndex) {
+            RefreshSettingsTabState();
+        }
+        bottomDock?.Post(() => bottomDock?.RefreshBlur(force: true));
     }
 
-    void OpenCavernizeApp() {
-        Intent launch = PackageManager?.GetLaunchIntentForPackage(CavernizeIpcBridgeClient.CavernizePackage);
-        if (launch != null) {
-            launch.AddFlags(ActivityFlags.NewTask);
-            StartActivity(launch);
-        } else {
-            OpenUrl("https://github.com/guumachadooo/Cavern/releases/tag/android-latest");
+    void OnServiceOrActivityChanged() {
+        RunOnUiThread(() => {
+            RefreshBridgeTabState();
+            RefreshSettingsTabState();
+        });
+    }
+
+    void RefreshAllVisibleState() {
+        RefreshBridgeTabState();
+        RefreshSettingsTabState();
+    }
+
+    async Task SyncCavernizeDesignInBackgroundAsync() {
+        if (designSyncChecked) {
+            return;
+        }
+        designSyncChecked = true;
+        string prevJson = store.CachedCavernizeDesignTokensJson;
+        (bool ok, _) = await CavernizeDesignSyncService.SyncFromCavernizeAsync(this).ConfigureAwait(false);
+        if (!ok) {
+            return;
+        }
+        string nextJson = store.CachedCavernizeDesignTokensJson;
+        RunOnUiThread(() => {
+            RefreshSettingsTabState();
+            if (!string.Equals(prevJson, nextJson, StringComparison.Ordinal)) {
+                Recreate();
+            }
+        });
+    }
+
+    async Task DelayedRefreshAfterTermuxWakeAsync() {
+        await Task.Delay(2400).ConfigureAwait(false);
+        await LoadHubSnapshotAsync(silent: true).ConfigureAwait(false);
+        if (activeTabIndex == TabFilesIndex) {
+            await LoadDirectoryAsync(currentExplorerPath, showSpinner: false).ConfigureAwait(false);
+        }
+        RunOnUiThread(RefreshBridgeTabState);
+    }
+
+    // ── Shared One UI 9 Layout & Component Helpers ───────────────────────────────────────
+
+    int Dp(float v) => OneUiTheme.Dp(this, v);
+
+    LinearLayout MakeTabHeader(string title, string subtitle, OneUiIconType icon, Color badgeColor, View trailingAction = null) {
+        LinearLayout header = MakeHRow();
+        header.SetPadding(Dp(2), Dp(4), Dp(2), Dp(14));
+
+        header.AddView(OneUiTheme.CreateVectorIconBadge(this, icon, badgeColor, 40));
+
+        LinearLayout texts = new(this) { Orientation = Orientation.Vertical };
+        texts.SetPadding(Dp(12), 0, Dp(8), 0);
+
+        TextView titleTv = new(this) {
+            Text = title,
+            TextSize = 23f,
+            Typeface = FontBold,
+        };
+        titleTv.SetTextColor(OneUiTheme.TextPrimary);
+        titleTv.SetSingleLine(true);
+        titleTv.Ellipsize = TextUtils.TruncateAt.End;
+        texts.AddView(titleTv);
+
+        if (!string.IsNullOrWhiteSpace(subtitle)) {
+            TextView subTv = new(this) {
+                Text = subtitle,
+                TextSize = 12.5f,
+                Typeface = FontRegular,
+            };
+            subTv.SetTextColor(OneUiTheme.TextSub);
+            subTv.SetSingleLine(true);
+            subTv.Ellipsize = TextUtils.TruncateAt.End;
+            texts.AddView(subTv);
+        }
+
+        header.AddView(texts, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WrapContent, 1f));
+        if (trailingAction != null) {
+            header.AddView(trailingAction);
+        }
+        return header;
+    }
+
+    LinearLayout MakeGlassCard(float cornerDp = 0f) {
+        float radius = cornerDp > 0f ? cornerDp : OneUiTheme.EffectiveCardCornerDp;
+        LinearLayout card = new(this) { Orientation = Orientation.Vertical };
+        card.Background = OneUiTheme.CreateGlassCardDrawable(this, OneUiTheme.SurfaceCard, radius);
+        card.SetPadding(Dp(18), Dp(16), Dp(18), Dp(16));
+        LinearLayout.LayoutParams lp = new(ViewGroup.LayoutParams.MatchParent, ViewGroup.LayoutParams.WrapContent) {
+            BottomMargin = Dp(14),
+        };
+        card.LayoutParameters = lp;
+        return card;
+    }
+
+    LinearLayout MakeHRow() {
+        LinearLayout row = new(this) {
+            Orientation = Orientation.Horizontal,
+            BaselineAligned = false,
+        };
+        row.SetGravity(GravityFlags.CenterVertical);
+        return row;
+    }
+
+    LinearLayout MakeCardHeader(string title, OneUiIconType icon, Color badgeColor, Action onHelp = null, View trailingView = null) {
+        LinearLayout row = MakeHRow();
+        row.SetPadding(0, 0, 0, Dp(10));
+
+        row.AddView(OneUiTheme.CreateVectorIconBadge(this, icon, badgeColor, 30));
+
+        TextView tv = new(this) {
+            Text = title,
+            TextSize = 15.5f,
+            Typeface = FontBold,
+        };
+        tv.SetTextColor(OneUiTheme.TextPrimary);
+        tv.SetSingleLine(true);
+        tv.Ellipsize = TextUtils.TruncateAt.End;
+        tv.SetPadding(Dp(10), 0, Dp(8), 0);
+        row.AddView(tv, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WrapContent, 1f));
+
+        if (trailingView != null) {
+            row.AddView(trailingView);
+        }
+
+        if (onHelp != null) {
+            FrameLayout helpBtn = new(this) {
+                Clickable = true,
+                Focusable = true,
+                ContentDescription = title,
+            };
+            helpBtn.Background = OneUiTheme.CreateRippleRoundedDrawable(
+                this,
+                OneUiTheme.WithAlpha(OneUiTheme.Primary, 28),
+                14f,
+                OneUiTheme.WithAlpha(OneUiTheme.Primary, 80),
+                1f);
+            OneUiIconView qIcon = new(this, OneUiIconType.HelpQuestion, OneUiTheme.Primary);
+            FrameLayout.LayoutParams iconLp = new(Dp(16), Dp(16)) { Gravity = GravityFlags.Center };
+            helpBtn.AddView(qIcon, iconLp);
+            OneUiTheme.AttachRecoil(helpBtn, 0.92f);
+            helpBtn.Click += (_, _) => onHelp();
+
+            LinearLayout.LayoutParams hlp = new(Dp(30), Dp(30)) { LeftMargin = Dp(6) };
+            row.AddView(helpBtn, hlp);
+        }
+        return row;
+    }
+
+    Button MakeActionPill(string text, bool primary = false, Color? customFill = null, Color? customText = null) {
+        Color fill = customFill ?? (primary ? OneUiTheme.Primary : OneUiTheme.SurfaceElevated);
+        Color fg = customText ?? (primary ? Color.White : OneUiTheme.TextPrimary);
+        Color stroke = primary
+            ? OneUiTheme.WithAlpha(Color.White, 48)
+            : OneUiTheme.WithAlpha(Color.White, 34);
+
+        Button btn = new(this) {
+            Text = text,
+            TextSize = 13f,
+            Typeface = primary ? FontBold : FontMedium,
+            AllCaps = false,
+        };
+        btn.SetTextColor(fg);
+        btn.SetSingleLine(true);
+        btn.Ellipsize = TextUtils.TruncateAt.End;
+        btn.SetPadding(Dp(14), Dp(10), Dp(14), Dp(10));
+        btn.SetMinimumHeight(Dp(42));
+        btn.SetMinHeight(Dp(42));
+        btn.Background = OneUiTheme.CreateRippleRoundedDrawable(this, fill, OneUiTheme.EffectiveButtonCornerDp, stroke, 1f);
+        OneUiTheme.AttachRecoil(btn, 0.96f);
+        return btn;
+    }
+
+    TextView MakeSectionLabel(string text) {
+        TextView tv = new(this) {
+            Text = text,
+            TextSize = 12f,
+            Typeface = FontBold,
+        };
+        tv.SetTextColor(OneUiTheme.TextSub);
+        tv.SetPadding(Dp(4), Dp(4), Dp(4), Dp(8));
+        return tv;
+    }
+
+    TextView MakeFieldLabel(string text) {
+        TextView tv = new(this) {
+            Text = text,
+            TextSize = 12f,
+            Typeface = FontMedium,
+        };
+        tv.SetTextColor(OneUiTheme.TextSub);
+        tv.SetPadding(0, Dp(8), 0, Dp(4));
+        return tv;
+    }
+
+    EditText MakeInput(string hint, string initialValue, bool isSecret = false) {
+        EditText et = new(this) {
+            Hint = hint,
+            Text = initialValue ?? "",
+            TextSize = 13.5f,
+            Typeface = FontRegular,
+            InputType = isSecret
+                ? InputTypes.ClassText | InputTypes.TextVariationPassword
+                : InputTypes.ClassText | InputTypes.TextFlagNoSuggestions,
+        };
+        et.SetTextColor(OneUiTheme.TextPrimary);
+        et.SetHintTextColor(OneUiTheme.TextMuted);
+        et.SetPadding(Dp(14), Dp(11), Dp(14), Dp(11));
+        et.Background = OneUiTheme.CreateRoundedDrawable(
+            this,
+            OneUiTheme.SurfaceModalRow,
+            14f,
+            OneUiTheme.WithAlpha(Color.White, 38),
+            1f);
+        return et;
+    }
+
+    (LinearLayout row, OneUiSwitch sw) MakeSwitchRow(string label, string subtitle, bool initialChecked, Action<bool> onChanged) {
+        LinearLayout row = MakeHRow();
+        row.SetPadding(0, Dp(6), 0, Dp(6));
+
+        LinearLayout texts = new(this) { Orientation = Orientation.Vertical };
+        TextView lbl = new(this) {
+            Text = label,
+            TextSize = 14f,
+            Typeface = FontMedium,
+        };
+        lbl.SetTextColor(OneUiTheme.TextPrimary);
+        texts.AddView(lbl);
+
+        if (!string.IsNullOrWhiteSpace(subtitle)) {
+            TextView sub = new(this) {
+                Text = subtitle,
+                TextSize = 12f,
+                Typeface = FontRegular,
+            };
+            sub.SetTextColor(OneUiTheme.TextMuted);
+            texts.AddView(sub);
+        }
+
+        OneUiSwitch sw = new(this) { Checked = initialChecked };
+        sw.CheckedChange += (_, e) => onChanged?.Invoke(e.IsChecked);
+
+        row.AddView(texts, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WrapContent, 1f));
+        LinearLayout.LayoutParams swLp = new(ViewGroup.LayoutParams.WrapContent, ViewGroup.LayoutParams.WrapContent) {
+            LeftMargin = Dp(10),
+        };
+        row.AddView(sw, swLp);
+        return (row, sw);
+    }
+
+    void CopyToClipboard(string label, string text) {
+        if (GetSystemService(ClipboardService) is ClipboardManager cm) {
+            cm.PrimaryClip = ClipData.NewPlainText(label, text ?? "");
+            ShowToast(S["FilesCopiedToast"]);
         }
     }
 
     void OpenUrl(string url) {
         try {
             StartActivity(new Intent(Intent.ActionView, Android.Net.Uri.Parse(url)));
-        } catch {
-            Toast.MakeText(this, url, ToastLength.Long)?.Show();
+        } catch (Exception ex) {
+            ShowToast(ex.Message);
         }
     }
 
-    void TriggerWakeTermux() {
-        if (!OmniAgentForegroundService.IsPackageInstalled(this, "com.termux")) {
-            string msg = T("Termux is not installed.", "O app Termux não está instalado.");
-            OmniSettingsStore.AppendActivity("ERR", msg);
-            Toast.MakeText(this, msg, ToastLength.Short)?.Show();
+    void ShowToast(string message) {
+        if (string.IsNullOrWhiteSpace(message)) {
             return;
         }
-        if (!OmniAgentForegroundService.HasTermuxPermission(this)) {
-            pendingTermuxWake = true;
-            OmniSettingsStore.AppendActivity("PERM", T("Requesting Termux RUN_COMMAND permission...", "Solicitando permissão Termux RUN_COMMAND..."));
-            RequestPermissions([OmniAgentForegroundService.TermuxRunCommandPermission], ReqTermuxRunCommand);
-            return;
-        }
-        DispatchSmartTermuxWake();
+        RunOnUiThread(() => Android.Widget.Toast.MakeText(this, message, ToastLength.Short)?.Show());
     }
 
-    void DispatchSmartTermuxWake() {
-        (bool ok, bool needsPermission, bool needsExternalApps, string msg) =
-            OmniAgentForegroundService.LaunchTermuxSmartDaemon(this, store.TermuxStartScript);
-        OmniSettingsStore.AppendActivity(ok ? "TERMUX" : "ERR", msg);
-        Toast.MakeText(this, ok ? T("Wake sent to Termux / Debian!", "Comando enviado ao Termux / Debian!") : msg, ToastLength.Short)?.Show();
-        if (!ok && (needsPermission || needsExternalApps)) {
-            ShowTermuxSetupSheet(permissionDenied: needsPermission);
-        }
-    }
-
-    void ShowTermuxSetupSheet(bool permissionDenied) {
-        LinearLayout sheet = CreateSheet(T("Termux & Debian One-Time Setup", "Configuração Única do Termux & Debian"));
-
-        TextView desc = new(this) {
-            Text = permissionDenied
-                ? T(
-                    "Android blocked the Termux RUN_COMMAND permission. Tap App Permissions below to enable 'Run commands in Termux environment', then run the setup command once in Termux.",
-                    "O Android bloqueou a permissão RUN_COMMAND do Termux. Toque em Permissões abaixo para ativar 'Executar comandos no Termux' e depois cole o comando abaixo uma única vez no Termux.")
-                : T(
-                    "Copy the command below, open Termux, paste it once and press Enter. It enables allow-external-apps=true, updates Cavern inside Debian, and starts the background agent.",
-                    "Copie o comando abaixo, abra o Termux, cole uma única vez e aperte Enter. Ele ativa allow-external-apps=true, atualiza o Cavern no Debian e liga o agente em segundo plano."),
-            TextSize = 12
-        };
-        desc.SetTextColor(TextSecondary);
-        desc.SetPadding(0, 0, 0, Dp(10));
-        sheet.AddView(desc);
-
-        TextView cmdBox = new(this) {
-            Text = TermuxBootstrapCmd,
-            TextSize = 11,
-            Background = Pill(CardElevated, 14, StrokeColor)
-        };
-        cmdBox.SetTypeface(Typeface.Monospace, TypefaceStyle.Normal);
-        cmdBox.SetTextColor(TextPrimary);
-        cmdBox.SetPadding(Dp(12), Dp(10), Dp(12), Dp(10));
-        sheet.AddView(cmdBox);
-
-        LinearLayout row1 = MakeRow();
-        row1.SetPadding(0, Dp(12), 0, 0);
-        Button copyBtn = MakeButton(T("Copy Command", "Copiar Comando"), AccentBlue, TextPrimary, true);
-        copyBtn.Click += (_, _) => {
-            Android.Content.ClipboardManager cm = (Android.Content.ClipboardManager)GetSystemService(ClipboardService);
-            if (cm != null) {
-                cm.PrimaryClip = ClipData.NewPlainText("OmniAgent Termux Setup", TermuxBootstrapCmd);
-            }
-            Toast.MakeText(this, T("Command copied!", "Comando copiado!"), ToastLength.Short)?.Show();
-        };
-        row1.AddView(copyBtn, MakeWeightedLp(1f, rightMarginDp: 8));
-
-        Button openTermuxBtn = MakeButton(T("Open Termux", "Abrir Termux"), CardElevated, TextPrimary, false);
-        openTermuxBtn.Click += (_, _) => {
-            Intent launch = PackageManager?.GetLaunchIntentForPackage("com.termux");
-            if (launch != null) {
-                launch.AddFlags(ActivityFlags.NewTask);
-                StartActivity(launch);
-            } else {
-                Toast.MakeText(this, T("Termux not found.", "Termux não encontrado."), ToastLength.Short)?.Show();
-            }
-        };
-        row1.AddView(openTermuxBtn, MakeWeightedLp(1f));
-        sheet.AddView(row1);
-
-        LinearLayout row2 = MakeRow();
-        row2.SetPadding(0, Dp(8), 0, 0);
-        Button permsBtn = MakeButton(T("App Permissions", "Permissões do App"), CardElevated, TextPrimary, false);
-        permsBtn.Click += (_, _) => {
-            Intent intent = new(Settings.ActionApplicationDetailsSettings);
-            intent.SetData(Android.Net.Uri.FromParts("package", PackageName, null));
-            StartActivity(intent);
-        };
-        row2.AddView(permsBtn, MakeWeightedLp(1f, rightMarginDp: 8));
-
-        Button closeBtn = MakeButton(T("Close", "Fechar"), CardElevated, TextSecondary, false);
-        closeBtn.Click += (_, _) => HideModal();
-        row2.AddView(closeBtn, MakeWeightedLp(1f));
-        sheet.AddView(row2);
-
-        PresentSheet(sheet);
-    }
-
-    Button MakeModeButton(string label, string modeValue) {
-        Button b = MakeButton(label, CardElevated, TextPrimary, false);
-        b.Click += (_, _) => {
-            store.SecurityMode = modeValue;
-            OmniSettingsStore.AppendActivity("SEC", $"Security mode -> {modeValue}");
-            RefreshUi();
-        };
-        return b;
-    }
-
-    void ToggleService() {
-        if (OmniAgentForegroundService.IsRunning) {
-            store.ServiceEnabled = false;
-            OmniAgentForegroundService.Stop(this);
-        } else {
-            if (!store.HasPairSecret || !OmniSettingsStore.TryNormalizeRelayUrl(store.RelayUrl, out _)) {
-                ShowRelayConfigSheet();
-                return;
-            }
-            store.ServiceEnabled = true;
-            OmniAgentForegroundService.Start(this);
-        }
-        RefreshUi();
-    }
-
-    void RefreshUi() {
-        if (statusBadge == null) {
-            return;
-        }
-        bool running = OmniAgentForegroundService.IsRunning;
-        statusBadge.Text = running
-            ? T("● ONLINE (channel: android)", "● ONLINE (canal: android)")
-            : T("○ STANDBY OFF", "○ DESLIGADO");
-        statusBadge.SetTextColor(running ? AccentGreen : TextSecondary);
-        statusBadge.Background = Pill(running ? Color.Argb(36, 34, 197, 94) : CardElevated, 20);
-
-        statusSubtitle.Text = running
-            ? T(
-                $"Unified Hub v6 bridge active • {OmniAgentForegroundService.CommandsHandled} cmd(s) handled",
-                $"Ponte Hub Unificado v6 ativa • {OmniAgentForegroundService.CommandsHandled} comando(s)")
-            : T(
-                "Tap Start Agent for remote Cavernize bridge, Cloudflare auto-deploy, GitHub push & Termux wake.",
-                "Toque em Ligar Agente para ponte Cavernize, auto-deploy Cloudflare, GitHub push e Termux.");
-
-        toggleServiceBtn.Text = running ? T("Stop Agent", "Parar Agente") : T("Start Agent", "Ligar Agente");
-        toggleServiceBtn.Background = Pill(running ? AccentRed : AccentBlue, 18);
-        if (langBtn != null) {
-            langBtn.Text = FormatLangBadge();
-        }
-
-        if (overlayPermBtn != null) {
-            bool okOv = OmniKnockApprovalActivity.CanDrawInstantOverlay(this);
-            overlayPermBtn.Text = okOv ? T("✓ Instant Popup", "✓ Popup Tela") : T("! Instant Popup", "! Ativar Popup");
-            overlayPermBtn.SetTextColor(okOv ? AccentGreen : AccentRed);
-            overlayPermBtn.Background = Pill(okOv ? Color.Argb(32, 34, 197, 94) : CardElevated, 14, okOv ? null : AccentRed);
-        }
-        if (batteryPermBtn != null) {
-            bool okBat = OmniAgentForegroundService.IsBatteryUnrestricted(this);
-            batteryPermBtn.Text = okBat ? T("✓ Battery Free", "✓ Bateria Livre") : T("! Battery Free", "! Bateria Livre");
-            batteryPermBtn.SetTextColor(okBat ? AccentGreen : AccentRed);
-            batteryPermBtn.Background = Pill(okBat ? Color.Argb(32, 34, 197, 94) : CardElevated, 14, okBat ? null : AccentRed);
-        }
-        if (cavernizeLinkBtn != null) {
-            bool cavInst = OmniAgentForegroundService.IsPackageInstalled(this, CavernizeIpcBridgeClient.CavernizePackage);
-            bool cavSig = cavInst && CavernizeIpcBridgeClient.IsSignatureVerified(this);
-            cavernizeLinkBtn.Text = cavSig
-                ? T("✓ Cavernize Local IPC Connected — Open App", "✓ Ponte Local Cavernize Ativa — Abrir App")
-                : (cavInst
-                    ? T("! Cavernize Installed (Update APK for IPC)", "! Cavernize Instalado (Atualize para IPC)")
-                    : T("Install Cavernize Android", "Baixar Cavernize Android"));
-            cavernizeLinkBtn.SetTextColor(cavSig ? AccentGreen : TextPrimary);
-        }
-
-        string mode = store.SecurityMode;
-        StyleModeBtn(modeSmartBtn, mode == "smart");
-        StyleModeBtn(modeBioBtn, mode == "biometric");
-        StyleModeBtn(modeTrustedBtn, mode == "trusted");
-
-        string pairDisp = store.HasPairSecret ? OmniCrypto.FormatPairKeyDisplay(store.LoadPairSecretHex()) : T("Not paired", "Sem chave");
-        relaySummaryTv.Text = $"Worker: {(string.IsNullOrEmpty(store.RelayUrl) ? T("Not set", "Não configurado") : store.RelayUrl)}  •  {T("Key", "Chave")}: {pairDisp}";
-        if (cloudflareSummaryTv != null) {
-            cloudflareSummaryTv.Text = $"Cloudflare Auto-Deploy: {store.ResolveEffectiveWorkerName()}  •  Token: {(store.HasCloudflareToken ? T("Encrypted in Keystore", "Salvo no Keystore") : T("Not set", "Não configurado"))}";
-        }
-        githubSummaryTv.Text = $"GitHub: {store.GitHubRepo} ({store.GitHubBranch})  •  PAT: {(store.HasGitHubPat ? T("Encrypted in Keystore", "Salvo no Keystore") : T("Optional", "Opcional"))}";
-
-        List<string> lines = OmniSettingsStore.GetActivitySnapshot();
-        logViewTv.Text = lines.Count == 0
-            ? T("No commands yet. Start the agent or wake Termux daemon.", "Nenhum comando ainda. Ligue o agente ou acorde o daemon no Termux.")
-            : string.Join("\n", lines.Take(18));
-    }
-
-    void StyleModeBtn(Button btn, bool selected) {
-        btn.Background = Pill(selected ? AccentBlue : CardElevated, 14, selected ? null : StrokeColor);
-        btn.SetTextColor(selected ? TextPrimary : TextSecondary);
-    }
-
-    void ShowRelayConfigSheet() {
-        LinearLayout sheet = CreateSheet(T("Cloudflare Relay & Pairing Key", "Cloudflare Worker & Chave de Pareamento"));
-        EditText urlInput = MakeInput(T("https://cavernize-diag-relay.xxx.workers.dev", "https://cavernize-diag-relay.xxx.workers.dev"), store.RelayUrl, false);
-        EditText keyInput = MakeInput(T("Paste 64-hex CAVPAIR key", "Cole a chave CAVPAIR (64 hex)"), store.LoadPairSecretHex(), false);
-
-        sheet.AddView(MakeFieldLabel("Cloudflare Worker URL"));
-        sheet.AddView(urlInput);
-        sheet.AddView(MakeFieldLabel(T("256-bit Pairing Key (AES-256-GCM Keystore)", "Chave 256-bit (Keystore AES-256-GCM)")));
-        sheet.AddView(keyInput);
-
-        TextView healthResultTv = new(this) { Text = "", TextSize = 12, Visibility = ViewStates.Gone };
-        healthResultTv.SetPadding(0, Dp(8), 0, 0);
-        sheet.AddView(healthResultTv);
-
-        LinearLayout btnRow = MakeRow();
-        btnRow.SetPadding(0, Dp(14), 0, 0);
-        Button testBtn = MakeButton(T("Test", "Testar"), CardElevated, TextPrimary, false);
-        testBtn.Click += async (_, _) => {
-            healthResultTv.Visibility = ViewStates.Visible;
-            healthResultTv.SetTextColor(TextSecondary);
-            healthResultTv.Text = T("Testing Worker /health...", "Testando Worker /health...");
-            (bool ok, _, _, string detail) = await OmniAgentForegroundService.TestRelayHealthAsync(urlInput.Text);
-            RunOnUiThread(() => {
-                healthResultTv.SetTextColor(ok ? AccentGreen : AccentRed);
-                healthResultTv.Text = ok ? $"✓ {detail}" : $"✗ {detail}";
-            });
-        };
-        btnRow.AddView(testBtn, MakeWeightedLp(1f, rightMarginDp: 6));
-
-        Button genBtn = MakeButton(T("Generate", "Gerar"), CardElevated, TextPrimary, false);
-        genBtn.Click += (_, _) => keyInput.Text = OmniCrypto.GeneratePairSecretHex();
-        btnRow.AddView(genBtn, MakeWeightedLp(1f, rightMarginDp: 6));
-
-        Button saveBtn = MakeButton(T("Save", "Salvar"), AccentBlue, TextPrimary, true);
-        saveBtn.Click += (_, _) => {
-            if (!OmniSettingsStore.TryNormalizeRelayUrl(urlInput.Text, out string normUrl)) {
-                Toast.MakeText(this, T("Invalid https:// Worker URL", "URL https:// inválida"), ToastLength.Short)?.Show();
-                return;
-            }
-            string normKey = OmniCrypto.NormalizePairSecretHex(keyInput.Text);
-            if (string.IsNullOrEmpty(normKey)) {
-                Toast.MakeText(this, T("Key must be 64 hex chars", "Chave precisa ter 64 caracteres hex"), ToastLength.Short)?.Show();
-                return;
-            }
-            store.RelayUrl = normUrl;
-            store.SavePairSecretHex(normKey);
-            OmniSettingsStore.AppendActivity("CFG", "Saved Cloudflare Worker URL & Keystore pairing key.");
-            HideModal();
-            RefreshUi();
-        };
-        btnRow.AddView(saveBtn, MakeWeightedLp(1f));
-        sheet.AddView(btnRow);
-
-        LinearLayout knockRow = MakeRow();
-        knockRow.SetPadding(0, Dp(8), 0, 0);
-        Button knockToggleBtn = MakeButton(
-            store.SmartKnockEnabled
-                ? T("Smart Knock: ON", "Smart Knock: ATIVO")
-                : T("Smart Knock: OFF", "Smart Knock: DESLIGADO"),
-            store.SmartKnockEnabled ? Color.Argb(45, 34, 197, 94) : CardElevated,
-            store.SmartKnockEnabled ? AccentGreen : TextSecondary,
-            false);
-        knockToggleBtn.Click += (_, _) => {
-            store.SmartKnockEnabled = !store.SmartKnockEnabled;
-            knockToggleBtn.Text = store.SmartKnockEnabled
-                ? T("Smart Knock: ON", "Smart Knock: ATIVO")
-                : T("Smart Knock: OFF", "Smart Knock: DESLIGADO");
-            knockToggleBtn.Background = Pill(store.SmartKnockEnabled ? Color.Argb(45, 34, 197, 94) : CardElevated, 14);
-            knockToggleBtn.SetTextColor(store.SmartKnockEnabled ? AccentGreen : TextSecondary);
-        };
-        knockRow.AddView(knockToggleBtn, MakeWeightedLp(1f, rightMarginDp: 6));
-
-        Button copyKnockBtn = MakeButton(T("Copy Public Knock ID", "Copiar Knock ID Público"), CardElevated, TextPrimary, false);
-        copyKnockBtn.Click += (_, _) => {
-            string normK = OmniCrypto.NormalizePairSecretHex(keyInput.Text);
-            if (string.IsNullOrEmpty(normK)) {
-                normK = store.LoadPairSecretHex();
-            }
-            string kid = OmniCrypto.ComputeKnockChannelId(normK);
-            if (string.IsNullOrEmpty(kid)) {
-                Toast.MakeText(this, T("Generate or save a 64-hex key first", "Gere ou salve uma chave de 64 hex primeiro"), ToastLength.Short)?.Show();
-                return;
-            }
-            if (GetSystemService(ClipboardService) is Android.Content.ClipboardManager cm) {
-                cm.PrimaryClip = ClipData.NewPlainText("OmniAgent Public Knock ID", kid);
-                Toast.MakeText(this, T("Public Knock ID copied (safe, zero secrets)!", "Knock ID Público copiado (seguro, sem segredos)!"), ToastLength.Long)?.Show();
-            }
-        };
-        knockRow.AddView(copyKnockBtn, MakeWeightedLp(1.2f));
-        sheet.AddView(knockRow);
-
-        PresentSheet(sheet);
-    }
-
-    void ShowCloudflareDeploySheet() {
-        LinearLayout sheet = CreateSheet(T("Cloudflare Auto-Deploy (Keystore)", "Auto-Deploy Cloudflare (Keystore)"));
-        TextView desc = new(this) {
-            Text = T(
-                "Save a Cloudflare API Token (Edit Cloudflare Workers template) once in Android Keystore so AI Studio can update your Worker & Durable Objects automatically without manual uploads.",
-                "Salve um Token de API Cloudflare (modelo 'Edit Cloudflare Workers') uma única vez no Keystore para a IA atualizar seu Worker e Durable Objects automaticamente sem upload manual."),
-            TextSize = 12
-        };
-        desc.SetTextColor(TextSecondary);
-        desc.SetPadding(0, 0, 0, Dp(6));
-        sheet.AddView(desc);
-
-        EditText tokenInput = MakeInput(T("Cloudflare API Token (leave empty to keep)", "Token API Cloudflare (vazio mantém atual)"), "", true);
-        EditText workerInput = MakeInput(store.ResolveEffectiveWorkerName(), store.CloudflareWorkerName, false);
-        EditText accInput = MakeInput(T("Optional (auto-detected)", "Opcional (detectado automático)"), store.CloudflareAccountId, false);
-
-        sheet.AddView(MakeFieldLabel(T("Cloudflare API Token (AES-256-GCM Keystore)", "Token API Cloudflare (Keystore AES-256-GCM)")));
-        sheet.AddView(tokenInput);
-        sheet.AddView(MakeFieldLabel(T("Worker Name (optional)", "Nome do Worker (opcional)")));
-        sheet.AddView(workerInput);
-        sheet.AddView(MakeFieldLabel(T("Account ID (optional)", "Account ID (opcional)")));
-        sheet.AddView(accInput);
-
-        TextView testTv = new(this) { Text = "", TextSize = 12, Visibility = ViewStates.Gone };
-        testTv.SetPadding(0, Dp(8), 0, 0);
-        sheet.AddView(testTv);
-
-        LinearLayout linkRow = MakeRow();
-        linkRow.SetPadding(0, Dp(10), 0, 0);
-        Button openCfBtn = MakeButton(T("Create CF Token", "Criar Token CF"), CardElevated, TextPrimary, false);
-        openCfBtn.Click += (_, _) => OpenUrl("https://dash.cloudflare.com/profile/api-tokens");
-        linkRow.AddView(openCfBtn, MakeWeightedLp(1f, rightMarginDp: 8));
-
-        Button testBtn = MakeButton(T("Test Token", "Testar Token"), CardElevated, TextPrimary, false);
-        testBtn.Click += async (_, _) => {
-            string tok = string.IsNullOrWhiteSpace(tokenInput.Text) ? store.LoadCloudflareToken() : tokenInput.Text.Trim();
-            testTv.Visibility = ViewStates.Visible;
-            testTv.SetTextColor(TextSecondary);
-            testTv.Text = T("Verifying Cloudflare API Token...", "Verificando Token Cloudflare...");
-            (bool ok, string accId, _, string msg) = await CloudflareDeployService.TestTokenAsync(tok);
-            RunOnUiThread(() => {
-                testTv.SetTextColor(ok ? AccentGreen : AccentRed);
-                testTv.Text = ok ? $"✓ {msg}" : $"✗ {msg}";
-                if (ok && string.IsNullOrWhiteSpace(accInput.Text) && !string.IsNullOrEmpty(accId)) {
-                    accInput.Text = accId;
-                }
-            });
-        };
-        linkRow.AddView(testBtn, MakeWeightedLp(1f));
-        sheet.AddView(linkRow);
-
-        LinearLayout btnRow = MakeRow();
-        btnRow.SetPadding(0, Dp(10), 0, 0);
-        Button cancelBtn = MakeButton(T("Cancel", "Cancelar"), CardElevated, TextSecondary, false);
-        cancelBtn.Click += (_, _) => HideModal();
-        btnRow.AddView(cancelBtn, MakeWeightedLp(1f, rightMarginDp: 8));
-
-        Button saveBtn = MakeButton(T("Save", "Salvar"), AccentBlue, TextPrimary, true);
-        saveBtn.Click += (_, _) => {
-            if (!string.IsNullOrWhiteSpace(tokenInput.Text)) {
-                store.SaveCloudflareToken(tokenInput.Text);
-            }
-            store.CloudflareWorkerName = workerInput.Text;
-            store.CloudflareAccountId = accInput.Text;
-            OmniSettingsStore.AppendActivity("CFG", $"Saved Cloudflare Auto-Deploy config (worker={store.ResolveEffectiveWorkerName()}).");
-            HideModal();
-            RefreshUi();
-        };
-        btnRow.AddView(saveBtn, MakeWeightedLp(1f));
-        sheet.AddView(btnRow);
-        PresentSheet(sheet);
-    }
-
-    void ShowGitHubConfigSheet() {
-        LinearLayout sheet = CreateSheet(T("Direct GitHub Push (Optional)", "GitHub Push Direto (Opcional)"));
-        EditText repoInput = MakeInput("guumachadooo/Cavern", store.GitHubRepo, false);
-        EditText branchInput = MakeInput("master", store.GitHubBranch, false);
-        EditText patInput = MakeInput(T("Fine-Grained PAT (Contents: Read & Write)", "Fine-Grained PAT (Contents: Read & Write)"), "", true);
-
-        sheet.AddView(MakeFieldLabel(T("Repository (owner/repo)", "Repositório (dono/repo)")));
-        sheet.AddView(repoInput);
-        sheet.AddView(MakeFieldLabel("Branch"));
-        sheet.AddView(branchInput);
-        sheet.AddView(MakeFieldLabel(T("GitHub PAT (leave empty to keep current)", "GitHub PAT (deixe vazio para manter atual)")));
-        sheet.AddView(patInput);
-
-        Button openGhBtn = MakeButton(T("Create GitHub Fine-Grained Token", "Criar Token GitHub (Fine-Grained)"), CardElevated, TextPrimary, false);
-        LinearLayout.LayoutParams ghLp = new(ViewGroup.LayoutParams.MatchParent, ViewGroup.LayoutParams.WrapContent);
-        ghLp.SetMargins(0, Dp(10), 0, 0);
-        openGhBtn.Click += (_, _) => OpenUrl("https://github.com/settings/personal-access-tokens/new");
-        sheet.AddView(openGhBtn, ghLp);
-
-        LinearLayout btnRow = MakeRow();
-        btnRow.SetPadding(0, Dp(10), 0, 0);
-        Button cancelBtn = MakeButton(T("Cancel", "Cancelar"), CardElevated, TextSecondary, false);
-        cancelBtn.Click += (_, _) => HideModal();
-        btnRow.AddView(cancelBtn, MakeWeightedLp(1f, rightMarginDp: 8));
-
-        Button saveBtn = MakeButton(T("Save", "Salvar"), AccentBlue, TextPrimary, true);
-        saveBtn.Click += (_, _) => {
-            store.GitHubRepo = repoInput.Text;
-            store.GitHubBranch = branchInput.Text;
-            if (!string.IsNullOrWhiteSpace(patInput.Text)) {
-                store.SaveGitHubPat(patInput.Text);
-            }
-            OmniSettingsStore.AppendActivity("CFG", $"Updated GitHub config ({store.GitHubRepo}@{store.GitHubBranch}).");
-            HideModal();
-            RefreshUi();
-        };
-        btnRow.AddView(saveBtn, MakeWeightedLp(1f));
-        sheet.AddView(btnRow);
-        PresentSheet(sheet);
-    }
-
-    LinearLayout CreateSheet(string titleText) {
-        LinearLayout sheet = new(this) {
-            Orientation = Orientation.Vertical,
-            Clickable = true,
-            Background = Pill(CardBg, 26, StrokeColor)
-        };
-        sheet.SetPadding(Dp(20), Dp(20), Dp(20), Dp(22));
-        TextView t = new(this) { Text = titleText, TextSize = 17 };
-        t.SetTextColor(TextPrimary);
-        t.SetTypeface(Typeface.DefaultBold, TypefaceStyle.Bold);
-        t.SetPadding(0, 0, 0, Dp(12));
-        sheet.AddView(t);
-        return sheet;
-    }
-
-    void PresentSheet(LinearLayout sheet) {
-        modalOverlay.RemoveAllViews();
-        FrameLayout.LayoutParams lp = new(ViewGroup.LayoutParams.MatchParent, ViewGroup.LayoutParams.WrapContent) {
-            Gravity = GravityFlags.Bottom
-        };
-        lp.SetMargins(Dp(12), Dp(12), Dp(12), Dp(20));
-        modalOverlay.AddView(sheet, lp);
-        modalOverlay.Visibility = ViewStates.Visible;
-    }
-
-    void HideModal() {
-        modalOverlay.Visibility = ViewStates.Gone;
-        modalOverlay.RemoveAllViews();
-    }
-
-    LinearLayout MakeCard() {
-        LinearLayout card = new(this) {
-            Orientation = Orientation.Vertical,
-            Background = Pill(CardBg, 24, StrokeColor)
-        };
-        card.SetPadding(Dp(16), Dp(16), Dp(16), Dp(16));
-        LinearLayout.LayoutParams lp = new(ViewGroup.LayoutParams.MatchParent, ViewGroup.LayoutParams.WrapContent);
-        lp.SetMargins(0, 0, 0, Dp(14));
-        card.LayoutParameters = lp;
-        return card;
-    }
-
-    LinearLayout MakeRow() {
-        LinearLayout row = new(this) {
-            Orientation = Orientation.Horizontal,
-            BaselineAligned = false
-        };
-        row.SetGravity(GravityFlags.CenterVertical);
-        return row;
-    }
-
-    LinearLayout.LayoutParams MakeWeightedLp(float weight, int leftMarginDp = 0, int rightMarginDp = 0) {
-        LinearLayout.LayoutParams lp = new(0, ViewGroup.LayoutParams.WrapContent, weight);
-        lp.SetMargins(Dp(leftMarginDp), 0, Dp(rightMarginDp), 0);
-        return lp;
-    }
-
-    TextView MakeCardTitle(string text) {
-        TextView tv = new(this) { Text = text, TextSize = 15 };
-        tv.SetTextColor(TextPrimary);
-        tv.SetTypeface(Typeface.DefaultBold, TypefaceStyle.Bold);
-        return tv;
-    }
-
-    TextView MakeFieldLabel(string text) {
-        TextView tv = new(this) { Text = text, TextSize = 12 };
-        tv.SetTextColor(TextSecondary);
-        tv.SetPadding(0, Dp(8), 0, Dp(4));
-        return tv;
-    }
-
-    EditText MakeInput(string hint, string initial, bool password) {
-        EditText et = new(this) {
-            Hint = hint,
-            Text = initial ?? "",
-            TextSize = 13,
-            Background = Pill(CardElevated, 14, StrokeColor),
-            InputType = password
-                ? (InputTypes.ClassText | InputTypes.TextVariationPassword)
-                : (InputTypes.ClassText | InputTypes.TextFlagNoSuggestions)
-        };
-        et.SetTextColor(TextPrimary);
-        et.SetHintTextColor(TextSecondary);
-        et.SetSingleLine(true);
-        et.SetPadding(Dp(12), Dp(10), Dp(12), Dp(10));
-        return et;
-    }
-
-    Button MakeButton(string text, Color bg, Color fg, bool bold) {
-        Button b = new(this) {
-            Text = text,
-            TextSize = 13,
-            Background = Pill(bg, 16)
-        };
-        b.SetAllCaps(false);
-        b.SetSingleLine(true);
-        b.Ellipsize = TextUtils.TruncateAt.End;
-        b.SetTextColor(fg);
-        b.SetTypeface(bold ? Typeface.DefaultBold : Typeface.Default, bold ? TypefaceStyle.Bold : TypefaceStyle.Normal);
-        b.SetPadding(Dp(14), Dp(11), Dp(14), Dp(11));
-        b.SetMinHeight(Dp(42));
-        return b;
-    }
-
-    sealed class SafeAreaInsetsListener : Java.Lang.Object, View.IOnApplyWindowInsetsListener {
-        readonly Action<int, int> onInsets;
-
-        public SafeAreaInsetsListener(Action<int, int> onInsets) => this.onInsets = onInsets;
-
+    sealed class OmniInsetsListener(Action<int, int> onInsets) : Java.Lang.Object, View.IOnApplyWindowInsetsListener {
         public WindowInsets OnApplyWindowInsets(View v, WindowInsets insets) {
-            if (insets == null) {
-                return insets;
-            }
+            int top = 0;
+            int bottom = 0;
             if (OperatingSystem.IsAndroidVersionAtLeast(30)) {
                 Insets bars = insets.GetInsets(WindowInsets.Type.SystemBars() | WindowInsets.Type.DisplayCutout());
-                onInsets(bars.Top, bars.Bottom);
+                top = bars.Top;
+                bottom = bars.Bottom;
             } else {
-#pragma warning disable CS0618, CA1422
-                onInsets(insets.SystemWindowInsetTop, insets.SystemWindowInsetBottom);
-#pragma warning restore CS0618, CA1422
+#pragma warning disable CA1422
+                top = insets.SystemWindowInsetTop;
+                bottom = insets.SystemWindowInsetBottom;
+#pragma warning restore CA1422
             }
+            onInsets(top, bottom);
             return insets;
         }
+    }
+
+    sealed class OmniBackCallback(Action onBack) : Java.Lang.Object, IOnBackInvokedCallback {
+        public void OnBackInvoked() => onBack();
     }
 }

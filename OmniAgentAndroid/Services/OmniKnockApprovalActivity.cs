@@ -2,24 +2,26 @@ using System.Collections.Concurrent;
 
 using Android.App;
 using Android.Content;
-using Android.Graphics;
-using Android.Graphics.Drawables;
 using Android.Hardware.Biometrics;
 using Android.OS;
-using Android.Util;
-using Android.Views;
-using Android.Widget;
+using Android.Provider;
+
+using OmniAgentAndroid.Language;
 
 namespace OmniAgentAndroid.Services;
 
 /// <summary>
-/// Translucent One UI 9 AMOLED biometric approval overlay for Zero-Secret Ephemeral P-256 ECDH Smart Knocks.
-/// Shows the independently computed 6-character Visual Verification Code (SAS) and requires native Android
-/// <see cref="BiometricPrompt"/> before granting encrypted workspace credentials to an unpaired AI Studio chat.
+/// Completely invisible translucent Activity host that invokes Android / Samsung One UI's
+/// native system <see cref="BiometricPrompt"/> bottom sheet directly over whatever app the
+/// user is currently using — NEVER opening OmniAgent's UI window and backed by a hardware
+/// StrongBox/TEE ECDSA-P256 <see cref="BiometricPrompt.CryptoObject"/> signature over the
+/// Smart Knock challenge.
 /// </summary>
 [Activity(
     Exported = false,
-    Theme = "@style/OmniBiometricOverlayTheme",
+    Theme = "@style/OmniSystemPromptTheme",
+    TaskAffinity = "hu.sbence.cavern.omniagent.biometric",
+    LaunchMode = Android.Content.PM.LaunchMode.SingleInstance,
     ExcludeFromRecents = true,
     NoHistory = true)]
 public sealed class OmniKnockApprovalActivity : Activity {
@@ -27,86 +29,82 @@ public sealed class OmniKnockApprovalActivity : Activity {
     public const string ExtraSasCode = "omni_knock_sas";
     public const string ExtraRequester = "omni_knock_requester";
     public const string ExtraReason = "omni_knock_reason";
-
-    static readonly ConcurrentDictionary<string, TaskCompletionSource<(bool approved, bool biometricVerified)>> pendingKnocks = new(StringComparer.Ordinal);
-
-    string currentReqId = "";
-    bool resolved;
-    TextView statusTv;
-    Button approveBtn;
-    Button denyBtn;
-    CancellationSignal cancelSignal;
+    public const string ExtraClientPub = "omni_knock_client_pub";
 
     const int KnockNotifId = 9192;
     const string KnockChannelId = "omni_agent_knock_urgent";
+
+    static readonly ConcurrentDictionary<string, TaskCompletionSource<(bool approved, bool bioVerified, string hwSig)>> pendingKnocks = new(StringComparer.Ordinal);
+
+    string currentReqId = "";
+    string currentChallenge = "";
+    CancellationSignal cancelSignal;
+    bool resolved;
 
     public static bool CanDrawInstantOverlay(Context context) {
         if (context == null) {
             return false;
         }
-        return !OperatingSystem.IsAndroidVersionAtLeast(23) || Android.Provider.Settings.CanDrawOverlays(context);
+        return !OperatingSystem.IsAndroidVersionAtLeast(23) || Settings.CanDrawOverlays(context);
     }
 
-    public static async Task<(bool approved, bool biometricVerified)> RequestApprovalAsync(
+    public static async Task<(bool approved, bool biometricVerified, string hardwareSigB64)> RequestApprovalAsync(
         Context context,
         string knockReqId,
         string sasCode,
         string requester,
         string reason,
+        string clientPubB64,
         CancellationToken ct) {
         if (context == null || string.IsNullOrEmpty(knockReqId)) {
-            return (false, false);
+            return (false, false, "");
         }
-        TaskCompletionSource<(bool, bool)> tcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        TaskCompletionSource<(bool, bool, string)> tcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
         pendingKnocks[knockReqId] = tcs;
-
-        using CancellationTokenRegistration reg = ct.Register(() => tcs.TrySetResult((false, false)));
+        using CancellationTokenRegistration reg = ct.Register(() => tcs.TrySetResult((false, false, "")));
         try {
             Intent intent = new(context, typeof(OmniKnockApprovalActivity));
             intent.PutExtra(ExtraKnockReqId, knockReqId);
-            intent.PutExtra(ExtraSasCode, sasCode ?? "");
+            intent.PutExtra(ExtraSasCode, sasCode ?? "---");
             intent.PutExtra(ExtraRequester, requester ?? "AI Studio");
-            intent.PutExtra(ExtraReason, reason ?? "Zero-paste connection");
-            intent.AddFlags(ActivityFlags.NewTask | ActivityFlags.ClearTop | ActivityFlags.SingleTop | ActivityFlags.ReorderToFront);
+            intent.PutExtra(ExtraReason, reason ?? "Zero-paste auto-connect");
+            intent.PutExtra(ExtraClientPub, clientPubB64 ?? "");
+            intent.AddFlags(
+                ActivityFlags.NewTask |
+                ActivityFlags.MultipleTask |
+                ActivityFlags.NoAnimation |
+                ActivityFlags.ExcludeFromRecents);
 
             bool hasOverlay = CanDrawInstantOverlay(context);
-            if (hasOverlay) {
-                try {
-                    context.StartActivity(intent);
-                } catch {
-                    PostFullScreenFallbackNotification(context, intent, sasCode ?? "---", requester ?? "AI Studio", reason ?? "");
-                }
-            } else {
-                // Always post urgent FullScreenIntent notification AND try direct launch (works if app is visible or screen unlocked via BAL)
-                PostFullScreenFallbackNotification(context, intent, sasCode ?? "---", requester ?? "AI Studio", reason ?? "");
-                try {
-                    context.StartActivity(intent);
-                } catch {
-                    // User can tap the urgent heads-up notification
-                }
+            if (!hasOverlay) {
+                PostFallbackNotification(context, intent, sasCode ?? "---", requester ?? "AI Studio", reason ?? "");
+            }
+            try {
+                context.StartActivity(intent);
+            } catch {
+                PostFallbackNotification(context, intent, sasCode ?? "---", requester ?? "AI Studio", reason ?? "");
             }
 
-            Task completed = await Task.WhenAny(tcs.Task, Task.Delay(TimeSpan.FromSeconds(105), ct)).ConfigureAwait(false);
-            return completed == tcs.Task ? await tcs.Task.ConfigureAwait(false) : (false, false);
+            Task completed = await Task.WhenAny(tcs.Task, Task.Delay(TimeSpan.FromSeconds(110), ct)).ConfigureAwait(false);
+            return completed == tcs.Task ? await tcs.Task.ConfigureAwait(false) : (false, false, "");
         } catch {
-            return (false, false);
+            return (false, false, "");
         } finally {
             pendingKnocks.TryRemove(knockReqId, out _);
             CancelFallbackNotification(context);
         }
     }
 
-    static void PostFullScreenFallbackNotification(Context context, Intent fullScreenIntent, string sas, string requester, string reason) {
+    static void PostFallbackNotification(Context context, Intent fullScreenIntent, string sas, string requester, string reason) {
         try {
             NotificationManager nm = (NotificationManager)context.GetSystemService(NotificationService);
             if (nm == null) {
                 return;
             }
             if (OperatingSystem.IsAndroidVersionAtLeast(26)) {
-                NotificationChannel ch = new(KnockChannelId, "Smart Knock Approval", NotificationImportance.High) {
-                    Description = "Urgent biometric approval requests from AI Studio"
+                NotificationChannel ch = new(KnockChannelId, "Smart Knock Biometric Prompt", NotificationImportance.High) {
+                    Description = "Native system fingerprint approval for AI Studio connections"
                 };
-                ch.LockscreenVisibility = NotificationVisibility.Public;
                 nm.CreateNotificationChannel(ch);
             }
             PendingIntentFlags piFlags = OperatingSystem.IsAndroidVersionAtLeast(23)
@@ -118,7 +116,7 @@ public sealed class OmniKnockApprovalActivity : Activity {
                 ? new Notification.Builder(context, KnockChannelId)
                 : new Notification.Builder(context);
             b.SetSmallIcon(Resource.Drawable.omni_icon)
-                .SetContentTitle($"Smart Knock ({sas}) — {requester}")
+                .SetContentTitle($"OmniAgent ({sas}) · {requester}")
                 .SetContentText(string.IsNullOrWhiteSpace(reason) ? "Toque para aprovar com sua digital" : reason)
                 .SetAutoCancel(true)
                 .SetCategory(Notification.CategoryCall)
@@ -139,152 +137,121 @@ public sealed class OmniKnockApprovalActivity : Activity {
         }
     }
 
-    int Dp(int v) => (int)Math.Round(TypedValue.ApplyDimension(ComplexUnitType.Dip, v, Resources.DisplayMetrics));
-
-    GradientDrawable Pill(Color fill, int radiusDp, Color? stroke = null) {
-        GradientDrawable g = new();
-        g.SetColor(fill);
-        g.SetCornerRadius(Dp(radiusDp));
-        if (stroke.HasValue) {
-            g.SetStroke(Dp(1), stroke.Value);
-        }
-        return g;
-    }
-
     protected override void OnCreate(Bundle savedInstanceState) {
         base.OnCreate(savedInstanceState);
+        SuppressTransitions();
         if (OperatingSystem.IsAndroidVersionAtLeast(27)) {
             SetShowWhenLocked(true);
             SetTurnScreenOn(true);
         }
 
+        OmniSettingsStore store = new(this);
+        OmniStrings.Refresh(store.UiLanguage);
+        OmniStrings S = OmniStrings.Active;
+
         currentReqId = Intent?.GetStringExtra(ExtraKnockReqId) ?? "";
         string sas = Intent?.GetStringExtra(ExtraSasCode) ?? "---";
         string requester = Intent?.GetStringExtra(ExtraRequester) ?? "AI Studio";
         string reason = Intent?.GetStringExtra(ExtraReason) ?? "Zero-paste connection";
+        string clientPub = Intent?.GetStringExtra(ExtraClientPub) ?? "";
+        currentChallenge = $"knock-hw-v1|{currentReqId}|{sas}|{clientPub}";
+
         if (string.IsNullOrEmpty(currentReqId)) {
-            Finish();
+            FinishNoAnim();
             return;
         }
 
-        bool isPt = string.Equals(Java.Util.Locale.Default?.Language, "pt", StringComparison.OrdinalIgnoreCase);
-
-        FrameLayout root = new(this);
-        root.SetBackgroundColor(Color.Argb(190, 9, 9, 11));
-        root.SetPadding(Dp(20), Dp(28), Dp(20), Dp(28));
-
-        LinearLayout card = new(this) { Orientation = Orientation.Vertical };
-        card.SetPadding(Dp(22), Dp(22), Dp(22), Dp(20));
-        card.Background = Pill(Color.ParseColor("#16161B"), 24, Color.ParseColor("#2A2A35"));
-
-        TextView title = new(this) {
-            Text = isPt ? "Smart Knock — Conectar AI Studio?" : "Smart Knock — Connect AI Studio?",
-            TextSize = 18f
-        };
-        title.SetTextColor(Color.ParseColor("#F4F4F6"));
-        title.SetTypeface(Typeface.DefaultBold, TypefaceStyle.Bold);
-        card.AddView(title);
-
-        TextView sasBadge = new(this) {
-            Text = isPt ? $"Código: {sas}" : $"Code: {sas}",
-            TextSize = 21f,
-            Gravity = GravityFlags.Center
-        };
-        sasBadge.SetTypeface(Typeface.Monospace, TypefaceStyle.Bold);
-        sasBadge.SetTextColor(Color.ParseColor("#2F7CF6"));
-        sasBadge.SetPadding(Dp(14), Dp(10), Dp(14), Dp(10));
-        sasBadge.Background = Pill(Color.ParseColor("#202028"), 16, Color.ParseColor("#2F7CF6"));
-        card.AddView(sasBadge, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MatchParent, ViewGroup.LayoutParams.WrapContent) {
-            TopMargin = Dp(12),
-            BottomMargin = Dp(10)
-        });
-
-        TextView info = new(this) {
-            Text = isPt
-                ? $"Solicitante: {requester}\nMotivo: {reason}\nConfirme o código acima e use sua digital para conectar automaticamente sem enviar tokens."
-                : $"Requester: {requester}\nReason: {reason}\nConfirm the code above and verify with biometrics to connect automatically without pasting tokens.",
-            TextSize = 13f
-        };
-        info.SetTextColor(Color.ParseColor("#9CA3AF"));
-        info.SetPadding(0, 0, 0, Dp(10));
-        card.AddView(info);
-
-        statusTv = new TextView(this) {
-            Text = isPt ? "Toque na digital para aprovar..." : "Touch fingerprint to approve...",
-            TextSize = 12.5f
-        };
-        statusTv.SetTextColor(Color.ParseColor("#22C55E"));
-        statusTv.SetPadding(0, 0, 0, Dp(14));
-        card.AddView(statusTv);
-
-        LinearLayout row = new(this) {
-            Orientation = Orientation.Horizontal,
-            BaselineAligned = false
-        };
-        row.SetGravity(GravityFlags.CenterVertical);
-
-        denyBtn = MakeBtn(isPt ? "Recusar (15m)" : "Deny (15m)", Color.ParseColor("#202028"), Color.ParseColor("#F4F4F6"));
-        denyBtn.Click += (_, _) => Complete(false, false);
-
-        approveBtn = MakeBtn(isPt ? "Usar Digital" : "Verify Fingerprint", Color.ParseColor("#2F7CF6"), Color.White);
-        approveBtn.Click += (_, _) => TriggerBiometric(title.Text, $"SAS {sas} · {reason}");
-
-        row.AddView(denyBtn, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WrapContent, 1f) { RightMargin = Dp(8) });
-        row.AddView(approveBtn, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WrapContent, 1.2f));
-        card.AddView(row);
-
-        root.AddView(card, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MatchParent, ViewGroup.LayoutParams.WrapContent) {
-            Gravity = GravityFlags.Center
-        });
-        SetContentView(root);
-        Window?.DecorView?.Post(() => TriggerBiometric(title.Text, $"SAS {sas} · {reason}"));
+        // ZERO SetContentView! Keep host 100% invisible and launch Samsung/Android native system BiometricPrompt directly.
+        Window?.DecorView?.Post(() => TriggerNativeSystemBiometric(
+            S["KnockPromptTitle"],
+            string.Format(S["KnockPromptSubFmt"], sas, requester),
+            string.Format(S["KnockPromptDescFmt"], reason),
+            S["KnockDenyBtn"]));
     }
 
-    Button MakeBtn(string label, Color bg, Color fg) {
-        Button b = new(this) { Text = label, TextSize = 13f };
-        b.SetAllCaps(false);
-        b.SetSingleLine(true);
-        b.Ellipsize = Android.Text.TextUtils.TruncateAt.End;
-        b.SetTextColor(fg);
-        b.SetPadding(Dp(12), Dp(11), Dp(12), Dp(11));
-        b.Background = Pill(bg, 16);
-        return b;
+    void SuppressTransitions() {
+        try {
+            if (OperatingSystem.IsAndroidVersionAtLeast(34)) {
+                OverrideActivityTransition(OverrideTransition.Open, 0, 0);
+                OverrideActivityTransition(OverrideTransition.Close, 0, 0);
+            } else {
+#pragma warning disable CS0618, CA1422
+                OverridePendingTransition(0, 0);
+#pragma warning restore CS0618, CA1422
+            }
+        } catch {
+            // Best effort
+        }
     }
 
-    void TriggerBiometric(string title, string subtitle) {
+    void TriggerNativeSystemBiometric(string title, string subtitle, string description, string denyLabel) {
         if (resolved) {
             return;
         }
         if (!OperatingSystem.IsAndroidVersionAtLeast(28)) {
-            Complete(true, false);
+            Complete(true, false, "");
             return;
         }
         try {
             cancelSignal?.Cancel();
             cancelSignal = new CancellationSignal();
+
+            var hwMode = OmniHardwareBiometric.ProbeCapability(this);
+            BiometricPrompt.CryptoObject cryptoObj = null;
+            if (hwMode != OmniHardwareBiometric.HardwareBacking.DeviceCredentialFallback) {
+                (cryptoObj, _) = OmniHardwareBiometric.TryCreateCryptoObject();
+            }
+
             BiometricPrompt.Builder builder = new BiometricPrompt.Builder(this)
                 .SetTitle(title)
-                .SetSubtitle(subtitle);
-            if (OperatingSystem.IsAndroidVersionAtLeast(30)) {
-                builder.SetAllowedAuthenticators(0x000F | 0x8000);
-            } else {
-                builder.SetNegativeButton("Deny", MainExecutor, new NegClick(() => Complete(false, false)));
+                .SetSubtitle(subtitle)
+                .SetDescription(description);
+
+            if (OperatingSystem.IsAndroidVersionAtLeast(29)) {
+                builder.SetConfirmationRequired(false);
             }
-            builder.Build().Authenticate(cancelSignal, MainExecutor, new KnockAuthCallback(this));
+
+            bool useStrongBio = hwMode != OmniHardwareBiometric.HardwareBacking.DeviceCredentialFallback;
+            if (OperatingSystem.IsAndroidVersionAtLeast(30)) {
+                if (useStrongBio) {
+                    // BIOMETRIC_STRONG allows clean native NegativeButton ("Recusar (15m)") AND CryptoObject!
+                    builder.SetAllowedAuthenticators(0x000F);
+                    builder.SetNegativeButton(denyLabel, MainExecutor, new NegClick(() => Complete(false, false, "")));
+                } else {
+                    // DEVICE_CREDENTIAL fallback (API 30+ forbids SetNegativeButton with DEVICE_CREDENTIAL)
+                    builder.SetAllowedAuthenticators(0x000F | 0x8000);
+                    cryptoObj = null;
+                }
+            } else {
+                builder.SetNegativeButton(denyLabel, MainExecutor, new NegClick(() => Complete(false, false, "")));
+            }
+
+            BiometricPrompt prompt = builder.Build();
+            KnockAuthCallback cb = new(this);
+            if (cryptoObj != null) {
+                prompt.Authenticate(cryptoObj, cancelSignal, MainExecutor, cb);
+            } else {
+                prompt.Authenticate(cancelSignal, MainExecutor, cb);
+            }
         } catch {
-            Complete(false, false);
+            Complete(false, false, "");
         }
     }
 
-    void Complete(bool approved, bool biometricVerified) {
+    void Complete(bool approved, bool biometricVerified, string hwSig) {
         if (resolved) {
             return;
         }
         resolved = true;
-        if (!string.IsNullOrEmpty(currentReqId) && pendingKnocks.TryRemove(currentReqId, out TaskCompletionSource<(bool, bool)> tcs)) {
-            tcs.TrySetResult((approved, biometricVerified));
+        if (!string.IsNullOrEmpty(currentReqId) && pendingKnocks.TryRemove(currentReqId, out TaskCompletionSource<(bool, bool, string)> tcs)) {
+            tcs.TrySetResult((approved, biometricVerified, hwSig ?? ""));
         }
+        FinishNoAnim();
+    }
+
+    void FinishNoAnim() {
         Finish();
+        SuppressTransitions();
     }
 
     protected override void OnDestroy() {
@@ -294,7 +261,7 @@ public sealed class OmniKnockApprovalActivity : Activity {
             // Ignore
         }
         if (!resolved) {
-            Complete(false, false);
+            Complete(false, false, "");
         }
         base.OnDestroy();
     }
@@ -305,20 +272,13 @@ public sealed class OmniKnockApprovalActivity : Activity {
 
     [System.Runtime.Versioning.SupportedOSPlatform("android28.0")]
     sealed class KnockAuthCallback(OmniKnockApprovalActivity owner) : BiometricPrompt.AuthenticationCallback {
-        public override void OnAuthenticationSucceeded(BiometricPrompt.AuthenticationResult result) =>
-            owner.Complete(true, true);
+        public override void OnAuthenticationSucceeded(BiometricPrompt.AuthenticationResult result) {
+            string hwSig = OmniHardwareBiometric.TrySignChallenge(result, owner.currentChallenge);
+            owner.Complete(true, true, hwSig);
+        }
 
         public override void OnAuthenticationError(BiometricErrorCode errorCode, Java.Lang.ICharSequence errString) {
-            int code = (int)errorCode;
-            if (code == 13 || errorCode == BiometricErrorCode.UserCanceled) {
-                owner.Complete(false, false);
-                return;
-            }
-            owner.RunOnUiThread(() => {
-                if (owner.statusTv != null) {
-                    owner.statusTv.Text = errString?.ToString() ?? errorCode.ToString();
-                }
-            });
+            owner.Complete(false, false, "");
         }
     }
 }

@@ -1,81 +1,16 @@
-# OmniAgent
+# OmniAgent Companion (`v2.1`)
 
-> **Zero-Trust E2E Android Companion App, Termux/Debian Agent Daemon & Cloudflare Durable Objects Unified Hub** — bridging cloud AI workspaces (**Google AI Studio**, **Antigravity**) with a live Android device and [**Cavernize Android**](https://github.com/guumachadooo/Cavern) over sub-10 ms same-signature local IPC.
+Standalone **Samsung One UI 9** Android Companion, **Triad Command Hub**, **Local Debian/Termux File Explorer**, and **Zero-Click Always-On Bridge** for the **Cavern / OmniAgent / Dynamic Fractal Planner** Triad.
 
-[![Build OmniAgent APK](https://github.com/guumachadooo/OmniAgent/actions/workflows/BuildOmniAgent.yml/badge.svg)](https://github.com/guumachadooo/OmniAgent/actions/workflows/BuildOmniAgent.yml)
-[![Latest Release](https://img.shields.io/github/v/release/guumachadooo/OmniAgent?label=Latest%20APK&color=0A84FF)](https://github.com/guumachadooo/OmniAgent/releases/latest)
-[![Platform](https://img.shields.io/badge/.NET%2011-Android%2015%2B%20%28API%2035%29-34C759)](#architecture)
-[![Relay](https://img.shields.io/badge/Cloudflare-Hub%20v6%20SQLite%20DO-F38020)](#architecture)
-[![Security](https://img.shields.io/badge/Crypto-E2E%20SHA256--CTR%20%2B%20ECDH%20P--256-111827)](#security-model)
+## What's New in v2.1
+- **Zero-Quota Cavernize One UI 9 Design Inheritance:** Compiles CavernizeAndroid's exact `OneUiTheme.cs`, `OneUiIconView.cs`, `OneUiComponents.cs`, and SF Pro variable font directly via `.agents/federation.json` mirrors + `BuildOmniAgent.yml` pre-build sync, AND pulls live design tokens over `<10 ms` same-signature IPC (`get_design_tokens`) with zero AI quota spent.
+- **Zero-Click Always-On Automation & Cold-Wake:** Auto-starts on launch, boot, and package update with `OnTaskRemoved` quick-restart (`AlarmManager`), a persisted 15-minute `JobScheduler` watchdog (`OmniWatchdogJobService`), automatic wake when Cavernize launches, and Debian daemon Smart Knock wake fallback.
+- **Native System Biometric Overlay (Zero App Window) + StrongBox/TEE Hardware ECDSA:** Invisible translucent host (`OmniSystemPromptTheme`) invokes Android/Samsung's native `BiometricPrompt` bottom sheet directly over any app with hardware-bound ECDSA-P256 `CryptoObject` signing (Samsung Knox Vault StrongBox / TEE).
+- **Zero-Toggle Automatic Cavernize Local IPC:** Automatically linked to same-signature **Cavernize Android** (`hu.sbence.cavern.permission.OMNI_BRIDGE`, `protectionLevel="signature"`).
+- **Triad Command Hub:** 4-tab floating frosted glass dock (`Hub · Files · Bridge · Settings`) showing live Wave/Next Milestone, CI status, GitHub Releases, local Debian dirty state, 1-tap Pull Triad / Cavernize Self-Check / APK Updater, and a zero-quota Project Doc Reader.
+- **Local Debian / Termux & Android File Explorer:** Authenticated `127.0.0.1:47921` loopback bridge (`omni_agent_daemon.py v4.1.0`) with HMAC auth and `os.path.realpath` root confinement — browse PRoot Debian (`/root`), Termux (`~`), Triad workspaces, and `/sdcard`, preview code/logs, copy, share, or export to `/sdcard/Download/OmniExport/`.
 
----
-
-## Architecture
-
-```text
-┌─────────────────────────────┐         E2E Encrypted (SHA256-CTR + HMAC)
-│  AI Studio / Antigravity    │ ◄──────────────────────────────────────────┐
-│  agent/omni_agent_client.py │                                            ▼
-│  agent/live_sync_watcher.py │                         ┌──────────────────────────────────┐
-└─────────────────────────────┘                         │  Cloudflare Unified Hub v6       │
-                                                        │  SQLite Durable Object (HUB_DO)  │
-                                                        │  <50 ms strong consistency       │
-                                                        └───────────┬──────────┬───────────┘
-                                                                    │          │
-                      ┌─────────────────────────────────────────────┘          └──────────────────────────┐
-                      ▼                                                                                   ▼
-┌───────────────────────────────────────────┐                                     ┌──────────────────────────────────────┐
-│  OmniAgent Android App (One UI 9)         │   Same-Signature Local IPC (<10ms)  │  Termux / Debian PRoot Daemon        │
-│  hu.sbence.cavern.omniagent               │ ◄─────────────────────────────────► │  agent/omni_agent_daemon.py          │
-│  • Biometric Smart Knock Overlay          │   hu.sbence.cavern.permission       │  agent/termux_auto_pilot.py          │
-│  • Cloudflare Worker Auto-Deploy          │   .OMNI_BRIDGE (CheckSignatures=0)  │  • Zero-Quota Auto-APK Downloader    │
-│  • Direct GitHub Push & APK Installer     │                 │                   │  • Live Antigravity File Mirror      │
-└───────────────────────────────────────────┘                 ▼                   │  • Background .NET Pre-Verify Cache  │
-                                            ┌───────────────────────────────────┐ └──────────────────────────────────────┘
-                                            │  Cavernize Android                │
-                                            │  Live Bridge, SelfAudit, hot_exec │
-                                            └───────────────────────────────────┘
-```
-
----
-
-## Key Features
-
-- **Same-Signature Local IPC (`CavernizeIpcBridgeClient.cs`):** Signed with the exact same release certificate as Cavernize Android (`protectionLevel="signature"` + `CheckSignatures == 0`), forwarding live diagnostics, audio audits, UI inspection, and in-RAM C# `hot_exec` probes in `<10 ms` without duplicate background polling in Cavernize.
-- **Cloudflare Unified Hub v6 (`worker/cloudflare_live_relay_worker.js`):** Hybrid SQLite Durable Objects (`HUB_DO`) eliminating KV eventual-consistency delays and write-quota exhaustion (`<50 ms` strong consistency, chunked encrypted blobs, multi-agent Swarm bus).
-- **Zero-Quota Automations (`agent/termux_auto_pilot.py` & `agent/live_sync_watcher.py`):**
-  - **Auto-APK Watcher:** Polls GitHub Releases via conditional `ETag` (`304 Not Modified` = 0 rate-limit cost) and automatically downloads new `Cavernize-Android.apk` & `OmniAgent-Android.apk` releases straight into `/sdcard/Download/`.
-  - **Live Antigravity Mirror:** Debounced `<8 ms` workspace watcher mirroring AI Studio edits into Debian Antigravity with SHA-256 manual-edit conflict protection and 0 LLM tokens.
-  - **1-Shot `ship` Pipeline (`agent/omni_agent_client.py`):** Runs static verification, file-budget checks, direct GitHub API push, Termux `git pull --rebase`, and Flight Recorder handoff in a single command.
-- **3-Tier Anti-Rollback Flight Recorder (`agent/flight_recorder.py`):** Persists session diaries and verified delta bundles across local `/tmp`, Termux phone storage, and Cloudflare Hub v6 DO.
-
----
-
-## Repository Layout
-
-| Path | Description |
-| :--- | :--- |
-| `OmniAgentAndroid/` | Standalone `.NET 11` (`net11.0-android`) One UI 9 Android companion application. |
-| `agent/` | Zero-dependency Python CLI, Termux daemon, E2E crypto protocol, Flight Recorder, Live Sync Watcher, Auto-Pilot & unit tests. |
-| `worker/` | Cloudflare Workers v6 SQLite Durable Object relay script (`cloudflare_live_relay_worker.js`). |
-| `docs/` | Unified Hub architecture & operations documentation (`DIAGNOSTICS_HUB.md`). |
-| `.github/workflows/BuildOmniAgent.yml` | Automated signed APK CI publishing auto-advancing `v2.0.<run>` (`Latest`) + rolling `omniagent-latest` releases. |
-
----
-
-## Security Model
-
-- **Zero-Trust Relay:** Cloudflare Worker routes only opaque authenticated ciphertext (`SHA256-CTR + HMAC-SHA256` Encrypt-then-MAC + P-256 ECDH Smart Knock).
-- **Android Hardware Keystore:** Pairing secrets, GitHub PATs, and Cloudflare tokens inside OmniAgent Android are encrypted via Android Keystore `AES-256-GCM` (`OmniSettingsStore.cs`).
-- **Biometric Gate:** Remote elevation requests open an instant on-screen biometric approval overlay (`OmniBiometricGateActivity.cs`).
-
----
-
-## Ecosystem
-
-- [**Cavern / Cavernize Android**](https://github.com/guumachadooo/Cavern) — Spatial audio player, Dolby Atmos/TrueHD/IAMF/HOA3 renderer, neural stem studio, and USB Pro-Audio suite.
-- [**Dynamic Fractal Planner**](https://github.com/guumachadooo/dynamic-fractal-planner) — Token-efficient AI planning, SOTA pre-flight, wiring-gate, and file-budget verification framework.
-
-## License
-
-Licensed under [`LICENSE.md`](./LICENSE.md).
+## Approval Policy Modes
+- **Smart (Recommended):** Automatically allows routine read-only/diagnostic tasks and prompts with the native biometric overlay only for sensitive writes, pushes, or new Smart Knock connections.
+- **Biometric (Strict):** Requires fresh hardware-backed biometric verification for every remote command.
+- **Trusted (Free):** Auto-approves commands from already paired sessions without interrupting you (Smart Knock pairing for brand-new unpaired sessions still requires your fingerprint).

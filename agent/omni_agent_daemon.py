@@ -23,13 +23,17 @@ import argparse
 import base64
 import concurrent.futures
 import hashlib
+import hmac
+import http.server
 import json
 import os
 import platform
+import re
 import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -43,7 +47,8 @@ if str(SCRIPT_DIR) not in sys.path:
 
 import omni_protocol as proto
 
-AGENT_VERSION = "4.0.0"
+AGENT_VERSION = "4.1.0"
+DEFAULT_LOCAL_FS_PORT = 47921
 CRITICAL_COMMANDS = {"git_commit_push", "shell_exec", "adb_exec", "install_apk", "file_write"}
 DEFAULT_ANTIGRAVITY_CANDIDATES = (
     "/root/.gemini/antigravity",
@@ -757,58 +762,463 @@ class OmniAgentDaemon:
             pass
         return 180.0
 
-    def run_forever(self, poll_fast_sec: float = 2.0, poll_idle_sec: float = 6.0) -> None:
+    def _try_wake_android_for_knock(self) -> bool:
+        """Best-effort wake of OmniAgent Android APK when a Smart Knock is queued and app was closed."""
+        am_bin = shutil.which("am") or ("/system/bin/am" if os.path.exists("/system/bin/am") else "")
+        if not am_bin:
+            return False
+        woke = False
+        for argv in (
+            [am_bin, "start-foreground-service", "-n", "hu.sbence.cavern.omniagent/.Services.OmniAgentForegroundService"],
+            [am_bin, "broadcast", "-a", "hu.sbence.cavern.ipc.OMNI_WAKE_KNOCK", "-p", "hu.sbence.cavern.omniagent", "--include-stopped-packages"],
+        ):
+            try:
+                res = subprocess.run(argv, capture_output=True, text=True, timeout=6, check=False)
+                if res.returncode == 0:
+                    woke = True
+            except Exception:
+                pass
+        return woke
+
+    def run_forever(self, poll_fast_sec: float = 2.0, poll_idle_sec: float = 6.0, local_fs_port: int = DEFAULT_LOCAL_FS_PORT) -> None:
         hb_interval = self.probe_heartbeat_interval()
         last_probe = time.time()
+        local_server = None
+        if local_fs_port and local_fs_port > 0:
+            local_server = start_local_fs_server(
+                self.pair_secret_hex,
+                self.repo_path,
+                port=local_fs_port,
+            )
         print(
-            f"[OmniAgent v{AGENT_VERSION}] Starting daemon | channel={self.channel} | security={self.security_mode} | hb={int(hb_interval)}s | repo={self.repo_path}",
+            f"[OmniAgent v{AGENT_VERSION}] Starting daemon | channel={self.channel} | security={self.security_mode} | hb={int(hb_interval)}s | localFs=127.0.0.1:{local_fs_port if local_server else 0} | repo={self.repo_path}",
             flush=True,
         )
         last_hb = 0.0
+        last_knock_wake = 0.0
         idle_ticks = 0
-        while self.running:
-            now = time.time()
-            if now - last_probe >= 1800.0:
-                hb_interval = self.probe_heartbeat_interval()
-                last_probe = now
-            if now - last_hb >= hb_interval:
-                try:
-                    self.send_heartbeat()
-                    last_hb = now
-                except Exception as exc:
-                    print(f"[OmniAgent] Heartbeat warning: {exc}", file=sys.stderr, flush=True)
-
-            try:
-                st, poll = proto.http_json("GET", f"{self.relay_url}/v1/agent/poll", self.headers, timeout=20)
-                if st == 200 and poll.get("ok") and poll.get("hasCommand"):
-                    idle_ticks = 0
-                    cmd_wrap = poll["command"]
-                    req_id = str(cmd_wrap.get("requestId") or "")
-                    env = cmd_wrap.get("envelope")
+        try:
+            while self.running:
+                now = time.time()
+                if now - last_probe >= 1800.0:
+                    hb_interval = self.probe_heartbeat_interval()
+                    last_probe = now
+                if now - last_hb >= hb_interval:
                     try:
-                        cmd_obj = proto.decrypt_envelope(self.pair_secret_hex, f"cmd:{req_id}", env)
-                        print(f"[OmniAgent] Exec #{req_id[:8]} -> {cmd_obj.get('cmd')}", flush=True)
-                        res_obj = self.handle_command(cmd_obj)
+                        self.send_heartbeat()
+                        last_hb = now
                     except Exception as exc:
-                        res_obj = {"ok": False, "error": f"Command decrypt/exec error: {exc}"}
+                        print(f"[OmniAgent] Heartbeat warning: {exc}", file=sys.stderr, flush=True)
 
-                    res_env = proto.encrypt_envelope(self.pair_secret_hex, f"res:{req_id}", res_obj)
-                    proto.http_json(
-                        "POST",
-                        f"{self.relay_url}/v1/agent/result",
-                        self.headers,
-                        {"requestId": req_id, "envelope": res_env},
-                        timeout=30,
+                try:
+                    st, poll = proto.http_json("GET", f"{self.relay_url}/v1/agent/poll", self.headers, timeout=20)
+                    if st == 200 and poll.get("ok") and poll.get("hasCommand"):
+                        idle_ticks = 0
+                        cmd_wrap = poll["command"]
+                        req_id = str(cmd_wrap.get("requestId") or "")
+                        env = cmd_wrap.get("envelope")
+                        try:
+                            cmd_obj = proto.decrypt_envelope(self.pair_secret_hex, f"cmd:{req_id}", env)
+                            print(f"[OmniAgent] Exec #{req_id[:8]} -> {cmd_obj.get('cmd')}", flush=True)
+                            res_obj = self.handle_command(cmd_obj)
+                        except Exception as exc:
+                            res_obj = {"ok": False, "error": f"Command decrypt/exec error: {exc}"}
+
+                        res_env = proto.encrypt_envelope(self.pair_secret_hex, f"res:{req_id}", res_obj)
+                        proto.http_json(
+                            "POST",
+                            f"{self.relay_url}/v1/agent/result",
+                            self.headers,
+                            {"requestId": req_id, "envelope": res_env},
+                            timeout=30,
+                        )
+                        continue
+                    # Wake OmniAgent Android automatically if a Smart Knock is waiting while the Android app was closed
+                    if now - last_knock_wake >= 15.0:
+                        k_st, k_data = proto.http_json(
+                            "GET",
+                            f"{self.relay_url}/v1/knock/poll",
+                            {"X-Device-Hash": self.device_hash},
+                            timeout=8,
+                        )
+                        if k_st == 200 and isinstance(k_data, dict) and k_data.get("hasKnock"):
+                            last_knock_wake = now
+                            if self._try_wake_android_for_knock():
+                                print("[OmniAgent] Woke OmniAgent Android for pending Smart Knock.", flush=True)
+                    idle_ticks = min(idle_ticks + 1, 20)
+                except KeyboardInterrupt:
+                    break
+                except Exception as exc:
+                    idle_ticks = min(idle_ticks + 1, 20)
+                    print(f"[OmniAgent] Poll error: {exc}", file=sys.stderr, flush=True)
+
+                time.sleep(poll_idle_sec if idle_ticks >= 5 else poll_fast_sec)
+        finally:
+            if local_server is not None:
+                try:
+                    local_server.shutdown()
+                    local_server.server_close()
+                except Exception:
+                    pass
+
+
+def derive_local_fs_key(pair_secret_hex: str) -> str:
+    """Derives the deterministic 127.0.0.1 loopback HMAC key shared by OmniAgentAndroid & Debian daemon."""
+    norm = proto.normalize_pair_secret_hex(pair_secret_hex)
+    return hmac.new(bytes.fromhex(norm), b"omni-local-fs-v1", hashlib.sha256).hexdigest()
+
+
+def _allowed_local_roots(repo_path: Path) -> list[str]:
+    candidates = [
+        "/root",
+        str(Path.home()),
+        "/data/data/com.termux/files/home",
+        "/sdcard",
+        "/storage/emulated/0",
+        "/tmp/cavern-federation",
+        str(repo_path),
+    ]
+    roots: list[str] = []
+    for c in candidates:
+        if not c:
+            continue
+        rp = os.path.realpath(c)
+        if rp and rp not in roots:
+            roots.append(rp)
+    return roots
+
+
+def _resolve_confined_path(raw_path: str, allowed_roots: list[str]) -> tuple[str | None, str]:
+    clean = (raw_path or "").strip()
+    if not clean:
+        return None, "Path is required."
+    expanded = os.path.expanduser(clean)
+    resolved = os.path.realpath(expanded)
+    for root in allowed_roots:
+        if resolved == root or resolved.startswith(root.rstrip("/") + os.sep):
+            return resolved, ""
+    return None, f"Path outside allowed roots: {clean}"
+
+
+def _inspect_local_triad(default_repo: Path) -> dict[str, Any]:
+    scratch_base = default_repo.parent if default_repo.parent.is_dir() else Path("/root/.gemini/antigravity/scratch")
+    specs = (
+        ("cavern", "guumachadooo/Cavern", "master", scratch_base / "Cavern"),
+        ("omniagent", "guumachadooo/OmniAgent", "main", scratch_base / "OmniAgent"),
+        ("fractal", "guumachadooo/dynamic-fractal-planner", "main", scratch_base / "dynamic-fractal-planner"),
+    )
+    repos_out: list[dict[str, Any]] = []
+    handoff_info: dict[str, str] = {"wave": "", "summary": "", "next": ""}
+    extra_pending = 0
+    lessons_count = 0
+
+    for alias, owner_repo, default_branch, rpath in specs:
+        exists = rpath.is_dir()
+        entry: dict[str, Any] = {
+            "alias": alias,
+            "ownerRepo": owner_repo,
+            "path": str(rpath),
+            "exists": exists,
+            "branch": default_branch,
+            "head": "",
+            "lastSubject": "",
+            "dirtyCount": 0,
+        }
+        if exists and (rpath / ".git").exists():
+            br = run_subprocess(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=rpath, timeout_sec=8)
+            if br["ok"] and br["stdout"].strip():
+                entry["branch"] = br["stdout"].strip()
+            hd = run_subprocess(["git", "log", "-1", "--format=%h|%s"], cwd=rpath, timeout_sec=8)
+            if hd["ok"] and "|" in hd["stdout"]:
+                parts = hd["stdout"].strip().split("|", 1)
+                entry["head"] = parts[0]
+                entry["lastSubject"] = parts[1][:120]
+            st = run_subprocess(["git", "status", "--porcelain"], cwd=rpath, timeout_sec=8)
+            if st["ok"]:
+                lines = [ln for ln in st["stdout"].splitlines() if ln.strip()]
+                entry["dirtyCount"] = len(lines)
+        if alias == "cavern" and exists:
+            hf = rpath / ".agents" / "docs" / "HANDOFF.md"
+            if hf.is_file():
+                for ln in hf.read_text(encoding="utf-8", errors="replace").splitlines():
+                    if ln.startswith("WAVE|"):
+                        handoff_info["wave"] = ln[5:].strip()
+                    elif ln.startswith("SUMMARY|"):
+                        handoff_info["summary"] = ln[8:].strip()[:320]
+                    elif ln.startswith("NEXT|"):
+                        handoff_info["next"] = ln[5:].strip()[:240]
+            ef = rpath / ".agents" / "docs" / "EXTRA_REQUESTS.md"
+            if ef.is_file():
+                txt = ef.read_text(encoding="utf-8", errors="replace")
+                pending_blk = txt.split("## Completed Requests")[0]
+                extra_pending = sum(1 for ln in pending_blk.splitlines() if ln.strip().startswith("- REQ|"))
+            bf = rpath / ".agents" / "docs" / "BUILD_LESSONS.md"
+            if bf.is_file():
+                lessons_count = len(re.findall(r"^###\s+`?BL-\d+`?", bf.read_text(encoding="utf-8", errors="replace"), re.M))
+        repos_out.append(entry)
+
+    return {
+        "ok": True,
+        "utc": _utc_now(),
+        "hostname": platform.node(),
+        "repos": repos_out,
+        "handoff": handoff_info,
+        "pendingExtraRequests": extra_pending,
+        "buildLessonsCount": lessons_count,
+    }
+
+
+def start_local_fs_server(
+    pair_secret_hex: str,
+    repo_path: Path,
+    *,
+    host: str = "127.0.0.1",
+    port: int = DEFAULT_LOCAL_FS_PORT,
+) -> http.server.ThreadingHTTPServer | None:
+    """Starts the authenticated 127.0.0.1 loopback server for OmniAgent's Debian File Explorer & Triad Hub."""
+    expected_key = derive_local_fs_key(pair_secret_hex)
+    allowed_roots = _allowed_local_roots(repo_path)
+    started_ts = time.time()
+
+    class LocalFsHandler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args: Any) -> None:
+            return  # Keep daemon stdout clean
+
+        def _send_json(self, code: int, payload: dict[str, Any]) -> None:
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _check_auth(self) -> bool:
+            got = (self.headers.get("X-Omni-Local-Key") or "").strip().lower()
+            if not got or not hmac.compare_digest(got, expected_key):
+                self._send_json(401, {"ok": False, "error": "Unauthorized local request"})
+                return False
+            return True
+
+        def _read_body_json(self) -> dict[str, Any]:
+            try:
+                length = min(int(self.headers.get("Content-Length") or "0"), 1_048_576)
+                raw = self.rfile.read(length) if length > 0 else b"{}"
+                parsed = json.loads(raw.decode("utf-8", errors="replace"))
+                return parsed if isinstance(parsed, dict) else {}
+            except Exception:
+                return {}
+
+        def do_GET(self) -> None:
+            if not self._check_auth():
+                return
+            parsed = urllib.parse.urlparse(self.path)
+            route = parsed.path
+            qs = urllib.parse.parse_qs(parsed.query)
+
+            if route == "/local/health":
+                self._send_json(
+                    200,
+                    {
+                        "ok": True,
+                        "service": "omniagent-local-fs",
+                        "version": AGENT_VERSION,
+                        "hostname": platform.node(),
+                        "uptimeSec": int(time.time() - started_ts),
+                        "roots": [
+                            {"label": "Cavern", "path": "/root/.gemini/antigravity/scratch/Cavern"},
+                            {"label": "OmniAgent", "path": "/root/.gemini/antigravity/scratch/OmniAgent"},
+                            {"label": "Fractal", "path": "/root/.gemini/antigravity/scratch/dynamic-fractal-planner"},
+                            {"label": "Antigravity", "path": "/root/.gemini/antigravity"},
+                            {"label": "Debian /root", "path": "/root"},
+                            {"label": "Termux ~", "path": "/data/data/com.termux/files/home"},
+                            {"label": "Android /sdcard", "path": "/sdcard"},
+                        ],
+                    },
+                )
+                return
+
+            if route == "/local/triad":
+                self._send_json(200, _inspect_local_triad(repo_path))
+                return
+
+            if route == "/local/fs/list":
+                req_path = (qs.get("path") or ["/root"])[0]
+                show_hidden = (qs.get("hidden") or ["1"])[0] in ("1", "true", "yes")
+                resolved, err = _resolve_confined_path(req_path, allowed_roots)
+                if not resolved:
+                    self._send_json(403, {"ok": False, "error": err})
+                    return
+                if not os.path.isdir(resolved):
+                    self._send_json(404, {"ok": False, "error": f"Directory not found: {resolved}"})
+                    return
+                entries: list[dict[str, Any]] = []
+                try:
+                    with os.scandir(resolved) as it:
+                        for entry in it:
+                            name = entry.name
+                            if not show_hidden and name.startswith("."):
+                                continue
+                            try:
+                                st = entry.stat(follow_symlinks=False)
+                                is_dir = entry.is_dir(follow_symlinks=True)
+                                is_link = entry.is_symlink()
+                                entries.append(
+                                    {
+                                        "name": name,
+                                        "path": os.path.join(resolved, name),
+                                        "isDir": is_dir,
+                                        "isSymlink": is_link,
+                                        "sizeBytes": 0 if is_dir else int(st.st_size),
+                                        "mtimeUnix": int(st.st_mtime),
+                                        "ext": "" if is_dir else Path(name).suffix.lower(),
+                                    }
+                                )
+                            except OSError:
+                                continue
+                except OSError as exc:
+                    self._send_json(500, {"ok": False, "error": str(exc)})
+                    return
+                entries.sort(key=lambda e: (not e["isDir"], e["name"].lower()))
+                parent = os.path.dirname(resolved.rstrip("/")) or "/"
+                parent_allowed, _ = _resolve_confined_path(parent, allowed_roots)
+                self._send_json(
+                    200,
+                    {
+                        "ok": True,
+                        "path": resolved,
+                        "parent": parent_allowed or "",
+                        "count": len(entries),
+                        "entries": entries[:500],
+                    },
+                )
+                return
+
+            if route == "/local/fs/read":
+                req_path = (qs.get("path") or [""])[0]
+                max_bytes = min(max(int((qs.get("maxBytes") or ["262144"])[0]), 1024), 524288)
+                resolved, err = _resolve_confined_path(req_path, allowed_roots)
+                if not resolved:
+                    self._send_json(403, {"ok": False, "error": err})
+                    return
+                if not os.path.isfile(resolved):
+                    self._send_json(404, {"ok": False, "error": f"File not found: {resolved}"})
+                    return
+                try:
+                    size = os.path.getsize(resolved)
+                    with open(resolved, "rb") as f:
+                        chunk = f.read(max_bytes)
+                    is_binary = b"\x00" in chunk[:4096]
+                    text = "" if is_binary else chunk.decode("utf-8", errors="replace")
+                    self._send_json(
+                        200,
+                        {
+                            "ok": True,
+                            "path": resolved,
+                            "name": os.path.basename(resolved),
+                            "sizeBytes": size,
+                            "truncated": size > len(chunk),
+                            "isBinary": is_binary,
+                            "lineCount": 0 if is_binary else len(text.splitlines()),
+                            "content": text,
+                        },
                     )
-                    continue
-                idle_ticks = min(idle_ticks + 1, 20)
-            except KeyboardInterrupt:
-                break
-            except Exception as exc:
-                idle_ticks = min(idle_ticks + 1, 20)
-                print(f"[OmniAgent] Poll error: {exc}", file=sys.stderr, flush=True)
+                except OSError as exc:
+                    self._send_json(500, {"ok": False, "error": str(exc)})
+                return
 
-            time.sleep(poll_idle_sec if idle_ticks >= 5 else poll_fast_sec)
+            self._send_json(404, {"ok": False, "error": f"Unknown route: {route}"})
+
+        def do_POST(self) -> None:
+            if not self._check_auth():
+                return
+            route = urllib.parse.urlparse(self.path).path
+            body = self._read_body_json()
+
+            if route == "/local/fs/export":
+                req_path = str(body.get("path") or "")
+                resolved, err = _resolve_confined_path(req_path, allowed_roots)
+                if not resolved:
+                    self._send_json(403, {"ok": False, "error": err})
+                    return
+                if not os.path.isfile(resolved):
+                    self._send_json(404, {"ok": False, "error": "Source file not found"})
+                    return
+                export_dir = Path("/sdcard/Download/OmniExport")
+                if not export_dir.parent.exists():
+                    export_dir = Path("/storage/emulated/0/Download/OmniExport")
+                try:
+                    export_dir.mkdir(parents=True, exist_ok=True)
+                    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", os.path.basename(resolved)).strip("._") or "exported_file"
+                    dest = export_dir / safe_name
+                    shutil.copy2(resolved, dest)
+                    self._send_json(200, {"ok": True, "exportedPath": str(dest), "sizeBytes": dest.stat().st_size})
+                except OSError as exc:
+                    self._send_json(500, {"ok": False, "error": str(exc)})
+                return
+
+            if route == "/local/fs/mkdir":
+                req_path = str(body.get("path") or "")
+                resolved, err = _resolve_confined_path(req_path, allowed_roots)
+                if not resolved:
+                    self._send_json(403, {"ok": False, "error": err})
+                    return
+                try:
+                    os.makedirs(resolved, exist_ok=True)
+                    self._send_json(200, {"ok": True, "path": resolved})
+                except OSError as exc:
+                    self._send_json(500, {"ok": False, "error": str(exc)})
+                return
+
+            if route == "/local/fs/delete":
+                req_path = str(body.get("path") or "")
+                resolved, err = _resolve_confined_path(req_path, allowed_roots)
+                if not resolved:
+                    self._send_json(403, {"ok": False, "error": err})
+                    return
+                if resolved in allowed_roots or resolved in ("/", "/root", "/sdcard", "/storage/emulated/0"):
+                    self._send_json(403, {"ok": False, "error": "Refusing to delete protected root directory"})
+                    return
+                try:
+                    if os.path.isdir(resolved) and not os.path.islink(resolved):
+                        shutil.rmtree(resolved)
+                    elif os.path.exists(resolved) or os.path.islink(resolved):
+                        os.unlink(resolved)
+                    self._send_json(200, {"ok": True, "deleted": resolved})
+                except OSError as exc:
+                    self._send_json(500, {"ok": False, "error": str(exc)})
+                return
+
+            if route == "/local/git/pull_all":
+                triad = _inspect_local_triad(repo_path)
+                results = []
+                for repo in triad.get("repos", []):
+                    rp = Path(repo["path"])
+                    if not (rp.is_dir() and (rp / ".git").exists()):
+                        results.append({"alias": repo["alias"], "ok": False, "output": "not cloned"})
+                        continue
+                    r = run_subprocess(["git", "pull", "--rebase", "--autostash"], cwd=rp, timeout_sec=60)
+                    results.append(
+                        {
+                            "alias": repo["alias"],
+                            "ok": bool(r["ok"]),
+                            "output": (r["stdout"] or r["stderr"] or "").strip()[-240:],
+                        }
+                    )
+                self._send_json(200, {"ok": all(x["ok"] for x in results), "results": results})
+                return
+
+            self._send_json(404, {"ok": False, "error": f"Unknown route: {route}"})
+
+    try:
+        server = http.server.ThreadingHTTPServer((host, port), LocalFsHandler)
+        server.daemon_threads = True
+        t = threading.Thread(target=server.serve_forever, name="omni-local-fs", daemon=True)
+        t.start()
+        return server
+    except OSError as exc:
+        print(f"[OmniAgent] Local FS loopback warning ({host}:{port}): {exc}", file=sys.stderr, flush=True)
+        return None
 
 
 def shlex_quote(s: str) -> str:

@@ -48,6 +48,20 @@ public static class OmniCrypto {
     public static string ComputeAgentKey(string pairHex) =>
         Sha256Hex($"agent-access-v4:{pairHex}");
 
+    /// <summary>
+    /// Derives the deterministic 127.0.0.1 loopback HMAC-SHA256 key shared with <c>omni_agent_daemon.py</c>
+    /// for local Debian/Termux File Explorer &amp; Triad Hub inspection.
+    /// </summary>
+    public static string ComputeLocalFsKey(string pairHex) {
+        string norm = NormalizePairSecretHex(pairHex);
+        if (string.IsNullOrEmpty(norm)) {
+            return "";
+        }
+        byte[] key = Convert.FromHexString(norm);
+        byte[] mac = HMACSHA256.HashData(key, System.Text.Encoding.UTF8.GetBytes("omni-local-fs-v1"));
+        return Convert.ToHexString(mac).ToLowerInvariant();
+    }
+
     public static string ComputeKnockChannelId(string pairHex) =>
         string.IsNullOrEmpty(pairHex) || pairHex.Length != 64
             ? ""

@@ -1,13 +1,23 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
   <style name="OmniAgentTheme" parent="@android:style/Theme.DeviceDefault.NoActionBar">
-    <item name="android:windowBackground">#09090B</item>
-    <item name="android:colorPrimary">#2F7CF6</item>
-    <item name="android:colorAccent">#2F7CF6</item>
+    <item name="android:windowBackground">#080A10</item>
+    <item name="android:colorPrimary">#387AFF</item>
+    <item name="android:colorAccent">#387AFF</item>
   </style>
-  <style name="OmniBiometricOverlayTheme" parent="@android:style/Theme.DeviceDefault.NoActionBar">
+
+  <!-- Pure invisible host for Samsung/Android native system BiometricPrompt bottom sheet (zero app window!) -->
+  <style name="OmniSystemPromptTheme" parent="@android:style/Theme.DeviceDefault.NoActionBar">
     <item name="android:windowIsTranslucent">true</item>
     <item name="android:windowBackground">@android:color/transparent</item>
-    <item name="android:backgroundDimEnabled">true</item>
+    <item name="android:windowContentOverlay">@null</item>
+    <item name="android:windowNoTitle">true</item>
+    <item name="android:backgroundDimEnabled">false</item>
+    <item name="android:windowDisablePreview">true</item>
+    <item name="android:windowAnimationStyle">@null</item>
+    <item name="android:colorBackgroundCacheHint">@null</item>
   </style>
+
+  <!-- Alias preserved for backwards compatibility -->
+  <style name="OmniBiometricOverlayTheme" parent="@style/OmniSystemPromptTheme" />
 </resources>

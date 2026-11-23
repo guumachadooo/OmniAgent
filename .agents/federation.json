@@ -86,6 +86,33 @@
           ]
         }
       ]
+    },
+    {
+      "name": "cavern-oneui9-design-kit",
+      "sourceRepo": "cavern",
+      "targetRepo": "omniagent",
+      "mappings": [
+        {
+          "src": "CavernSamples/CavernizeAndroid/Theme/OneUiTheme.cs",
+          "dst": "OmniAgentAndroid/SharedOneUi/OneUiTheme.cs",
+          "exclude": []
+        },
+        {
+          "src": "CavernSamples/CavernizeAndroid/Views/OneUiIconView.cs",
+          "dst": "OmniAgentAndroid/SharedOneUi/OneUiIconView.cs",
+          "exclude": []
+        },
+        {
+          "src": "CavernSamples/CavernizeAndroid/Views/OneUiComponents.cs",
+          "dst": "OmniAgentAndroid/SharedOneUi/OneUiComponents.cs",
+          "exclude": []
+        },
+        {
+          "src": "CavernSamples/CavernizeAndroid/Assets/fonts/sf_pro_android_ui.ttf",
+          "dst": "OmniAgentAndroid/Assets/fonts/sf_pro_android_ui.ttf",
+          "exclude": []
+        }
+      ]
     }
   ]
 }

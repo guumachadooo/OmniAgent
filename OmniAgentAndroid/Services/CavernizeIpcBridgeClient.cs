@@ -106,7 +106,7 @@ public static class CavernizeIpcBridgeClient {
             if (completed == tcs.Task) {
                 return await tcs.Task.ConfigureAwait(false);
             }
-            return (false, $"Cavernize local IPC timed out after {timeoutSeconds}s (ensure Cavernize is updated and 'Permitir ponte local com OmniAgent' is enabled).", 0);
+            return (false, $"Cavernize local IPC timed out after {timeoutSeconds}s (ensure Cavernize Android is updated and signed with the matching release key).", 0);
         } finally {
             pending.TryRemove(reqId, out _);
         }

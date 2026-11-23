@@ -21,7 +21,7 @@ public sealed class OmniAgentForegroundService : Service {
     const string ChannelId = "omni_agent_foreground";
     const string ActionStop = "hu.sbence.cavern.omniagent.ACTION_STOP";
 
-    const string AgentVersion = "2.0.0";
+    const string AgentVersion = "2.1.0";
 
     static readonly HashSet<string> CriticalCommands = new(StringComparer.OrdinalIgnoreCase) {
         "github_push_bundle",
@@ -56,7 +56,7 @@ public sealed class OmniAgentForegroundService : Service {
 
     static HttpClient BuildClient() {
         HttpClient c = new() { Timeout = TimeSpan.FromSeconds(30) };
-        c.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue("OmniAgentAndroid", "2.0"));
+        c.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue("OmniAgentAndroid", "2.1"));
         c.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
         return c;
     }
@@ -73,16 +73,41 @@ public sealed class OmniAgentForegroundService : Service {
         }
     }
 
+    /// <summary>
+    /// Starts OmniAgent's Always-On background bridge and schedules the persisted watchdog job
+    /// whenever Relay URL + Pair Key are configured (zero manual Start clicks required).
+    /// </summary>
+    public static bool EnsureAlwaysOn(Context context) {
+        if (context == null) {
+            return false;
+        }
+        Context appCtx = context.ApplicationContext ?? context;
+        OmniSettingsStore store = new(appCtx);
+        if (!store.ServiceEnabled || !store.HasPairSecret || !OmniSettingsStore.TryNormalizeRelayUrl(store.RelayUrl, out _)) {
+            return false;
+        }
+        OmniWatchdogJobService.Schedule(appCtx);
+        if (!isRunning) {
+            Start(appCtx);
+        }
+        return true;
+    }
+
     public static void Start(Context context) {
         if (context == null) {
             return;
         }
         Context appCtx = context.ApplicationContext ?? context;
         Intent intent = new(appCtx, typeof(OmniAgentForegroundService));
-        if (OperatingSystem.IsAndroidVersionAtLeast(26)) {
-            appCtx.StartForegroundService(intent);
-        } else {
-            appCtx.StartService(intent);
+        try {
+            if (OperatingSystem.IsAndroidVersionAtLeast(26)) {
+                appCtx.StartForegroundService(intent);
+            } else {
+                appCtx.StartService(intent);
+            }
+        } catch (Exception ex) {
+            OmniSettingsStore.AppendActivity("WAKE", $"StartForegroundService deferred to watchdog: {ex.Message}");
+            OmniWatchdogJobService.Schedule(appCtx);
         }
     }
 
@@ -100,10 +125,40 @@ public sealed class OmniAgentForegroundService : Service {
 
     public override IBinder OnBind(Intent intent) => null;
 
+    public override void OnTaskRemoved(Intent rootIntent) {
+        base.OnTaskRemoved(rootIntent);
+        try {
+            OmniSettingsStore store = new(this);
+            if (store.ServiceEnabled && store.HasPairSecret && OmniSettingsStore.TryNormalizeRelayUrl(store.RelayUrl, out _)) {
+                ScheduleQuickRestart(this);
+                OmniWatchdogJobService.Schedule(this);
+            }
+        } catch {
+            // Best effort
+        }
+    }
+
+    static void ScheduleQuickRestart(Context context) {
+        try {
+            Intent restart = new(context, typeof(OmniBootReceiver));
+            restart.SetAction(OmniBootReceiver.ActionWatchdogRestart);
+            PendingIntentFlags flags = OperatingSystem.IsAndroidVersionAtLeast(23)
+                ? PendingIntentFlags.OneShot | PendingIntentFlags.Immutable
+                : PendingIntentFlags.OneShot;
+            PendingIntent pi = PendingIntent.GetBroadcast(context, 9198, restart, flags);
+            if (context.GetSystemService(AlarmService) is AlarmManager am) {
+                am.Set(AlarmType.ElapsedRealtimeWakeup, SystemClock.ElapsedRealtime() + 1800L, pi);
+            }
+        } catch {
+            // Best effort
+        }
+    }
+
     public override StartCommandResult OnStartCommand(Intent intent, StartCommandFlags flags, int startId) {
         if (string.Equals(intent?.Action, ActionStop, StringComparison.Ordinal)) {
             OmniSettingsStore store = new(this);
             store.ServiceEnabled = false;
+            OmniWatchdogJobService.Cancel(this);
             StopForegroundCompat(true);
             StopSelf();
             return StartCommandResult.NotSticky;
@@ -317,7 +372,7 @@ public sealed class OmniAgentForegroundService : Service {
         string sas = OmniCrypto.ComputeKnockSasCode(knockId, knockReqId, clientPub);
         OmniSettingsStore.AppendActivity("KNOCK", $"Incoming Smart Knock (SAS={sas}) from {requester}...");
 
-        (bool approved, bool bioOk) = await OmniKnockApprovalActivity.RequestApprovalAsync(this, knockReqId, sas, requester, reason, ct).ConfigureAwait(false);
+        (bool approved, bool bioOk, string hwSig) = await OmniKnockApprovalActivity.RequestApprovalAsync(this, knockReqId, sas, requester, reason, clientPub, ct).ConfigureAwait(false);
         if (!approved || !bioOk) {
             using HttpRequestMessage denyReq = new(HttpMethod.Post, $"{baseUrl}/v1/knock/deny");
             denyReq.Headers.Add("X-Device-Hash", devHash);
@@ -336,6 +391,7 @@ public sealed class OmniAgentForegroundService : Service {
             pairSecret = pairHex,
             knockId,
             biometricVerified = true,
+            hardwareAttestationSig = hwSig,
             device = $"{Build.Manufacturer} {Build.Model}".Trim(),
             approvedAtUtc = DateTime.UtcNow.ToString("O")
         };
@@ -372,7 +428,12 @@ public sealed class OmniAgentForegroundService : Service {
 
             if (string.Equals(store.SecurityMode, "biometric", StringComparison.OrdinalIgnoreCase) && CriticalCommands.Contains(cmd)) {
                 bool approved = await OmniBiometricGateActivity.RequestApprovalAsync(
-                    this, reqId, "OmniAgent Approval", $"Allow remote '{cmd}'?", ct).ConfigureAwait(false);
+                    this,
+                    reqId,
+                    Language.OmniStrings.Active["GatePromptTitle"],
+                    $"CMD: {cmd}",
+                    string.Format(Language.OmniStrings.Active["GatePromptDescFmt"], cmd),
+                    ct).ConfigureAwait(false);
                 if (!approved) {
                     OmniSettingsStore.AppendActivity("DENY", $"User denied {cmd} via biometric prompt.");
                     return new { ok = false, cmd, error = "Denied by user via BiometricPrompt." };
@@ -763,7 +824,7 @@ public sealed class OmniAgentForegroundService : Service {
         if (nm == null) {
             return;
         }
-        NotificationChannel ch = new(ChannelId, "OmniAgent Bridge", NotificationImportance.Low) {
+        NotificationChannel ch = new(ChannelId, "OmniAgent Bridge", NotificationImportance.Min) {
             Description = "Zero-trust background bridge for AI Studio Full-Agent commands"
         };
         ch.SetShowBadge(false);
@@ -784,7 +845,7 @@ public sealed class OmniAgentForegroundService : Service {
 
         Notification.Builder b = new(this, ChannelId);
         b.SetSmallIcon(Resource.Drawable.omni_icon)
-            .SetContentTitle("OmniAgent Online")
+            .SetContentTitle("OmniAgent · Always-On")
             .SetContentText($"Channel: android • {commandsHandled} cmd(s) handled")
             .SetOngoing(true)
             .SetContentIntent(openPi);

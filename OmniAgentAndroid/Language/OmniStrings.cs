@@ -1,0 +1,374 @@
+namespace OmniAgentAndroid.Language;
+
+/// <summary>
+/// Full EN / PT-BR localization dictionary for OmniAgent Companion (matching Cavernize's AndroidStrings architecture).
+/// Zero untranslated labels; supports "auto" (device locale), "pt", and "en".
+/// </summary>
+public sealed class OmniStrings {
+    static readonly Dictionary<string, string> En = CreateEnglish();
+    static readonly Dictionary<string, string> Pt = CreatePortuguese();
+
+    public static OmniStrings Active { get; private set; } = new(isPt: false);
+    public bool IsPortuguese { get; }
+
+    OmniStrings(bool isPt) => IsPortuguese = isPt;
+
+    public static void Refresh(string languagePref) {
+        string pref = (languagePref ?? "auto").Trim().ToLowerInvariant();
+        bool isPt = pref == "pt" || (pref == "auto" && string.Equals(Java.Util.Locale.Default?.Language, "pt", StringComparison.OrdinalIgnoreCase));
+        Active = new OmniStrings(isPt);
+    }
+
+    public string this[string key] {
+        get {
+            if (IsPortuguese && Pt.TryGetValue(key, out string ptVal)) {
+                return ptVal;
+            }
+            if (En.TryGetValue(key, out string enVal)) {
+                return enVal;
+            }
+            return key;
+        }
+    }
+
+    public static IReadOnlyCollection<string> EnglishKeys => En.Keys;
+    public static IReadOnlyCollection<string> PortugueseKeys => Pt.Keys;
+
+    static Dictionary<string, string> CreateEnglish() => new(StringComparer.Ordinal) {
+        ["AppTitle"] = "OmniAgent",
+        ["AppSubtitle"] = "Triad Command Hub · Zero-Trust E2E · Cavernize Bridge",
+        ["TabHub"] = "Hub",
+        ["TabFiles"] = "Files",
+        ["TabBridge"] = "Bridge",
+        ["TabSettings"] = "Settings",
+
+        // Hub Tab
+        ["HubTitle"] = "Triad Command Hub",
+        ["HubSubtitle"] = "Live workspace state across Cavern, OmniAgent & Dynamic Fractal Planner",
+        ["HubRefreshBtn"] = "Refresh",
+        ["HubRefreshing"] = "Syncing Triad status from GitHub & Debian...",
+        ["HubActiveWaveTitle"] = "Active Wave & Next Milestone",
+        ["HubWaveNextLabel"] = "Next",
+        ["HubReposTitle"] = "Triad Repositories",
+        ["HubActionsTitle"] = "Smart Actions",
+        ["HubPullTriadBtn"] = "Pull Triad (Debian)",
+        ["HubUpdateCavernizeBtn"] = "Update Cavernize APK",
+        ["HubUpdateOmniBtn"] = "Update OmniAgent APK",
+        ["HubSelfCheckCavernizeBtn"] = "Cavernize Checkup",
+        ["HubOpenCavernizeBtn"] = "Open Cavernize",
+        ["HubDocsTitle"] = "Project Docs (Zero-Quota Reader)",
+        ["HubRecentSyncTitle"] = "Recent Sync Ledger",
+        ["HubCiPass"] = "CI PASS",
+        ["HubCiFail"] = "CI FAIL",
+        ["HubCiRunning"] = "CI RUNNING",
+        ["HubCiIdle"] = "CI IDLE",
+        ["HubDirtyFmt"] = "{0} local edits",
+        ["HubCleanLocal"] = "Debian clean",
+        ["HubLocalOffline"] = "GitHub live",
+        ["HubStatsFmt"] = "Pending Extra: {0} · Build Lessons: {1}",
+        ["HubNoSyncEntries"] = "Tap Refresh to load latest sync ledger from GitHub.",
+        ["HubApkDownloading"] = "Downloading latest signed APK from GitHub Releases...",
+        ["HubApkReady"] = "Opening Android installer...",
+        ["HubApkNotFound"] = "No APK asset found in latest release.",
+
+        // Files Tab
+        ["FilesTitle"] = "Debian & Android Files",
+        ["FilesSubtitle"] = "Browse Termux / PRoot Debian directly over authenticated 127.0.0.1 loopback",
+        ["FilesSearchHint"] = "Filter files in this folder...",
+        ["FilesUpBtn"] = "Up",
+        ["FilesRefreshBtn"] = "Reload",
+        ["FilesNewFolderBtn"] = "+ Folder",
+        ["FilesDaemonOfflineTitle"] = "Debian / Termux local bridge is asleep",
+        ["FilesDaemonOfflineBody"] = "Wake the Termux Debian daemon so OmniAgent can browse /root, Antigravity scratch repos, and Termux home at <5 ms locally — or switch to Android /sdcard below.",
+        ["FilesWakeNowBtn"] = "Wake Debian / Termux",
+        ["FilesBrowseSdcardBtn"] = "Browse Android /sdcard",
+        ["FilesEmptyDir"] = "This folder is empty.",
+        ["FilesCountFmt"] = "{0} items · {1}",
+        ["FilesPreviewCopyBtn"] = "Copy",
+        ["FilesPreviewExportBtn"] = "Export / Share",
+        ["FilesExportedToastFmt"] = "Exported to {0}",
+        ["FilesCopiedToast"] = "Copied to clipboard.",
+        ["FilesBinaryNotice"] = "Binary file preview disabled. Use Export / Share to copy it to /sdcard/Download/OmniExport/ and open in Android.",
+        ["FilesDeleteConfirmTitle"] = "Delete item?",
+        ["FilesDeleteConfirmFmt"] = "Permanently remove:
+{0}",
+        ["FilesDeleteBtn"] = "Delete",
+        ["FilesCreateFolderTitle"] = "New Folder",
+        ["FilesCreateFolderHint"] = "Folder name",
+        ["FilesCreateBtn"] = "Create",
+
+        // Bridge Tab
+        ["BridgeTitle"] = "Live Bridge & Automation",
+        ["BridgeAlwaysOnOnline"] = "ALWAYS-ON ONLINE",
+        ["BridgeAlwaysOnStandby"] = "AUTO-START STANDBY",
+        ["BridgeNeedsSetup"] = "SETUP REQUIRED",
+        ["BridgeStatusOnlineFmt"] = "Auto-managed · {0} cmd(s) handled · Policy: {1}",
+        ["BridgeStatusNeedsSetup"] = "Configure Cloudflare Worker URL & Pair Key once. After that, OmniAgent runs automatically with zero manual Start clicks.",
+        ["BridgeWakeTermuxBtn"] = "Wake Termux",
+        ["BridgeTestRelayBtn"] = "Test Relay",
+        ["BridgeCopyKnockBtn"] = "Copy Knock ID",
+        ["BridgePauseBtn"] = "Pause",
+        ["BridgeResumeBtn"] = "Auto-Resume",
+        ["BridgeLinksCardTitle"] = "Ecosystem Links",
+        ["BridgeCavernizeLinked"] = "Cavernize IPC · Automatic (Same Signature)",
+        ["BridgeCavernizeMissing"] = "Cavernize not installed",
+        ["BridgeDebianOnline"] = "Debian Loopback · Connected (<5 ms)",
+        ["BridgeDebianOffline"] = "Debian Loopback · Asleep (Tap Wake Termux)",
+        ["BridgeActivityTitle"] = "Live Agent Activity",
+        ["BridgeActivityEmpty"] = "No activity yet. Always-on bridge is listening automatically.",
+        ["BridgeClearBtn"] = "Clear",
+
+        // Settings Tab
+        ["SettingsTitle"] = "OmniAgent Settings",
+        ["SettingsApprovalTitle"] = "Approval & Security Policy",
+        ["SettingsApprovalHelpTitle"] = "How Smart, Biometric & Trusted Work",
+        ["SettingsApprovalHelpBody"] = "1. SMART (Recommended):
+• Already-paired devices (256-bit E2E HMAC key) execute commands silently without interrupting you.
+• Brand-new unknown AI Studio sessions knocking via Smart Knock ALWAYS require your hardware-backed fingerprint via the native Android system sheet.
+
+2. BIOMETRIC (Strict):
+• Prompts your native fingerprint sheet on EVERY sensitive remote action (git push, Cloudflare deploy, APK install, shell command) even when already paired.
+
+3. TRUSTED (Hands-Free):
+• Zero fingerprint popups for paired commands (equivalent to Smart for paired sessions) and auto-approves trusted commands without interruption. Use only on your private personal phone.",
+        ["SettingsModeSmart"] = "Smart",
+        ["SettingsModeBiometric"] = "Biometric",
+        ["SettingsModeTrusted"] = "Trusted",
+        ["SettingsModeSmartDesc"] = "Silent 256-bit E2E HMAC for paired sessions; native hardware fingerprint for new Smart Knocks.",
+        ["SettingsModeBioDesc"] = "Requires native hardware fingerprint confirmation before every push, deploy, install, or shell run.",
+        ["SettingsModeTrustedDesc"] = "Hands-free mode: zero biometric prompts on paired actions.",
+        ["SettingsHwBioStrongBox"] = "Hardware Auth · StrongBox ECDSA-P256 Ready",
+        ["SettingsHwBioTee"] = "Hardware Auth · TEE Biometric Keystore Ready",
+        ["SettingsHwBioFallback"] = "Hardware Auth · Device Credential / PIN Fallback",
+        ["SettingsResilienceTitle"] = "Zero-Click Background & System Overlay",
+        ["SettingsResilienceDesc"] = "Allow 'Appear on top' so the native system fingerprint prompt pops instantly over any app (even when OmniAgent is closed), and keep Battery Unrestricted.",
+        ["SettingsOverlayOk"] = "System Overlay ✓",
+        ["SettingsOverlayNeed"] = "Grant Overlay",
+        ["SettingsBatteryOk"] = "Battery Unrestricted ✓",
+        ["SettingsBatteryNeed"] = "Unrestricted Battery",
+        ["SettingsAlwaysOnSwitch"] = "Always-On Auto-Wake (Boot + Watchdog)",
+        ["SettingsSmartKnockSwitch"] = "Zero-Secret Smart Knock Inbox",
+        ["SettingsConnectionsTitle"] = "Cloudflare, GitHub & Termux",
+        ["SettingsRelayBtn"] = "Worker & Key",
+        ["SettingsCfDeployBtn"] = "CF Auto-Deploy",
+        ["SettingsGithubBtn"] = "GitHub Push",
+        ["SettingsTermuxBtn"] = "Termux / Debian",
+        ["SettingsDesignSyncTitle"] = "Cavernize One UI 9 Design Sync",
+        ["SettingsDesignSyncHelpTitle"] = "Zero-Quota Shared Design System",
+        ["SettingsDesignSyncHelpBody"] = "OmniAgent shares the exact same OneUiTheme, OneUiComponents, OneUiIconView, and SF Pro typography as CavernizeAndroid.
+
+• Compile-time: GitHub Actions & Federation automatically pull Cavernize's latest UI files into OmniAgent with zero AI quota.
+• Runtime: OmniAgent also queries Cavernize's live design tokens over <10 ms same-signature IPC.",
+        ["SettingsDesignSyncNowBtn"] = "Sync Tokens from Cavernize",
+        ["SettingsDesignSyncInfoFmt"] = "Kit {0} · Source: {1} · Last IPC: {2}",
+        ["SettingsLanguageLabel"] = "Interface Language",
+        ["SettingsLangAuto"] = "Automatic (System)",
+        ["SettingsLangPt"] = "Português (Brasil)",
+        ["SettingsLangEn"] = "English",
+
+        // Native System Biometric Prompt
+        ["KnockPromptTitle"] = "OmniAgent · Connect AI Studio",
+        ["KnockPromptSubFmt"] = "SAS Code: {0} · {1}",
+        ["KnockPromptDescFmt"] = "{0}
+Verify the SAS code and touch your fingerprint to release the E2E encrypted session (hardware-backed key).",
+        ["KnockDenyBtn"] = "Deny (15m)",
+        ["GatePromptTitle"] = "OmniAgent · Confirm Action",
+        ["GatePromptDescFmt"] = "Remote command '{0}' requested.
+Touch your fingerprint to approve with your hardware key.",
+
+        // Modals & Common
+        ["SaveBtn"] = "Save",
+        ["CancelBtn"] = "Cancel",
+        ["CloseBtn"] = "Close",
+        ["OkBtn"] = "OK",
+        ["GenerateBtn"] = "Generate",
+        ["CopyKeyBtn"] = "Copy Key",
+        ["TestBtn"] = "Test",
+        ["RelayModalTitle"] = "Cloudflare Hub & Pair Key",
+        ["CfModalTitle"] = "Cloudflare Auto-Deploy (Hub v6)",
+        ["GithubModalTitle"] = "Direct GitHub Push (Optional)",
+        ["TermuxModalTitle"] = "Termux & Debian PRoot Setup",
+        ["RelayUrlLabel"] = "Cloudflare Worker URL (https://...workers.dev)",
+        ["PairKeyLabel"] = "256-bit Pair Key (leave blank to keep current)",
+        ["CfTokenLabel"] = "Cloudflare API Token (Workers Scripts: Edit)",
+        ["CfWorkerLabel"] = "Worker Name",
+        ["CfAccountLabel"] = "Account ID (auto-detected on Test)",
+        ["GithubRepoLabel"] = "Repository (owner/repo)",
+        ["GithubBranchLabel"] = "Branch",
+        ["GithubPatLabel"] = "GitHub Fine-Grained PAT (leave blank to keep)",
+        ["TermuxScriptLabel"] = "Custom Start Script Path (optional)",
+        ["TermuxCopyCmdBtn"] = "Copy 1-Line Debian Install",
+        ["TermuxOpenPermsBtn"] = "App Permissions",
+        ["OpenCloudflareTokenBtn"] = "Create CF Token",
+        ["OpenGithubTokenBtn"] = "Create GitHub Token"
+    };
+
+    static Dictionary<string, string> CreatePortuguese() => new(StringComparer.Ordinal) {
+        ["AppTitle"] = "OmniAgent",
+        ["AppSubtitle"] = "Hub da Tríade · E2E Zero-Trust · Ponte Cavernize",
+        ["TabHub"] = "Hub",
+        ["TabFiles"] = "Arquivos",
+        ["TabBridge"] = "Ponte",
+        ["TabSettings"] = "Ajustes",
+
+        // Hub Tab
+        ["HubTitle"] = "Hub da Tríade",
+        ["HubSubtitle"] = "Visão ao vivo de Cavern, OmniAgent e Dynamic Fractal Planner",
+        ["HubRefreshBtn"] = "Atualizar",
+        ["HubRefreshing"] = "Sincronizando estado da Tríade no GitHub e Debian...",
+        ["HubActiveWaveTitle"] = "Wave Ativa & Próximo Passo",
+        ["HubWaveNextLabel"] = "Próximo",
+        ["HubReposTitle"] = "Repositórios da Tríade",
+        ["HubActionsTitle"] = "Ações Inteligentes",
+        ["HubPullTriadBtn"] = "Atualizar Tríade (Debian)",
+        ["HubUpdateCavernizeBtn"] = "Atualizar APK Cavernize",
+        ["HubUpdateOmniBtn"] = "Atualizar APK OmniAgent",
+        ["HubSelfCheckCavernizeBtn"] = "Checkup Cavernize",
+        ["HubOpenCavernizeBtn"] = "Abrir Cavernize",
+        ["HubDocsTitle"] = "Documentos do Projeto (Zero Cota)",
+        ["HubRecentSyncTitle"] = "Histórico Recente (Sync Ledger)",
+        ["HubCiPass"] = "CI OK",
+        ["HubCiFail"] = "CI FALHOU",
+        ["HubCiRunning"] = "CI RODANDO",
+        ["HubCiIdle"] = "CI PRONTO",
+        ["HubDirtyFmt"] = "{0} edições locais",
+        ["HubCleanLocal"] = "Debian limpo",
+        ["HubLocalOffline"] = "GitHub ao vivo",
+        ["HubStatsFmt"] = "Extras Pendentes: {0} · Lições (BL): {1}",
+        ["HubNoSyncEntries"] = "Toque em Atualizar para carregar o histórico recente do GitHub.",
+        ["HubApkDownloading"] = "Baixando APK assinado mais recente do GitHub Releases...",
+        ["HubApkReady"] = "Abrindo instalador do Android...",
+        ["HubApkNotFound"] = "Nenhum arquivo APK encontrado na última release.",
+
+        // Files Tab
+        ["FilesTitle"] = "Arquivos Debian & Android",
+        ["FilesSubtitle"] = "Explore o Termux / Debian PRoot localmente via 127.0.0.1 autenticado",
+        ["FilesSearchHint"] = "Filtrar arquivos nesta pasta...",
+        ["FilesUpBtn"] = "Subir",
+        ["FilesRefreshBtn"] = "Recarregar",
+        ["FilesNewFolderBtn"] = "+ Pasta",
+        ["FilesDaemonOfflineTitle"] = "Ponte local do Debian / Termux está dormindo",
+        ["FilesDaemonOfflineBody"] = "Acorde o daemon Debian/Termux para navegar em /root, repositórios do Antigravity e pasta do Termux em <5 ms localmente — ou navegue no /sdcard do Android abaixo.",
+        ["FilesWakeNowBtn"] = "Acordar Debian / Termux",
+        ["FilesBrowseSdcardBtn"] = "Explorar Android /sdcard",
+        ["FilesEmptyDir"] = "Esta pasta está vazia.",
+        ["FilesCountFmt"] = "{0} itens · {1}",
+        ["FilesPreviewCopyBtn"] = "Copiar",
+        ["FilesPreviewExportBtn"] = "Exportar / Compartilhar",
+        ["FilesExportedToastFmt"] = "Exportado para {0}",
+        ["FilesCopiedToast"] = "Copiado para a área de transferência.",
+        ["FilesBinaryNotice"] = "Pré-visualização de binário desativada. Use Exportar / Compartilhar para copiar para /sdcard/Download/OmniExport/ e abrir no Android.",
+        ["FilesDeleteConfirmTitle"] = "Apagar item?",
+        ["FilesDeleteConfirmFmt"] = "Remover permanentemente:
+{0}",
+        ["FilesDeleteBtn"] = "Apagar",
+        ["FilesCreateFolderTitle"] = "Nova Pasta",
+        ["FilesCreateFolderHint"] = "Nome da pasta",
+        ["FilesCreateBtn"] = "Criar",
+
+        // Bridge Tab
+        ["BridgeTitle"] = "Ponte Ao Vivo & Automação",
+        ["BridgeAlwaysOnOnline"] = "SEMPRE ATIVO",
+        ["BridgeAlwaysOnStandby"] = "AUTO-START EM ESPERA",
+        ["BridgeNeedsSetup"] = "CONFIGURAR",
+        ["BridgeStatusOnlineFmt"] = "Automático · {0} cmd(s) processados · Modo: {1}",
+        ["BridgeStatusNeedsSetup"] = "Configure o Worker Cloudflare e a Chave uma vez. Depois disso o OmniAgent roda e acorda sozinho sem precisar clicar em Ligar.",
+        ["BridgeWakeTermuxBtn"] = "Acordar Termux",
+        ["BridgeTestRelayBtn"] = "Testar Relay",
+        ["BridgeCopyKnockBtn"] = "Copiar Knock ID",
+        ["BridgePauseBtn"] = "Pausar",
+        ["BridgeResumeBtn"] = "Retomar Auto",
+        ["BridgeLinksCardTitle"] = "Conexões do Ecossistema",
+        ["BridgeCavernizeLinked"] = "IPC Cavernize · Automático (Mesma Assinatura)",
+        ["BridgeCavernizeMissing"] = "Cavernize não instalado",
+        ["BridgeDebianOnline"] = "Loopback Debian · Conectado (<5 ms)",
+        ["BridgeDebianOffline"] = "Loopback Debian · Dormindo (Toque Acordar Termux)",
+        ["BridgeActivityTitle"] = "Atividade do Agente",
+        ["BridgeActivityEmpty"] = "Nenhuma atividade ainda. Ponte automática escutando em 2º plano.",
+        ["BridgeClearBtn"] = "Limpar",
+
+        // Settings Tab
+        ["SettingsTitle"] = "Ajustes do OmniAgent",
+        ["SettingsApprovalTitle"] = "Política de Aprovação & Segurança",
+        ["SettingsApprovalHelpTitle"] = "Como funcionam Smart, Digital e Livre (Trust)",
+        ["SettingsApprovalHelpBody"] = "1. SMART (Recomendado):
+• Sessões já pareadas (chave HMAC E2E 256-bit) executam silenciosamente sem interromper você.
+• Novas sessões desconhecidas do AI Studio via Smart Knock SEMPRE pedem sua digital com chave de hardware no prompt nativo do sistema.
+
+2. DIGITAL (Rigoroso):
+• Abre o prompt nativo da digital em TODA ação crítica remota (git push, deploy Cloudflare, instalar APK, shell) mesmo já pareado.
+
+3. LIVRE / TRUST (Automático):
+• Zero popups de biometria para comandos pareados (não pede confirmação extra a cada ação). Deixe ativado somente no seu celular pessoal.",
+        ["SettingsModeSmart"] = "Smart",
+        ["SettingsModeBiometric"] = "Digital",
+        ["SettingsModeTrusted"] = "Livre (Trust)",
+        ["SettingsModeSmartDesc"] = "HMAC E2E 256-bit silencioso quando pareado; digital nativa de hardware para novos Smart Knocks.",
+        ["SettingsModeBioDesc"] = "Pede confirmação nativa pela digital antes de cada push, deploy, instalação ou shell remoto.",
+        ["SettingsModeTrustedDesc"] = "Modo mãos-livres: não pede biometria extra em comandos já pareados.",
+        ["SettingsHwBioStrongBox"] = "Chave Hardware · StrongBox ECDSA-P256 Ativo",
+        ["SettingsHwBioTee"] = "Chave Hardware · Keystore TEE Biométrico Ativo",
+        ["SettingsHwBioFallback"] = "Autenticação · PIN / Credencial do Aparelho",
+        ["SettingsResilienceTitle"] = "2º Plano Automático & Prompt Nativo",
+        ["SettingsResilienceDesc"] = "Ative 'Sobrepor a outros apps' para o prompt nativo da digital aparecer sobre qualquer tela (mesmo com o Omni fechado), e mantenha Bateria sem restrições.",
+        ["SettingsOverlayOk"] = "Sobreposição ✓",
+        ["SettingsOverlayNeed"] = "Ativar Sobreposição",
+        ["SettingsBatteryOk"] = "Bateria Livre ✓",
+        ["SettingsBatteryNeed"] = "Liberar Bateria",
+        ["SettingsAlwaysOnSwitch"] = "Auto-Wake Sempre Ativo (Boot + Watchdog)",
+        ["SettingsSmartKnockSwitch"] = "Receber Smart Knock (Zero Tokens)",
+        ["SettingsConnectionsTitle"] = "Cloudflare, GitHub & Termux",
+        ["SettingsRelayBtn"] = "Worker & Chave",
+        ["SettingsCfDeployBtn"] = "Deploy CF",
+        ["SettingsGithubBtn"] = "GitHub Push",
+        ["SettingsTermuxBtn"] = "Termux / Debian",
+        ["SettingsDesignSyncTitle"] = "Sync de Design One UI 9 (Cavernize)",
+        ["SettingsDesignSyncHelpTitle"] = "Sistema de Design Compartilhado (Zero Cota)",
+        ["SettingsDesignSyncHelpBody"] = "O OmniAgent compartilha exatamente os mesmos OneUiTheme, OneUiComponents, OneUiIconView e tipografia SF Pro do CavernizeAndroid.
+
+• No Build (CI): GitHub Actions e a Federação puxam automaticamente as mudanças visuais do Cavernize para o Omni sem gastar cota de IA.
+• Ao Vivo (IPC): O OmniAgent também sincroniza os tokens visuais em tempo real direto do Cavernize em <10 ms.",
+        ["SettingsDesignSyncNowBtn"] = "Sincronizar Design do Cavernize",
+        ["SettingsDesignSyncInfoFmt"] = "Kit {0} · Origem: {1} · Último IPC: {2}",
+        ["SettingsLanguageLabel"] = "Idioma da Interface",
+        ["SettingsLangAuto"] = "Automático (Sistema)",
+        ["SettingsLangPt"] = "Português (Brasil)",
+        ["SettingsLangEn"] = "English",
+
+        // Native System Biometric Prompt
+        ["KnockPromptTitle"] = "OmniAgent · Conectar AI Studio",
+        ["KnockPromptSubFmt"] = "Código SAS: {0} · {1}",
+        ["KnockPromptDescFmt"] = "{0}
+Confirme o código acima com sua digital para liberar a sessão E2E (protegida por chave de hardware).",
+        ["KnockDenyBtn"] = "Recusar (15m)",
+        ["GatePromptTitle"] = "OmniAgent · Confirmar Ação",
+        ["GatePromptDescFmt"] = "Comando remoto '{0}' solicitado.
+Toque na sua digital para aprovar com a chave de hardware.",
+
+        // Modals & Common
+        ["SaveBtn"] = "Salvar",
+        ["CancelBtn"] = "Cancelar",
+        ["CloseBtn"] = "Fechar",
+        ["OkBtn"] = "OK",
+        ["GenerateBtn"] = "Gerar",
+        ["CopyKeyBtn"] = "Copiar Chave",
+        ["TestBtn"] = "Testar",
+        ["RelayModalTitle"] = "Hub Cloudflare & Chave Pareada",
+        ["CfModalTitle"] = "Auto-Deploy Cloudflare (Hub v6)",
+        ["GithubModalTitle"] = "GitHub Push Direto (Opcional)",
+        ["TermuxModalTitle"] = "Configurar Termux & Debian PRoot",
+        ["RelayUrlLabel"] = "URL do Worker Cloudflare (https://...workers.dev)",
+        ["PairKeyLabel"] = "Chave 256-bit (deixe vazio para manter atual)",
+        ["CfTokenLabel"] = "Token API Cloudflare (Workers Scripts: Edit)",
+        ["CfWorkerLabel"] = "Nome do Worker",
+        ["CfAccountLabel"] = "Account ID (detectado no Testar)",
+        ["GithubRepoLabel"] = "Repositório (dono/repo)",
+        ["GithubBranchLabel"] = "Branch",
+        ["GithubPatLabel"] = "Fine-Grained PAT GitHub (vazio = manter)",
+        ["TermuxScriptLabel"] = "Script de inicialização customizado (opcional)",
+        ["TermuxCopyCmdBtn"] = "Copiar Instalação 1-Linha Debian",
+        ["TermuxOpenPermsBtn"] = "Permissões do App",
+        ["OpenCloudflareTokenBtn"] = "Criar Token CF",
+        ["OpenGithubTokenBtn"] = "Criar Token GitHub"
+    };
+}

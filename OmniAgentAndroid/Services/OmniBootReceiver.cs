@@ -4,29 +4,41 @@ using Android.Content;
 namespace OmniAgentAndroid.Services;
 
 /// <summary>
-/// Automatically restarts <see cref="OmniAgentForegroundService"/> after device reboot or APK update
-/// when the user previously enabled the agent, preventing background bridge downtime.
+/// Always-On auto-wake receiver handling device boot, APK upgrades, Recents task-removal restarts,
+/// Cavernize startup wake pings (<c>OMNI_ENSURE_ALIVE</c>), and Termux Smart Knock wakes
+/// (<c>OMNI_WAKE_KNOCK</c>) so OmniAgent wakes automatically even when completely closed.
 /// </summary>
 [BroadcastReceiver(Enabled = true, Exported = true)]
-[IntentFilter([Intent.ActionBootCompleted, Intent.ActionMyPackageReplaced])]
+[IntentFilter([
+    Intent.ActionBootCompleted,
+    Intent.ActionLockedBootCompleted,
+    Intent.ActionMyPackageReplaced,
+    "android.intent.action.QUICKBOOT_POWERON",
+    ActionWatchdogRestart,
+    ActionEnsureOmniAlive,
+    ActionWakeKnock
+])]
 public sealed class OmniBootReceiver : BroadcastReceiver {
+    public const string ActionWatchdogRestart = "hu.sbence.cavern.omniagent.WATCHDOG_RESTART";
+    public const string ActionEnsureOmniAlive = "hu.sbence.cavern.ipc.OMNI_ENSURE_ALIVE";
+    public const string ActionWakeKnock = "hu.sbence.cavern.ipc.OMNI_WAKE_KNOCK";
+
     public override void OnReceive(Context context, Intent intent) {
         if (context == null || intent == null) {
             return;
         }
         string action = intent.Action ?? "";
-        if (!string.Equals(action, Intent.ActionBootCompleted, StringComparison.Ordinal) &&
-            !string.Equals(action, Intent.ActionMyPackageReplaced, StringComparison.Ordinal)) {
-            return;
-        }
         try {
             OmniSettingsStore store = new(context);
-            if (store.ServiceEnabled && store.HasPairSecret && OmniSettingsStore.TryNormalizeRelayUrl(store.RelayUrl, out _)) {
-                OmniSettingsStore.AppendActivity("BOOT", $"Auto-restarting OmniAgent after {action}.");
-                OmniAgentForegroundService.Start(context);
+            bool forceWake = string.Equals(action, ActionWakeKnock, StringComparison.Ordinal);
+            if ((store.ServiceEnabled || forceWake) &&
+                store.HasPairSecret &&
+                OmniSettingsStore.TryNormalizeRelayUrl(store.RelayUrl, out _)) {
+                OmniSettingsStore.AppendActivity("WAKE", $"Auto-waking Always-On service ({action}).");
+                OmniAgentForegroundService.EnsureAlwaysOn(context);
             }
         } catch (Exception ex) {
-            OmniSettingsStore.AppendActivity("ERR", $"Boot auto-start skipped: {ex.Message}");
+            OmniSettingsStore.AppendActivity("ERR", $"Auto-wake skipped: {ex.Message}");
         }
     }
 }

@@ -672,6 +672,14 @@ class OmniAgentProtocolTests(unittest.TestCase):
             (mount / "omniagent" / "worker").mkdir(parents=True)
             (mount / "omniagent" / "worker" / "cloudflare_live_relay_worker.js").write_text("// w6", encoding="utf-8")
 
+            (ws_cav / "CavernSamples" / "CavernizeAndroid" / "Theme").mkdir(parents=True)
+            (ws_cav / "CavernSamples" / "CavernizeAndroid" / "Views").mkdir(parents=True)
+            (ws_cav / "CavernSamples" / "CavernizeAndroid" / "Assets" / "fonts").mkdir(parents=True)
+            (ws_cav / "CavernSamples" / "CavernizeAndroid" / "Theme" / "OneUiTheme.cs").write_text("// theme", encoding="utf-8")
+            (ws_cav / "CavernSamples" / "CavernizeAndroid" / "Views" / "OneUiIconView.cs").write_text("// icons", encoding="utf-8")
+            (ws_cav / "CavernSamples" / "CavernizeAndroid" / "Views" / "OneUiComponents.cs").write_text("// comps", encoding="utf-8")
+            (ws_cav / "CavernSamples" / "CavernizeAndroid" / "Assets" / "fonts" / "sf_pro_android_ui.ttf").write_bytes(b"FONT")
+
             res = rfed.sync_mirrors(ws_cav, mirror_name="all", apply=True, mount_root=mount)
             self.assertTrue(res["ok"])
             self.assertTrue((ws_cav / ".agents" / "plugins" / "dynamic-fractal-planner" / "plugin.json").is_file())
@@ -679,6 +687,63 @@ class OmniAgentProtocolTests(unittest.TestCase):
             self.assertFalse((ws_cav / ".agents" / "plugins" / "dynamic-fractal-planner" / "AGENTS.md").exists())
             self.assertEqual((ws_cav / ".agents" / "agent" / "x.py").read_text(encoding="utf-8"), "# x")
             self.assertEqual((ws_cav / ".agents" / "docs" / "cloudflare_live_relay_worker.js").read_text(encoding="utf-8"), "// w6")
+            self.assertEqual((mount / "omniagent" / "OmniAgentAndroid" / "SharedOneUi" / "OneUiTheme.cs").read_text(encoding="utf-8"), "// theme")
+            self.assertEqual((mount / "omniagent" / "OmniAgentAndroid" / "Assets" / "fonts" / "sf_pro_android_ui.ttf").read_bytes(), b"FONT")
+
+    def test_local_fs_loopback_server_security_and_browse(self) -> None:
+        import urllib.error
+        import urllib.parse
+        import urllib.request
+        import omni_agent_daemon as daemon
+
+        pair_hex = "a1" * 32
+        key = daemon.derive_local_fs_key(pair_hex)
+        self.assertEqual(len(key), 64)
+
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            (repo / "sub").mkdir()
+            (repo / "hello.txt").write_text("line1\nline2\n", encoding="utf-8")
+
+            srv = daemon.start_local_fs_server(pair_hex, repo, host="127.0.0.1", port=0)
+            self.assertIsNotNone(srv)
+            assert srv is not None
+            port = srv.server_address[1]
+            base = f"http://127.0.0.1:{port}"
+            try:
+                # 1. Missing/invalid HMAC key must be rejected with 401
+                with self.assertRaises(urllib.error.HTTPError) as ctx:
+                    urllib.request.urlopen(f"{base}/local/health", timeout=5)
+                self.assertEqual(ctx.exception.code, 401)
+
+                # 2. Valid key lists allowed repo directory
+                q = urllib.parse.urlencode({"path": str(repo)})
+                req = urllib.request.Request(f"{base}/local/fs/list?{q}", headers={"X-Omni-Local-Key": key})
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                self.assertTrue(data["ok"])
+                names = [e["name"] for e in data["entries"]]
+                self.assertEqual(names[0], "sub")  # folders sorted first
+                self.assertIn("hello.txt", names)
+
+                # 3. Valid key reads file preview
+                q2 = urllib.parse.urlencode({"path": str(repo / "hello.txt")})
+                req2 = urllib.request.Request(f"{base}/local/fs/read?{q2}", headers={"X-Omni-Local-Key": key})
+                with urllib.request.urlopen(req2, timeout=5) as resp2:
+                    rd = json.loads(resp2.read().decode("utf-8"))
+                self.assertTrue(rd["ok"])
+                self.assertEqual(rd["lineCount"], 2)
+                self.assertIn("line2", rd["content"])
+
+                # 4. Path traversal outside allowed roots must be blocked with 403
+                q3 = urllib.parse.urlencode({"path": "/etc/passwd"})
+                req3 = urllib.request.Request(f"{base}/local/fs/read?{q3}", headers={"X-Omni-Local-Key": key})
+                with self.assertRaises(urllib.error.HTTPError) as ctx3:
+                    urllib.request.urlopen(req3, timeout=5)
+                self.assertEqual(ctx3.exception.code, 403)
+            finally:
+                srv.shutdown()
+                srv.server_close()
 
 
 if __name__ == "__main__":

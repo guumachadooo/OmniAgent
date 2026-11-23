@@ -12,10 +12,58 @@ permissions:
 jobs:
   omniagent:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
+
+      - name: Zero-Quota Sync Cavernize One UI 9 Design Kit
+        run: |
+          python3 - <<'PY'
+          import hashlib, pathlib, urllib.request
+          from datetime import datetime, timezone
+
+          raw_base = "https://raw.githubusercontent.com/guumachadooo/Cavern/master"
+          targets = [
+              ("CavernSamples/CavernizeAndroid/Theme/OneUiTheme.cs", "OmniAgentAndroid/SharedOneUi/OneUiTheme.cs"),
+              ("CavernSamples/CavernizeAndroid/Views/OneUiIconView.cs", "OmniAgentAndroid/SharedOneUi/OneUiIconView.cs"),
+              ("CavernSamples/CavernizeAndroid/Views/OneUiComponents.cs", "OmniAgentAndroid/SharedOneUi/OneUiComponents.cs"),
+              ("CavernSamples/CavernizeAndroid/Assets/fonts/sf_pro_android_ui.ttf", "OmniAgentAndroid/Assets/fonts/sf_pro_android_ui.ttf"),
+          ]
+          h = hashlib.sha256()
+          synced = 0
+          for src, dst in targets:
+              dst_p = pathlib.Path(dst)
+              dst_p.parent.mkdir(parents=True, exist_ok=True)
+              try:
+                  req = urllib.request.Request(f"{raw_base}/{src}", headers={"User-Agent": "OmniAgent-DesignSync/2.1"})
+                  with urllib.request.urlopen(req, timeout=15) as r:
+                      data = r.read()
+                  if data:
+                      dst_p.write_bytes(data)
+                      synced += 1
+              except Exception as exc:
+                  print(f"[design-sync] Fallback to committed {dst}: {exc}")
+              if dst_p.exists():
+                  h.update(dst_p.read_bytes())
+
+          fp = h.hexdigest()[:12]
+          ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+          manifest = (
+              "namespace OmniAgentAndroid.SharedOneUi;\n\n"
+              "/// <summary>\n"
+              "/// Auto-generated zero-quota manifest tracking the exact Cavernize One UI 9 Design Kit\n"
+              "/// synced into OmniAgentAndroid via Federation mirrors / BuildOmniAgent.yml CI.\n"
+              "/// </summary>\n"
+              "public static class OneUiDesignKitManifest {\n"
+              "    public const string SourceRepo = \"guumachadooo/Cavern\";\n"
+              "    public const string SourceBranch = \"master\";\n"
+              f"    public const string KitFingerprint = \"{fp}\";\n"
+              f"    public const string SyncedAtUtc = \"{ts}\";\n"
+              "}\n"
+          )
+          pathlib.Path("OmniAgentAndroid/SharedOneUi/OneUiDesignKitManifest.cs").write_text(manifest, encoding="utf-8")
+          print(f"[design-sync] synced={synced}/{len(targets)} fingerprint={fp}")
+          PY
 
       - name: Setup Java 21
         uses: actions/setup-java@v6
@@ -51,14 +99,13 @@ jobs:
           dotnet publish OmniAgentAndroid/OmniAgentAndroid.csproj \
             -f net11.0-android -c Release \
             -p:ApplicationVersion="$VER_CODE" \
-            -p:ApplicationDisplayVersion="2.0.${{ github.run_number }}" \
+            -p:ApplicationDisplayVersion="2.1.${{ github.run_number }}" \
             -p:AndroidKeyStore=true \
             -p:AndroidSigningKeyStore="$GITHUB_WORKSPACE/cavernize.keystore" \
             -p:AndroidSigningKeyAlias=cavernize \
             -p:AndroidSigningKeyPass=cavernize \
             -p:AndroidSigningStorePass=cavernize \
             -o "$RUNNER_TEMP/omniagent_out"
-
           SIGNED_APK=$(find "$RUNNER_TEMP/omniagent_out" -name "*-Signed.apk" | head -n 1)
           if [ -z "$SIGNED_APK" ]; then
             SIGNED_APK=$(find "$RUNNER_TEMP/omniagent_out" -name "*.apk" | head -n 1)
@@ -75,12 +122,14 @@ jobs:
       - name: Publish versioned OmniAgent GitHub Release (auto-advancing Latest)
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: v2.0.${{ github.run_number }}
-          name: OmniAgent v2.0.${{ github.run_number }}
+          tag_name: v2.1.${{ github.run_number }}
+          name: OmniAgent v2.1.${{ github.run_number }}
           body: |
-            Signed release for **OmniAgent Companion `v2.0.${{ github.run_number }}`** (Build `#${{ github.run_number }}`, commit `${{ github.sha }}`).
-            - Signed with the same release certificate as [**Cavernize Android**](https://github.com/guumachadooo/Cavern/releases/latest) so local `protectionLevel="signature"` IPC (`hu.sbence.cavern.permission.OMNI_BRIDGE`) verifies with `<10 ms` latency.
-            - Includes One UI 9 interface, Cloudflare Hub v6 Durable Objects Worker auto-deploy, instant biometric overlay approval, direct GitHub push, APK installer, and Termux daemon launcher.
+            Signed release for **OmniAgent Companion `v2.1.${{ github.run_number }}`** (Build `#${{ github.run_number }}`, commit `${{ github.sha }}`).
+            - **Zero-Quota Cavernize One UI 9 Design Inheritance:** Auto-synced `OneUiTheme`, `OneUiIconView`, `OneUiComponents`, & SF Pro directly from `guumachadooo/Cavern@master` + live `<10 ms` runtime token sync.
+            - **Zero-Click Always-On Automation & Cold-Wake:** Auto-starts on launch/boot/update with persisted 15m JobScheduler watchdog, `OnTaskRemoved` quick-restart, Cavernize launch wake, and Debian daemon Smart Knock wake.
+            - **Native System Biometric Overlay (Zero App Window) + StrongBox/TEE Hardware ECDSA:** Invisible translucent host invokes Android/Samsung's native `BiometricPrompt` sheet directly over any app with hardware-bound asymmetric signing.
+            - **Triad Command Hub & Local Debian/Termux Explorer:** Live 3-repo status (`Cavern`, `OmniAgent`, `dynamic-fractal-planner`), zero-quota Doc Reader, 1-tap APK updater, and authenticated `127.0.0.1` loopback file browser.
           prerelease: false
           make_latest: true
           files: ${{ runner.temp }}/OmniAgent-Android.apk
@@ -91,7 +140,7 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           tag_name: omniagent-latest
-          name: OmniAgent v2.0.${{ github.run_number }} (OTA Alias)
+          name: OmniAgent v2.1.${{ github.run_number }} (OTA Alias)
           prerelease: false
           make_latest: false
           files: ${{ runner.temp }}/OmniAgent-Android.apk
