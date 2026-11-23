@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+bin/
+obj/
+.bridge_vault.json
+*.keystore
+*.p12

@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net11.0-android</TargetFramework>
+    <SupportedOSPlatformVersion>26.0</SupportedOSPlatformVersion>
+    <OutputType>Exe</OutputType>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+
+    <ApplicationId>hu.sbence.cavern.omniagent</ApplicationId>
+    <ApplicationVersion>20</ApplicationVersion>
+    <ApplicationDisplayVersion>2.0.0</ApplicationDisplayVersion>
+    <ApplicationTitle>OmniAgent</ApplicationTitle>
+    <AndroidPackageFormat>apk</AndroidPackageFormat>
+    <AndroidUseAapt2>true</AndroidUseAapt2>
+    <Authors>VoidX</Authors>
+    <Description>Standalone One UI 9 Full-Agent Companion (Antigravity 2 Bridge, Direct GitHub Push, APK Installer, Termux Launcher &amp; Smart Biometric Gate).</Description>
+    <!-- Intentionally pin targetSdkVersion=35 in AndroidManifest.xml while compiling against newer Android TFM -->
+    <NoWarn>$(NoWarn);XA1006;XA4211</NoWarn>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(Configuration)' == 'Release'">
+    <Optimize>true</Optimize>
+    <PublishReadyToRun>false</PublishReadyToRun>
+    <PublishTrimmed>false</PublishTrimmed>
+    <AndroidLinkMode>None</AndroidLinkMode>
+  </PropertyGroup>
+</Project>

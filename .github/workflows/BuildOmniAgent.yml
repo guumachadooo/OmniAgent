@@ -1,0 +1,99 @@
+name: Build OmniAgent Android APK
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  omniagent:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup Java 21
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Setup .NET 11 SDK
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '11.0.x'
+
+      - name: Install .NET Android workload
+        run: dotnet workload install android
+
+      - name: Install Android SDK dependencies
+        run: |
+          dotnet build OmniAgentAndroid/OmniAgentAndroid.csproj \
+            -t:InstallAndroidDependencies -f net11.0-android -c Release \
+            -p:AcceptAndroidSDKLicenses=true
+
+      - name: Restore shared release signing keystore (Cavernize same-signature IPC)
+        run: |
+          base64 -d .github/signing/cavernize.keystore.b64 > "$GITHUB_WORKSPACE/cavernize.p12"
+          keytool -importkeystore \
+            -srckeystore "$GITHUB_WORKSPACE/cavernize.p12" -srcstoretype PKCS12 -srcstorepass cavernize \
+            -destkeystore "$GITHUB_WORKSPACE/cavernize.keystore" -deststoretype PKCS12 -deststorepass cavernize \
+            -destkeypass cavernize -noprompt
+
+      - name: Build & sign OmniAgent Android APK (Release)
+        run: |
+          VER_CODE=$(($(date +%s) / 60))
+          dotnet publish OmniAgentAndroid/OmniAgentAndroid.csproj \
+            -f net11.0-android -c Release \
+            -p:ApplicationVersion="$VER_CODE" \
+            -p:ApplicationDisplayVersion="2.0.${{ github.run_number }}" \
+            -p:AndroidKeyStore=true \
+            -p:AndroidSigningKeyStore="$GITHUB_WORKSPACE/cavernize.keystore" \
+            -p:AndroidSigningKeyAlias=cavernize \
+            -p:AndroidSigningKeyPass=cavernize \
+            -p:AndroidSigningStorePass=cavernize \
+            -o "$RUNNER_TEMP/omniagent_out"
+
+          SIGNED_APK=$(find "$RUNNER_TEMP/omniagent_out" -name "*-Signed.apk" | head -n 1)
+          if [ -z "$SIGNED_APK" ]; then
+            SIGNED_APK=$(find "$RUNNER_TEMP/omniagent_out" -name "*.apk" | head -n 1)
+          fi
+          cp "$SIGNED_APK" "$RUNNER_TEMP/OmniAgent-Android.apk"
+          ls -lh "$RUNNER_TEMP/OmniAgent-Android.apk"
+
+      - name: Upload OmniAgent APK Artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: OmniAgent-Android-APK
+          path: ${{ runner.temp }}/OmniAgent-Android.apk
+
+      - name: Publish versioned OmniAgent GitHub Release (auto-advancing Latest)
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: v2.0.${{ github.run_number }}
+          name: OmniAgent v2.0.${{ github.run_number }}
+          body: |
+            Signed release for **OmniAgent Companion `v2.0.${{ github.run_number }}`** (Build `#${{ github.run_number }}`, commit `${{ github.sha }}`).
+            - Signed with the same release certificate as [**Cavernize Android**](https://github.com/guumachadooo/Cavern/releases/latest) so local `protectionLevel="signature"` IPC (`hu.sbence.cavern.permission.OMNI_BRIDGE`) verifies with `<10 ms` latency.
+            - Includes One UI 9 interface, Cloudflare Hub v6 Durable Objects Worker auto-deploy, instant biometric overlay approval, direct GitHub push, APK installer, and Termux daemon launcher.
+          prerelease: false
+          make_latest: true
+          files: ${{ runner.temp }}/OmniAgent-Android.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update rolling omniagent-latest OTA alias
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: omniagent-latest
+          name: OmniAgent v2.0.${{ github.run_number }} (OTA Alias)
+          prerelease: false
+          make_latest: false
+          files: ${{ runner.temp }}/OmniAgent-Android.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
