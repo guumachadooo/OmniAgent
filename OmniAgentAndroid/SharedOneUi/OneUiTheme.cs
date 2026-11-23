@@ -662,7 +662,8 @@ public static class OneUiTheme {
 
     /// <summary>
     /// Serializes the active One UI 9 design tokens (palette, glass surfaces, semantic icons, corner radii)
-    /// to compact JSON so companion apps (OmniAgent) can mirror Cavernize's live visual choices with zero quota.
+    /// to compact deterministic JSON so companion apps (OmniAgent) can mirror Cavernize's live visual choices
+    /// with zero quota and without false-positive timestamp diffs.
     /// </summary>
     public static string ExportDesignTokensJson(string sourceTag = "cavernize-ipc") {
         return JsonSerializer.Serialize(new {
@@ -694,16 +695,39 @@ public static class OneUiTheme {
             iconAtmosUpmix = IconAtmosUpmix.ToArgb(),
             iconStudioExport = IconStudioExport.ToArgb(),
             iconStemsCalib = IconStemsCalib.ToArgb(),
-            iconSystemInfo = IconSystemInfo.ToArgb(),
-            utc = DateTime.UtcNow.ToString("O")
+            iconSystemInfo = IconSystemInfo.ToArgb()
         });
+    }
+
+    /// <summary>
+    /// Computes a deterministic signature of only the active visual tokens (radii + ARGB colors),
+    /// ignoring metadata such as timestamps or source labels.
+    /// </summary>
+    public static string ComputeVisualTokensSignature() {
+        return string.Create(
+            System.Globalization.CultureInfo.InvariantCulture,
+            $"{EffectiveCardCornerDp:F2}|{EffectiveButtonCornerDp:F2}|{EffectiveTileCornerDp:F2}|" +
+            $"{BgScreen.ToArgb()}|{SurfaceCard.ToArgb()}|{SurfaceElevated.ToArgb()}|{SurfaceModal.ToArgb()}|" +
+            $"{SurfaceModalRow.ToArgb()}|{SurfaceFloatingBar.ToArgb()}|{GlassRimTop.ToArgb()}|{GlassRimMid.ToArgb()}|" +
+            $"{GlassRimBottom.ToArgb()}|{Primary.ToArgb()}|{PrimaryHigh.ToArgb()}|{PrimaryPressed.ToArgb()}|" +
+            $"{Secondary.ToArgb()}|{SecondaryHigh.ToArgb()}|{Tertiary.ToArgb()}|{HighlightAccent.ToArgb()}|" +
+            $"{PeachText.ToArgb()}|{IconSpatial.ToArgb()}|{IconSliderMedia.ToArgb()}|{IconAtmosUpmix.ToArgb()}|" +
+            $"{IconStudioExport.ToArgb()}|{IconStemsCalib.ToArgb()}|{IconSystemInfo.ToArgb()}");
     }
 
     /// <summary>
     /// Applies a JSON design-token snapshot exported by Cavernize so companion apps reflect
     /// Cavernize design adjustments immediately at runtime without rebuilding or spending quota.
     /// </summary>
-    public static bool ApplyRuntimeDesignTokensJson(string json, string sourceLabel = "cavernize-ipc") {
+    public static bool ApplyRuntimeDesignTokensJson(string json, string sourceLabel = "cavernize-ipc") =>
+        ApplyRuntimeDesignTokensJson(json, sourceLabel, out _);
+
+    /// <summary>
+    /// Applies a JSON design-token snapshot exported by Cavernize and reports via
+    /// <paramref name="visualChanged"/> whether any visual color or corner-radius token actually changed.
+    /// </summary>
+    public static bool ApplyRuntimeDesignTokensJson(string json, string sourceLabel, out bool visualChanged) {
+        visualChanged = false;
         if (string.IsNullOrWhiteSpace(json)) {
             return false;
         }
@@ -713,6 +737,7 @@ public static class OneUiTheme {
             if (root.ValueKind != JsonValueKind.Object) {
                 return false;
             }
+            string beforeSig = ComputeVisualTokensSignature();
             if (TryGetFloat(root, "cardCornerDp", out float cDp)) EffectiveCardCornerDp = Math.Clamp(cDp, 12f, 36f);
             if (TryGetFloat(root, "buttonCornerDp", out float bDp)) EffectiveButtonCornerDp = Math.Clamp(bDp, 10f, 32f);
             if (TryGetFloat(root, "tileCornerDp", out float tDp)) EffectiveTileCornerDp = Math.Clamp(tDp, 12f, 32f);
@@ -740,6 +765,8 @@ public static class OneUiTheme {
             if (TryGetArgb(root, "iconStemsCalib", out c)) IconStemsCalib = c;
             if (TryGetArgb(root, "iconSystemInfo", out c)) IconSystemInfo = c;
             ActiveDesignTokensSource = string.IsNullOrWhiteSpace(sourceLabel) ? "cavernize-ipc" : sourceLabel;
+            string afterSig = ComputeVisualTokensSignature();
+            visualChanged = !string.Equals(beforeSig, afterSig, StringComparison.Ordinal);
             return true;
         } catch {
             return false;

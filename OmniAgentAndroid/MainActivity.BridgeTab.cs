@@ -19,6 +19,9 @@ public sealed partial class MainActivity {
     TextView bridgeDebianStatusTv;
     TextView bridgeRelayStatusTv;
     TextView bridgeActivityTv;
+    string lastRenderedActivityText = "";
+    bool debianHealthChecking;
+    long lastDebianProbeMs;
 
     void BuildBridgeTab(LinearLayout parent) {
         parent.AddView(MakeTabHeader(
@@ -151,8 +154,8 @@ public sealed partial class MainActivity {
         parent.AddView(logCard);
     }
 
-    void RefreshBridgeTabState() {
-        if (bridgeStateChipTv == null) {
+    void RefreshBridgeTabState(bool probeDebian = false) {
+        if (bridgeStateChipTv == null || IsFinishing || IsDestroyed) {
             return;
         }
         bool configured = store.HasPairSecret && !string.IsNullOrWhiteSpace(store.RelayUrl);
@@ -175,28 +178,43 @@ public sealed partial class MainActivity {
             bridgeToggleBtn.Text = S["BridgeResumeBtn"];
         }
 
-        bool cavInstalled = OmniAgentForegroundService.IsPackageInstalled(this, CavernizeIpcBridgeClient.CavernizePackage);
-        bool cavSigOk = cavInstalled && CavernizeIpcBridgeClient.IsSignatureVerified(this);
+        bool cavSigOk = CavernizeIpcBridgeClient.IsSignatureVerified(this);
         bridgeCavernizeStatusTv.Text = cavSigOk ? S["BridgeCavernizeLinked"] : S["BridgeCavernizeMissing"];
         bridgeCavernizeStatusTv.SetTextColor(cavSigOk ? OneUiTheme.FunctionalGreen : OneUiTheme.TextMuted);
 
         bridgeRelayStatusTv.Text = string.IsNullOrWhiteSpace(store.RelayUrl) ? "—" : store.RelayUrl;
 
         List<string> logs = OmniSettingsStore.GetActivitySnapshot();
-        bridgeActivityTv.Text = logs.Count == 0 ? S["BridgeActivityEmpty"] : string.Join("\n", logs);
+        string nextLogText = logs.Count == 0 ? S["BridgeActivityEmpty"] : string.Join("\n", logs);
+        if (!string.Equals(lastRenderedActivityText, nextLogText, StringComparison.Ordinal)) {
+            lastRenderedActivityText = nextLogText;
+            bridgeActivityTv.Text = nextLogText;
+        }
 
-        _ = RefreshDebianLoopbackStatusAsync();
+        if (probeDebian) {
+            _ = RefreshDebianLoopbackStatusAsync();
+        }
     }
 
     async Task RefreshDebianLoopbackStatusAsync() {
-        (bool online, string detail) = await TermuxLocalFsClient.CheckHealthAsync(store).ConfigureAwait(false);
-        RunOnUiThread(() => {
-            if (bridgeDebianStatusTv == null) {
-                return;
-            }
-            bridgeDebianStatusTv.Text = online ? S["BridgeDebianOnline"] : S["BridgeDebianOffline"];
-            bridgeDebianStatusTv.SetTextColor(online ? OneUiTheme.FunctionalGreen : OneUiTheme.FunctionalAmber);
-        });
+        long nowMs = Android.OS.SystemClock.ElapsedRealtime();
+        if (debianHealthChecking || (lastDebianProbeMs > 0 && nowMs - lastDebianProbeMs < 5_000L)) {
+            return;
+        }
+        debianHealthChecking = true;
+        lastDebianProbeMs = nowMs;
+        try {
+            (bool online, _) = await TermuxLocalFsClient.CheckHealthAsync(store).ConfigureAwait(false);
+            RunOnUiThread(() => {
+                if (bridgeDebianStatusTv == null || IsFinishing || IsDestroyed) {
+                    return;
+                }
+                bridgeDebianStatusTv.Text = online ? S["BridgeDebianOnline"] : S["BridgeDebianOffline"];
+                bridgeDebianStatusTv.SetTextColor(online ? OneUiTheme.FunctionalGreen : OneUiTheme.FunctionalAmber);
+            });
+        } finally {
+            debianHealthChecking = false;
+        }
     }
 
     void ToggleBridgePauseResume() {

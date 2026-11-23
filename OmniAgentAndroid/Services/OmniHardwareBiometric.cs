@@ -26,9 +26,16 @@ public static class OmniHardwareBiometric {
         DeviceCredentialFallback
     }
 
-    public static HardwareBacking ProbeCapability(Context context) {
+    static long cachedProbeMs;
+    static HardwareBacking cachedBacking = HardwareBacking.DeviceCredentialFallback;
+
+    public static HardwareBacking ProbeCapability(Context context, bool forceRefresh = false) {
         if (!OperatingSystem.IsAndroidVersionAtLeast(29) || context == null) {
             return HardwareBacking.DeviceCredentialFallback;
+        }
+        long nowMs = Android.OS.SystemClock.ElapsedRealtime();
+        if (!forceRefresh && cachedProbeMs > 0 && nowMs - cachedProbeMs < 15_000L) {
+            return cachedBacking;
         }
         try {
             BiometricManager bm = context.GetSystemService(Java.Lang.Class.FromType(typeof(BiometricManager))) as BiometricManager;
@@ -40,11 +47,16 @@ public static class OmniHardwareBiometric {
 #pragma warning disable CS0618, CA1422
                 : (int)bm.CanAuthenticate();
 #pragma warning restore CS0618, CA1422
+            HardwareBacking result;
             if (can != 0) { // BIOMETRIC_SUCCESS == 0
-                return HardwareBacking.DeviceCredentialFallback;
+                result = HardwareBacking.DeviceCredentialFallback;
+            } else {
+                bool hasStrongBox = context.PackageManager?.HasSystemFeature("android.hardware.strongbox_keystore") ?? false;
+                result = hasStrongBox ? HardwareBacking.StrongBox : HardwareBacking.Tee;
             }
-            bool hasStrongBox = context.PackageManager?.HasSystemFeature("android.hardware.strongbox_keystore") ?? false;
-            return hasStrongBox ? HardwareBacking.StrongBox : HardwareBacking.Tee;
+            cachedBacking = result;
+            cachedProbeMs = nowMs;
+            return result;
         } catch {
             return HardwareBacking.DeviceCredentialFallback;
         }

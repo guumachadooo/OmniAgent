@@ -30,19 +30,29 @@ public static class CavernizeIpcBridgeClient {
     static readonly ConcurrentDictionary<string, TaskCompletionSource<(bool ok, string body, long elapsedMs)>> pending = new(StringComparer.Ordinal);
     static readonly object regLock = new();
     static ReplyReceiver replyReceiver;
+    static long cachedSigCheckedMs;
+    static bool cachedSigResult;
 
     /// <summary>
     /// Verifies that <c>CavernizeAndroid</c> is installed and signed by the exact same release keystore certificate.
+    /// Cached for 30s to avoid repeated PackageManager Binder IPC on the UI thread.
     /// </summary>
-    public static bool IsSignatureVerified(Context context) {
+    public static bool IsSignatureVerified(Context context, bool forceRefresh = false) {
         if (context?.PackageManager == null) {
             return false;
+        }
+        long nowMs = Android.OS.SystemClock.ElapsedRealtime();
+        if (!forceRefresh && cachedSigCheckedMs > 0 && nowMs - cachedSigCheckedMs < 30_000L) {
+            return cachedSigResult;
         }
         try {
 #pragma warning disable CS0618, CA1422
             // Android PackageManager.SIGNATURE_MATCH == 0
-            return (int)context.PackageManager.CheckSignatures(context.PackageName, CavernizePackage) == 0;
+            bool ok = (int)context.PackageManager.CheckSignatures(context.PackageName, CavernizePackage) == 0;
 #pragma warning restore CS0618, CA1422
+            cachedSigResult = ok;
+            cachedSigCheckedMs = nowMs;
+            return ok;
         } catch {
             return false;
         }

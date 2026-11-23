@@ -152,6 +152,9 @@ public sealed partial class MainActivity {
         try {
             LocalFsListResult res = await TermuxLocalFsClient.ListDirectoryAsync(store, target).ConfigureAwait(false);
             RunOnUiThread(() => {
+                if (IsFinishing || IsDestroyed) {
+                    return;
+                }
                 if (res.Ok) {
                     currentExplorerPath = res.Path;
                     currentExplorerParent = res.Parent;

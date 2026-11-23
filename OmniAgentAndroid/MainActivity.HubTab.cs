@@ -189,11 +189,15 @@ public sealed partial class MainActivity {
         try {
             TriadHubSnapshot snap = await TriadHubService.FetchSnapshotAsync(store).ConfigureAwait(false);
             lastHubSnapshot = snap;
-            RunOnUiThread(() => RenderHubSnapshot(snap));
+            RunOnUiThread(() => {
+                if (!IsFinishing && !IsDestroyed) {
+                    RenderHubSnapshot(snap);
+                }
+            });
         } finally {
             hubLoading = false;
             RunOnUiThread(() => {
-                if (hubRefreshBtn != null) {
+                if (!IsFinishing && !IsDestroyed && hubRefreshBtn != null) {
                     hubRefreshBtn.Enabled = true;
                     hubRefreshBtn.Text = S["HubRefreshBtn"];
                 }

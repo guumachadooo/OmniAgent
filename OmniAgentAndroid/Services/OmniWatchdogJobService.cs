@@ -23,6 +23,9 @@ public sealed class OmniWatchdogJobService : JobService {
             if (js == null) {
                 return;
             }
+            if (js.GetPendingJob(WatchdogJobId) != null) {
+                return;
+            }
             ComponentName comp = new(context, Java.Lang.Class.FromType(typeof(OmniWatchdogJobService)));
             JobInfo job = new JobInfo.Builder(WatchdogJobId, comp)
                 .SetRequiredNetworkType(NetworkType.Any)

@@ -227,13 +227,16 @@ public sealed partial class MainActivity {
     }
 
     void RefreshSettingsTabState() {
-        if (approvalModeDescTv == null) {
+        if (approvalModeDescTv == null || IsFinishing || IsDestroyed) {
             return;
         }
         suppressSettingsEvents = true;
         try {
             string mode = store.SecurityMode;
-            approvalSelector?.SetSelection(ModeToIndex(mode), notify: false);
+            int targetModeIdx = ModeToIndex(mode);
+            if (approvalSelector != null && approvalSelector.SelectedIndex != targetModeIdx) {
+                approvalSelector.SetSelection(targetModeIdx, notify: false);
+            }
             approvalModeDescTv.Text = mode switch {
                 "biometric" => S["SettingsModeBioDesc"],
                 "trusted" => S["SettingsModeTrustedDesc"],
@@ -283,16 +286,24 @@ public sealed partial class MainActivity {
     async Task RunManualDesignSyncAsync(Button btn) {
         btn.Enabled = false;
         try {
-            (bool ok, string detail) = await CavernizeDesignSyncService.SyncFromCavernizeAsync(this).ConfigureAwait(false);
+            (bool ok, bool visualChanged, string detail) = await CavernizeDesignSyncService.SyncFromCavernizeAsync(
+                this, logIfUnchanged: true).ConfigureAwait(false);
             ShowToast(detail);
             RunOnUiThread(() => {
+                if (IsFinishing || IsDestroyed) {
+                    return;
+                }
                 RefreshSettingsTabState();
-                if (ok) {
+                if (ok && visualChanged) {
                     Recreate();
                 }
             });
         } finally {
-            RunOnUiThread(() => btn.Enabled = true);
+            RunOnUiThread(() => {
+                if (!IsFinishing && !IsDestroyed) {
+                    btn.Enabled = true;
+                }
+            });
         }
     }
 

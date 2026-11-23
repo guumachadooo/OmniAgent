@@ -46,10 +46,17 @@ public sealed partial class MainActivity : Activity {
     readonly LinearLayout[] dockTabItems = new LinearLayout[4];
     readonly OneUiIconView[] dockTabIcons = new OneUiIconView[4];
     readonly TextView[] dockTabLabels = new TextView[4];
+    static int designSyncStartedThisProcess;
+    static int autoRecreateCountThisProcess;
+
     int activeTabIndex = TabHubIndex;
     int topInsetPx;
     int bottomInsetPx;
-    bool designSyncChecked;
+    int lastAppliedTopPad = -1;
+    int lastAppliedBottomPad = -1;
+    int lastAppliedDockMargin = -1;
+    Handler uiHandler;
+    bool pendingUiRefresh;
     IOnBackInvokedCallback predictiveBackCallback;
 
     static OmniStrings S => OmniStrings.Active;
@@ -60,6 +67,7 @@ public sealed partial class MainActivity : Activity {
     protected override void OnCreate(Bundle savedInstanceState) {
         base.OnCreate(savedInstanceState);
 
+        uiHandler = new Handler(Looper.MainLooper);
         store = new OmniSettingsStore(this);
         OmniStrings.Refresh(store.UiLanguage);
 
@@ -72,25 +80,33 @@ public sealed partial class MainActivity : Activity {
         RegisterPredictiveBack();
         RequestInitialPermissions();
 
-        // Zero-click Always-On automation: ensure foreground bridge & persisted watchdog run automatically.
-        OmniAgentForegroundService.EnsureAlwaysOn(this);
+        // Zero-click Always-On automation off the UI thread so startup stays 120Hz silky smooth.
+        Context appCtx = ApplicationContext ?? this;
+        _ = Task.Run(() => OmniAgentForegroundService.EnsureAlwaysOn(appCtx));
 
         OmniAgentForegroundService.StateChanged += OnServiceOrActivityChanged;
         OmniSettingsStore.ActivityChanged += OnServiceOrActivityChanged;
 
-        RefreshAllVisibleState();
+        RefreshAllVisibleState(probeDebian: false);
         _ = LoadHubSnapshotAsync(silent: false);
         _ = SyncCavernizeDesignInBackgroundAsync();
     }
 
     protected override void OnResume() {
         base.OnResume();
-        OmniAgentForegroundService.EnsureAlwaysOn(this);
-        RefreshAllVisibleState();
-        bottomDock?.RefreshBlur(force: true);
+        Context appCtx = ApplicationContext ?? this;
+        _ = Task.Run(() => OmniAgentForegroundService.EnsureAlwaysOn(appCtx));
+        RefreshAllVisibleState(probeDebian: activeTabIndex == TabBridgeIndex);
+        bottomDock?.Post(() => {
+            if (!IsFinishing && !IsDestroyed) {
+                bottomDock?.RefreshBlur(force: true);
+            }
+        });
     }
 
     protected override void OnDestroy() {
+        uiHandler?.RemoveCallbacksAndMessages(null);
+        pendingUiRefresh = false;
         OmniAgentForegroundService.StateChanged -= OnServiceOrActivityChanged;
         OmniSettingsStore.ActivityChanged -= OnServiceOrActivityChanged;
         if (OperatingSystem.IsAndroidVersionAtLeast(33) && predictiveBackCallback != null) {
@@ -201,7 +217,12 @@ public sealed partial class MainActivity : Activity {
             sv.AddView(container, new ViewGroup.LayoutParams(
                 ViewGroup.LayoutParams.MatchParent, ViewGroup.LayoutParams.WrapContent));
 
-            sv.ViewTreeObserver.ScrollChanged += (_, _) => bottomDock?.RefreshBlur(force: false);
+            int tabIdx = i;
+            sv.ScrollChange += (_, _) => {
+                if (activeTabIndex == tabIdx && bottomDock != null && bottomDock.IsAttachedToWindow) {
+                    bottomDock.RefreshBlur(force: false);
+                }
+            };
 
             tabScrolls[i] = sv;
             tabRoots[i] = container;
@@ -296,11 +317,17 @@ public sealed partial class MainActivity : Activity {
     void ApplySafeAreaInsets() {
         int topPad = Math.Max(Dp(14), topInsetPx + Dp(8));
         int bottomPad = Math.Max(Dp(116), bottomInsetPx + Dp(106));
-        for (int i = 0; i < tabRoots.Length; i++) {
-            tabRoots[i]?.SetPadding(Dp(16), topPad, Dp(16), bottomPad);
+        if (topPad != lastAppliedTopPad || bottomPad != lastAppliedBottomPad) {
+            lastAppliedTopPad = topPad;
+            lastAppliedBottomPad = bottomPad;
+            for (int i = 0; i < tabRoots.Length; i++) {
+                tabRoots[i]?.SetPadding(Dp(16), topPad, Dp(16), bottomPad);
+            }
         }
-        if (bottomDock?.LayoutParameters is FrameLayout.LayoutParams lp) {
-            lp.BottomMargin = Math.Max(Dp(16), bottomInsetPx + Dp(10));
+        int dockMargin = Math.Max(Dp(16), bottomInsetPx + Dp(10));
+        if (dockMargin != lastAppliedDockMargin && bottomDock?.LayoutParameters is FrameLayout.LayoutParams lp) {
+            lastAppliedDockMargin = dockMargin;
+            lp.BottomMargin = dockMargin;
             bottomDock.LayoutParameters = lp;
         }
     }
@@ -335,40 +362,64 @@ public sealed partial class MainActivity : Activity {
             _ = LoadDirectoryAsync(store.LastExplorerPath, showSpinner: true);
         }
         if (activeTabIndex == TabBridgeIndex) {
-            RefreshBridgeTabState();
+            RefreshBridgeTabState(probeDebian: true);
         }
         if (activeTabIndex == TabSettingsIndex) {
             RefreshSettingsTabState();
         }
-        bottomDock?.Post(() => bottomDock?.RefreshBlur(force: true));
-    }
-
-    void OnServiceOrActivityChanged() {
-        RunOnUiThread(() => {
-            RefreshBridgeTabState();
-            RefreshSettingsTabState();
+        bottomDock?.Post(() => {
+            if (!IsFinishing && !IsDestroyed) {
+                bottomDock?.RefreshBlur(force: true);
+            }
         });
     }
 
-    void RefreshAllVisibleState() {
-        RefreshBridgeTabState();
+    void OnServiceOrActivityChanged() {
+        if (IsFinishing || IsDestroyed || uiHandler == null) {
+            return;
+        }
+        uiHandler.Post(() => {
+            if (IsFinishing || IsDestroyed || pendingUiRefresh) {
+                return;
+            }
+            pendingUiRefresh = true;
+            uiHandler.PostDelayed(() => {
+                pendingUiRefresh = false;
+                if (IsFinishing || IsDestroyed) {
+                    return;
+                }
+                if (activeTabIndex == TabBridgeIndex) {
+                    RefreshBridgeTabState(probeDebian: false);
+                } else if (activeTabIndex == TabSettingsIndex) {
+                    RefreshSettingsTabState();
+                }
+            }, 250L);
+        });
+    }
+
+    void RefreshAllVisibleState(bool probeDebian = false) {
+        if (IsFinishing || IsDestroyed) {
+            return;
+        }
+        RefreshBridgeTabState(probeDebian: probeDebian);
         RefreshSettingsTabState();
     }
 
     async Task SyncCavernizeDesignInBackgroundAsync() {
-        if (designSyncChecked) {
+        if (System.Threading.Interlocked.Exchange(ref designSyncStartedThisProcess, 1) != 0) {
             return;
         }
-        designSyncChecked = true;
-        string prevJson = store.CachedCavernizeDesignTokensJson;
-        (bool ok, _) = await CavernizeDesignSyncService.SyncFromCavernizeAsync(this).ConfigureAwait(false);
+        (bool ok, bool visualChanged, _) = await CavernizeDesignSyncService.SyncFromCavernizeAsync(
+            this, logIfUnchanged: false).ConfigureAwait(false);
         if (!ok) {
             return;
         }
-        string nextJson = store.CachedCavernizeDesignTokensJson;
         RunOnUiThread(() => {
+            if (IsFinishing || IsDestroyed) {
+                return;
+            }
             RefreshSettingsTabState();
-            if (!string.Equals(prevJson, nextJson, StringComparison.Ordinal)) {
+            if (visualChanged && System.Threading.Interlocked.Increment(ref autoRecreateCountThisProcess) == 1) {
                 Recreate();
             }
         });
@@ -380,7 +431,11 @@ public sealed partial class MainActivity : Activity {
         if (activeTabIndex == TabFilesIndex) {
             await LoadDirectoryAsync(currentExplorerPath, showSpinner: false).ConfigureAwait(false);
         }
-        RunOnUiThread(RefreshBridgeTabState);
+        RunOnUiThread(() => {
+            if (!IsFinishing && !IsDestroyed) {
+                RefreshBridgeTabState(probeDebian: true);
+            }
+        });
     }
 
     // ── Shared One UI 9 Layout & Component Helpers ───────────────────────────────────────

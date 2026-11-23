@@ -19,6 +19,9 @@ public sealed class OmniSettingsStore {
 
     static readonly object logLock = new();
     static readonly List<string> activityLog = [];
+    static readonly object secretCacheLock = new();
+    static readonly Dictionary<string, string> decryptedSecretCache = new(StringComparer.Ordinal);
+    static volatile IKey cachedKeystoreKey;
 
     public static event Action ActivityChanged;
 
@@ -210,24 +213,35 @@ public sealed class OmniSettingsStore {
     }
 
     static IKey GetOrCreateKeystoreKey() {
-        KeyStore ks = KeyStore.GetInstance("AndroidKeyStore");
-        ks.Load(null);
-        if (ks.ContainsAlias(KeyAlias)) {
-            IKey existing = ks.GetKey(KeyAlias, null);
-            if (existing != null) {
-                return existing;
-            }
+        IKey fast = cachedKeystoreKey;
+        if (fast != null) {
+            return fast;
         }
-        KeyGenerator kg = KeyGenerator.GetInstance(KeyProperties.KeyAlgorithmAes, "AndroidKeyStore");
-        KeyGenParameterSpec spec = new KeyGenParameterSpec.Builder(
-                KeyAlias,
-                KeyStorePurpose.Encrypt | KeyStorePurpose.Decrypt)
-            .SetBlockModes(KeyProperties.BlockModeGcm)
-            .SetEncryptionPaddings(KeyProperties.EncryptionPaddingNone)
-            .SetKeySize(256)
-            .Build();
-        kg.Init(spec);
-        return kg.GenerateKey();
+        lock (secretCacheLock) {
+            if (cachedKeystoreKey != null) {
+                return cachedKeystoreKey;
+            }
+            KeyStore ks = KeyStore.GetInstance("AndroidKeyStore");
+            ks.Load(null);
+            if (ks.ContainsAlias(KeyAlias)) {
+                IKey existing = ks.GetKey(KeyAlias, null);
+                if (existing != null) {
+                    cachedKeystoreKey = existing;
+                    return existing;
+                }
+            }
+            KeyGenerator kg = KeyGenerator.GetInstance(KeyProperties.KeyAlgorithmAes, "AndroidKeyStore");
+            KeyGenParameterSpec spec = new KeyGenParameterSpec.Builder(
+                    KeyAlias,
+                    KeyStorePurpose.Encrypt | KeyStorePurpose.Decrypt)
+                .SetBlockModes(KeyProperties.BlockModeGcm)
+                .SetEncryptionPaddings(KeyProperties.EncryptionPaddingNone)
+                .SetKeySize(256)
+                .Build();
+            kg.Init(spec);
+            cachedKeystoreKey = kg.GenerateKey();
+            return cachedKeystoreKey;
+        }
     }
 
     static string EncryptSecret(string plainText) {
@@ -236,12 +250,24 @@ public sealed class OmniSettingsStore {
         cipher.Init(CipherMode.EncryptMode, key);
         byte[] iv = cipher.GetIV();
         byte[] enc = cipher.DoFinal(System.Text.Encoding.UTF8.GetBytes(plainText));
-        return $"{KsPrefix}{Convert.ToBase64String(iv)}:{Convert.ToBase64String(enc)}";
+        string ciphertext = $"{KsPrefix}{Convert.ToBase64String(iv)}:{Convert.ToBase64String(enc)}";
+        lock (secretCacheLock) {
+            if (decryptedSecretCache.Count > 16) {
+                decryptedSecretCache.Clear();
+            }
+            decryptedSecretCache[ciphertext] = plainText;
+        }
+        return ciphertext;
     }
 
     static string DecryptSecret(string stored) {
         if (string.IsNullOrEmpty(stored) || !stored.StartsWith(KsPrefix, StringComparison.Ordinal)) {
             return "";
+        }
+        lock (secretCacheLock) {
+            if (decryptedSecretCache.TryGetValue(stored, out string cached)) {
+                return cached;
+            }
         }
         try {
             string rest = stored[KsPrefix.Length..];
@@ -255,7 +281,14 @@ public sealed class OmniSettingsStore {
             Cipher cipher = Cipher.GetInstance("AES/GCM/NoPadding");
             cipher.Init(CipherMode.DecryptMode, key, new GCMParameterSpec(128, iv));
             byte[] plain = cipher.DoFinal(cipherBytes);
-            return System.Text.Encoding.UTF8.GetString(plain);
+            string plainText = System.Text.Encoding.UTF8.GetString(plain);
+            lock (secretCacheLock) {
+                if (decryptedSecretCache.Count > 16) {
+                    decryptedSecretCache.Clear();
+                }
+                decryptedSecretCache[stored] = plainText;
+            }
+            return plainText;
         } catch {
             return "";
         }
