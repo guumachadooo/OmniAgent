@@ -502,8 +502,8 @@ public sealed partial class MainActivity : Activity {
             Text = text,
             TextSize = 13f,
             Typeface = primary ? FontBold : FontMedium,
-            AllCaps = false,
         };
+        btn.SetAllCaps(false);
         btn.SetTextColor(fg);
         btn.SetSingleLine(true);
         btn.Ellipsize = TextUtils.TruncateAt.End;
@@ -594,7 +594,7 @@ public sealed partial class MainActivity : Activity {
     }
 
     void CopyToClipboard(string label, string text) {
-        if (GetSystemService(ClipboardService) is ClipboardManager cm) {
+        if (GetSystemService(ClipboardService) is Android.Content.ClipboardManager cm) {
             cm.PrimaryClip = ClipData.NewPlainText(label, text ?? "");
             ShowToast(S["FilesCopiedToast"]);
         }
