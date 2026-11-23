@@ -275,8 +275,7 @@ public static class TermuxLocalFsClient {
                     SizeBytes = fi.Length,
                     Truncated = fi.Length > read,
                     IsBinary = bin,
-                    LineCount = bin ? 0 : text.Split('
-').Length,
+                    LineCount = bin ? 0 : text.Split('\n').Length,
                     Content = text
                 };
             } catch {
@@ -369,8 +368,7 @@ public static class TermuxLocalFsClient {
                     lines.Add($"{a}: {(rok ? "OK" : "ERR")} {Str(r, "output")}");
                 }
             }
-            return (ok, lines.Count > 0 ? string.Join("
-", lines) : Str(root, "error"));
+            return (ok, lines.Count > 0 ? string.Join("\n", lines) : Str(root, "error"));
         } catch (Exception ex) {
             return (false, ex.Message);
         }

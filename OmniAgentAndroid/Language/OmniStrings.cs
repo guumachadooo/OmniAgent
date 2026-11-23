@@ -83,15 +83,14 @@ public sealed class OmniStrings {
         ["FilesWakeNowBtn"] = "Wake Debian / Termux",
         ["FilesBrowseSdcardBtn"] = "Browse Android /sdcard",
         ["FilesEmptyDir"] = "This folder is empty.",
-        ["FilesCountFmt"] = "{0} items · {1}",
+        ["FilesCountFmt"] = "{0} items",
         ["FilesPreviewCopyBtn"] = "Copy",
         ["FilesPreviewExportBtn"] = "Export / Share",
         ["FilesExportedToastFmt"] = "Exported to {0}",
         ["FilesCopiedToast"] = "Copied to clipboard.",
         ["FilesBinaryNotice"] = "Binary file preview disabled. Use Export / Share to copy it to /sdcard/Download/OmniExport/ and open in Android.",
         ["FilesDeleteConfirmTitle"] = "Delete item?",
-        ["FilesDeleteConfirmFmt"] = "Permanently remove:
-{0}",
+        ["FilesDeleteConfirmFmt"] = "Permanently remove:\n{0}",
         ["FilesDeleteBtn"] = "Delete",
         ["FilesCreateFolderTitle"] = "New Folder",
         ["FilesCreateFolderHint"] = "Folder name",
@@ -122,15 +121,7 @@ public sealed class OmniStrings {
         ["SettingsTitle"] = "OmniAgent Settings",
         ["SettingsApprovalTitle"] = "Approval & Security Policy",
         ["SettingsApprovalHelpTitle"] = "How Smart, Biometric & Trusted Work",
-        ["SettingsApprovalHelpBody"] = "1. SMART (Recommended):
-• Already-paired devices (256-bit E2E HMAC key) execute commands silently without interrupting you.
-• Brand-new unknown AI Studio sessions knocking via Smart Knock ALWAYS require your hardware-backed fingerprint via the native Android system sheet.
-
-2. BIOMETRIC (Strict):
-• Prompts your native fingerprint sheet on EVERY sensitive remote action (git push, Cloudflare deploy, APK install, shell command) even when already paired.
-
-3. TRUSTED (Hands-Free):
-• Zero fingerprint popups for paired commands (equivalent to Smart for paired sessions) and auto-approves trusted commands without interruption. Use only on your private personal phone.",
+        ["SettingsApprovalHelpBody"] = "1. SMART (Recommended):\n• Already-paired devices (256-bit E2E HMAC key) execute commands silently without interrupting you.\n• Brand-new unknown AI Studio sessions knocking via Smart Knock ALWAYS require your hardware-backed fingerprint via the native Android system sheet.\n\n2. BIOMETRIC (Strict):\n• Prompts your native fingerprint sheet on EVERY sensitive remote action (git push, Cloudflare deploy, APK install, shell command) even when already paired.\n\n3. TRUSTED (Hands-Free):\n• Zero fingerprint popups for paired commands (equivalent to Smart for paired sessions) and auto-approves trusted commands without interruption. Use only on your private personal phone.",
         ["SettingsModeSmart"] = "Smart",
         ["SettingsModeBiometric"] = "Biometric",
         ["SettingsModeTrusted"] = "Trusted",
@@ -155,10 +146,7 @@ public sealed class OmniStrings {
         ["SettingsTermuxBtn"] = "Termux / Debian",
         ["SettingsDesignSyncTitle"] = "Cavernize One UI 9 Design Sync",
         ["SettingsDesignSyncHelpTitle"] = "Zero-Quota Shared Design System",
-        ["SettingsDesignSyncHelpBody"] = "OmniAgent shares the exact same OneUiTheme, OneUiComponents, OneUiIconView, and SF Pro typography as CavernizeAndroid.
-
-• Compile-time: GitHub Actions & Federation automatically pull Cavernize's latest UI files into OmniAgent with zero AI quota.
-• Runtime: OmniAgent also queries Cavernize's live design tokens over <10 ms same-signature IPC.",
+        ["SettingsDesignSyncHelpBody"] = "OmniAgent shares the exact same OneUiTheme, OneUiComponents, OneUiIconView, and SF Pro typography as CavernizeAndroid.\n\n• Compile-time: GitHub Actions & Federation automatically pull Cavernize's latest UI files into OmniAgent with zero AI quota.\n• Runtime: OmniAgent also queries Cavernize's live design tokens over <10 ms same-signature IPC.",
         ["SettingsDesignSyncNowBtn"] = "Sync Tokens from Cavernize",
         ["SettingsDesignSyncInfoFmt"] = "Kit {0} · Source: {1} · Last IPC: {2}",
         ["SettingsLanguageLabel"] = "Interface Language",
@@ -169,12 +157,10 @@ public sealed class OmniStrings {
         // Native System Biometric Prompt
         ["KnockPromptTitle"] = "OmniAgent · Connect AI Studio",
         ["KnockPromptSubFmt"] = "SAS Code: {0} · {1}",
-        ["KnockPromptDescFmt"] = "{0}
-Verify the SAS code and touch your fingerprint to release the E2E encrypted session (hardware-backed key).",
+        ["KnockPromptDescFmt"] = "{0}\nVerify the SAS code and touch your fingerprint to release the E2E encrypted session (hardware-backed key).",
         ["KnockDenyBtn"] = "Deny (15m)",
         ["GatePromptTitle"] = "OmniAgent · Confirm Action",
-        ["GatePromptDescFmt"] = "Remote command '{0}' requested.
-Touch your fingerprint to approve with your hardware key.",
+        ["GatePromptDescFmt"] = "Remote command '{0}' requested.\nTouch your fingerprint to approve with your hardware key.",
 
         // Modals & Common
         ["SaveBtn"] = "Save",
@@ -200,11 +186,7 @@ Touch your fingerprint to approve with your hardware key.",
         ["TermuxCopyCmdBtn"] = "Copy 1-Line Debian Install",
         ["TermuxOpenPermsBtn"] = "App Permissions",
         ["OpenCloudflareTokenBtn"] = "Create CF Token",
-        ["OpenGithubTokenBtn"] = "Create GitHub Token"
-    };
-
-    static Dictionary<string, string> CreatePortuguese() => new(StringComparer.Ordinal) {
-        ["AppTitle"] = "OmniAgent",
+        ["OpenGithubTokenBtn"] = "Create GitHub Token"\n    };\n\n    static Dictionary<string, string> CreatePortuguese() => new(StringComparer.Ordinal) {\n        ["AppTitle"] = "OmniAgent",
         ["AppSubtitle"] = "Hub da Tríade · E2E Zero-Trust · Ponte Cavernize",
         ["TabHub"] = "Hub",
         ["TabFiles"] = "Arquivos",
@@ -252,15 +234,14 @@ Touch your fingerprint to approve with your hardware key.",
         ["FilesWakeNowBtn"] = "Acordar Debian / Termux",
         ["FilesBrowseSdcardBtn"] = "Explorar Android /sdcard",
         ["FilesEmptyDir"] = "Esta pasta está vazia.",
-        ["FilesCountFmt"] = "{0} itens · {1}",
+        ["FilesCountFmt"] = "{0} itens",
         ["FilesPreviewCopyBtn"] = "Copiar",
         ["FilesPreviewExportBtn"] = "Exportar / Compartilhar",
         ["FilesExportedToastFmt"] = "Exportado para {0}",
         ["FilesCopiedToast"] = "Copiado para a área de transferência.",
         ["FilesBinaryNotice"] = "Pré-visualização de binário desativada. Use Exportar / Compartilhar para copiar para /sdcard/Download/OmniExport/ e abrir no Android.",
         ["FilesDeleteConfirmTitle"] = "Apagar item?",
-        ["FilesDeleteConfirmFmt"] = "Remover permanentemente:
-{0}",
+        ["FilesDeleteConfirmFmt"] = "Remover permanentemente:\n{0}",
         ["FilesDeleteBtn"] = "Apagar",
         ["FilesCreateFolderTitle"] = "Nova Pasta",
         ["FilesCreateFolderHint"] = "Nome da pasta",
@@ -291,15 +272,7 @@ Touch your fingerprint to approve with your hardware key.",
         ["SettingsTitle"] = "Ajustes do OmniAgent",
         ["SettingsApprovalTitle"] = "Política de Aprovação & Segurança",
         ["SettingsApprovalHelpTitle"] = "Como funcionam Smart, Digital e Livre (Trust)",
-        ["SettingsApprovalHelpBody"] = "1. SMART (Recomendado):
-• Sessões já pareadas (chave HMAC E2E 256-bit) executam silenciosamente sem interromper você.
-• Novas sessões desconhecidas do AI Studio via Smart Knock SEMPRE pedem sua digital com chave de hardware no prompt nativo do sistema.
-
-2. DIGITAL (Rigoroso):
-• Abre o prompt nativo da digital em TODA ação crítica remota (git push, deploy Cloudflare, instalar APK, shell) mesmo já pareado.
-
-3. LIVRE / TRUST (Automático):
-• Zero popups de biometria para comandos pareados (não pede confirmação extra a cada ação). Deixe ativado somente no seu celular pessoal.",
+        ["SettingsApprovalHelpBody"] = "1. SMART (Recomendado):\n• Sessões já pareadas (chave HMAC E2E 256-bit) executam silenciosamente sem interromper você.\n• Novas sessões desconhecidas do AI Studio via Smart Knock SEMPRE pedem sua digital com chave de hardware no prompt nativo do sistema.\n\n2. DIGITAL (Rigoroso):\n• Abre o prompt nativo da digital em TODA ação crítica remota (git push, deploy Cloudflare, instalar APK, shell) mesmo já pareado.\n\n3. LIVRE / TRUST (Automático):\n• Zero popups de biometria para comandos pareados (não pede confirmação extra a cada ação). Deixe ativado somente no seu celular pessoal.",
         ["SettingsModeSmart"] = "Smart",
         ["SettingsModeBiometric"] = "Digital",
         ["SettingsModeTrusted"] = "Livre (Trust)",
@@ -324,10 +297,7 @@ Touch your fingerprint to approve with your hardware key.",
         ["SettingsTermuxBtn"] = "Termux / Debian",
         ["SettingsDesignSyncTitle"] = "Sync de Design One UI 9 (Cavernize)",
         ["SettingsDesignSyncHelpTitle"] = "Sistema de Design Compartilhado (Zero Cota)",
-        ["SettingsDesignSyncHelpBody"] = "O OmniAgent compartilha exatamente os mesmos OneUiTheme, OneUiComponents, OneUiIconView e tipografia SF Pro do CavernizeAndroid.
-
-• No Build (CI): GitHub Actions e a Federação puxam automaticamente as mudanças visuais do Cavernize para o Omni sem gastar cota de IA.
-• Ao Vivo (IPC): O OmniAgent também sincroniza os tokens visuais em tempo real direto do Cavernize em <10 ms.",
+        ["SettingsDesignSyncHelpBody"] = "O OmniAgent compartilha exatamente os mesmos OneUiTheme, OneUiComponents, OneUiIconView e tipografia SF Pro do CavernizeAndroid.\n\n• No Build (CI): GitHub Actions e a Federação puxam automaticamente as mudanças visuais do Cavernize para o Omni sem gastar cota de IA.\n• Ao Vivo (IPC): O OmniAgent também sincroniza os tokens visuais em tempo real direto do Cavernize em <10 ms.",
         ["SettingsDesignSyncNowBtn"] = "Sincronizar Design do Cavernize",
         ["SettingsDesignSyncInfoFmt"] = "Kit {0} · Origem: {1} · Último IPC: {2}",
         ["SettingsLanguageLabel"] = "Idioma da Interface",
@@ -338,12 +308,10 @@ Touch your fingerprint to approve with your hardware key.",
         // Native System Biometric Prompt
         ["KnockPromptTitle"] = "OmniAgent · Conectar AI Studio",
         ["KnockPromptSubFmt"] = "Código SAS: {0} · {1}",
-        ["KnockPromptDescFmt"] = "{0}
-Confirme o código acima com sua digital para liberar a sessão E2E (protegida por chave de hardware).",
+        ["KnockPromptDescFmt"] = "{0}\nConfirme o código acima com sua digital para liberar a sessão E2E (protegida por chave de hardware).",
         ["KnockDenyBtn"] = "Recusar (15m)",
         ["GatePromptTitle"] = "OmniAgent · Confirmar Ação",
-        ["GatePromptDescFmt"] = "Comando remoto '{0}' solicitado.
-Toque na sua digital para aprovar com a chave de hardware.",
+        ["GatePromptDescFmt"] = "Comando remoto '{0}' solicitado.\nToque na sua digital para aprovar com a chave de hardware.",
 
         // Modals & Common
         ["SaveBtn"] = "Salvar",
@@ -369,6 +337,4 @@ Toque na sua digital para aprovar com a chave de hardware.",
         ["TermuxCopyCmdBtn"] = "Copiar Instalação 1-Linha Debian",
         ["TermuxOpenPermsBtn"] = "Permissões do App",
         ["OpenCloudflareTokenBtn"] = "Criar Token CF",
-        ["OpenGithubTokenBtn"] = "Criar Token GitHub"
-    };
-}
+        ["OpenGithubTokenBtn"] = "Criar Token GitHub"\n    };\n}

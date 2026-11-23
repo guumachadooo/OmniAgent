@@ -197,8 +197,7 @@ public static class TriadHubService {
                 commitSha = sha.Length >= 7 ? sha[..7] : sha;
                 if (doc.RootElement.TryGetProperty("commit", out JsonElement cObj)) {
                     string fullMsg = Str(cObj, "message");
-                    int nl = fullMsg.IndexOf('
-');
+                    int nl = fullMsg.IndexOf('\n');
                     commitMsg = (nl > 0 ? fullMsg[..nl] : fullMsg).Trim();
                 }
             }
@@ -287,8 +286,7 @@ public static class TriadHubService {
         if (string.IsNullOrWhiteSpace(md)) {
             return (wave, summary, next);
         }
-        foreach (string raw in md.Split('
-')) {
+        foreach (string raw in md.Split('\n')) {
             string line = raw.Trim();
             if (line.StartsWith("WAVE|", StringComparison.Ordinal)) wave = line[5..].Trim();
             else if (line.StartsWith("SUMMARY|", StringComparison.Ordinal)) summary = line[8..].Trim();
@@ -301,8 +299,7 @@ public static class TriadHubService {
         if (string.IsNullOrWhiteSpace(md)) return 0;
         string pendingBlk = md.Split("## Completed Requests", StringSplitOptions.None)[0];
         int count = 0;
-        foreach (string ln in pendingBlk.Split('
-')) {
+        foreach (string ln in pendingBlk.Split('\n')) {
             if (ln.TrimStart().StartsWith("- REQ|", StringComparison.Ordinal)) count++;
         }
         return count;
@@ -316,8 +313,7 @@ public static class TriadHubService {
     static List<TriadSyncEntry> ParseSyncEntries(string md, int maxItems) {
         List<TriadSyncEntry> list = [];
         if (string.IsNullOrWhiteSpace(md)) return list;
-        foreach (string raw in md.Split('
-')) {
+        foreach (string raw in md.Split('\n')) {
             string line = raw.Trim();
             if (!line.StartsWith("- ", StringComparison.Ordinal) || !line.Contains(" | ", StringComparison.Ordinal)) {
                 continue;

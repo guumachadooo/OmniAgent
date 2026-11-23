@@ -166,7 +166,7 @@ public sealed partial class MainActivity {
         } else if (running) {
             OneUiTheme.UpdateStatusChip(this, bridgeStateChipTv, S["BridgeAlwaysOnOnline"], OneUiTheme.FunctionalGreen);
             bridgeHeadlineTv.Text = S["BridgeAlwaysOnOnline"];
-            bridgeDetailTv.Text = string.Format(S["BridgeStatusOnlineFmt"], OmniAgentForegroundService.CommandsHandled);
+            bridgeDetailTv.Text = string.Format(S["BridgeStatusOnlineFmt"], OmniAgentForegroundService.CommandsHandled, store.SecurityMode);
             bridgeToggleBtn.Text = S["BridgePauseBtn"];
         } else {
             OneUiTheme.UpdateStatusChip(this, bridgeStateChipTv, S["BridgeAlwaysOnStandby"], OneUiTheme.FunctionalAmber);
