@@ -14,19 +14,26 @@ using IOPath = System.IO.Path;
 namespace OmniAgentAndroid;
 
 public sealed partial class MainActivity {
-    bool filesInitialized;
-    bool filesLoading;
-    string currentExplorerPath = "/root/.gemini/antigravity/scratch/Cavern";
-    string currentExplorerParent = "/root/.gemini/antigravity/scratch";
-    List<LocalFsEntry> currentExplorerEntries = [];
-
+    LinearLayout filesOfflineBanner;
+    TextView filesOfflineTitleTv;
+    TextView filesOfflineBodyTv;
+    Button filesOfflinePrimaryBtn;
+    Button filesOfflineSecondaryBtn;
+    Action filesOfflinePrimaryAction;
+    Action filesOfflineSecondaryAction;
     TextView filesPathTv;
     TextView filesCountChipTv;
     EditText filesSearchEt;
-    LinearLayout filesOfflineBanner;
     LinearLayout filesListContainer;
     Button filesUpBtn;
     Button filesNewFolderBtn;
+
+    string currentExplorerPath = "/root/.gemini/antigravity/scratch/Cavern";
+    string currentExplorerParent = "/root/.gemini/antigravity/scratch";
+    List<LocalFsEntry> currentExplorerEntries = [];
+    bool filesInitialized;
+    CancellationTokenSource filesLoadCts;
+    int filesLoadSeq;
 
     void BuildFilesTab(LinearLayout parent) {
         parent.AddView(MakeTabHeader(
@@ -52,30 +59,39 @@ public sealed partial class MainActivity {
         parent.AddView(bmScroll, new LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MatchParent, ViewGroup.LayoutParams.WrapContent) { BottomMargin = Dp(12) });
 
-        // 2. Offline Debian Banner (auto-hidden when loopback online or browsing /sdcard)
+        // 2. Context-Aware Bridge Banner (distinguishes Missing Pair Key vs HTTP 401 vs Debian Asleep)
         filesOfflineBanner = MakeGlassCard(22f);
         filesOfflineBanner.Visibility = ViewStates.Gone;
-        filesOfflineBanner.AddView(MakeCardHeader(
-            S["FilesDaemonOfflineTitle"],
-            OneUiIconType.Bolt,
-            OneUiTheme.FunctionalAmber));
 
-        TextView offBody = new(this) {
+        LinearLayout offHeader = MakeHRow();
+        offHeader.SetPadding(0, 0, 0, Dp(8));
+        offHeader.AddView(OneUiTheme.CreateVectorIconBadge(this, OneUiIconType.Bolt, OneUiTheme.FunctionalAmber, 30));
+        filesOfflineTitleTv = new TextView(this) {
+            Text = S["FilesDaemonOfflineTitle"],
+            TextSize = 15.5f,
+            Typeface = FontBold,
+        };
+        filesOfflineTitleTv.SetTextColor(OneUiTheme.TextPrimary);
+        filesOfflineTitleTv.SetPadding(Dp(10), 0, 0, 0);
+        offHeader.AddView(filesOfflineTitleTv, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WrapContent, 1f));
+        filesOfflineBanner.AddView(offHeader);
+
+        filesOfflineBodyTv = new TextView(this) {
             Text = S["FilesDaemonOfflineBody"],
             TextSize = 12.5f,
             Typeface = FontRegular,
         };
-        offBody.SetTextColor(OneUiTheme.TextSub);
-        offBody.SetPadding(0, 0, 0, Dp(10));
-        filesOfflineBanner.AddView(offBody);
+        filesOfflineBodyTv.SetTextColor(OneUiTheme.TextSub);
+        filesOfflineBodyTv.SetPadding(0, 0, 0, Dp(10));
+        filesOfflineBanner.AddView(filesOfflineBodyTv);
 
         LinearLayout offBtns = MakeHRow();
-        Button wakeBtn = MakeActionPill(S["FilesWakeNowBtn"], primary: true);
-        wakeBtn.Click += (_, _) => TriggerTermuxWake();
-        Button sdBtn = MakeActionPill(S["FilesBrowseSdcardBtn"], primary: false);
-        sdBtn.Click += (_, _) => _ = LoadDirectoryAsync("/storage/emulated/0", showSpinner: true);
-        offBtns.AddView(wakeBtn, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WrapContent, 1f) { RightMargin = Dp(8) });
-        offBtns.AddView(sdBtn, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WrapContent, 1f));
+        filesOfflinePrimaryBtn = MakeActionPill(S["FilesWakeNowBtn"], primary: true);
+        filesOfflinePrimaryBtn.Click += (_, _) => filesOfflinePrimaryAction?.Invoke();
+        filesOfflineSecondaryBtn = MakeActionPill(S["FilesBrowseSdcardBtn"], primary: false);
+        filesOfflineSecondaryBtn.Click += (_, _) => filesOfflineSecondaryAction?.Invoke();
+        offBtns.AddView(filesOfflinePrimaryBtn, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WrapContent, 1f) { RightMargin = Dp(8) });
+        offBtns.AddView(filesOfflineSecondaryBtn, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WrapContent, 1f));
         filesOfflineBanner.AddView(offBtns);
         parent.AddView(filesOfflineBanner);
 
@@ -134,25 +150,51 @@ public sealed partial class MainActivity {
     }
 
     async Task LoadDirectoryAsync(string path, bool showSpinner) {
-        if (filesLoading) {
-            return;
-        }
-        filesLoading = true;
         filesInitialized = true;
         string target = string.IsNullOrWhiteSpace(path) ? "/root/.gemini/antigravity/scratch/Cavern" : path.Trim();
+        int mySeq = System.Threading.Interlocked.Increment(ref filesLoadSeq);
 
-        if (showSpinner) {
-            RunOnUiThread(() => {
-                if (filesPathTv != null) {
-                    filesPathTv.Text = target;
-                }
-            });
+        CancellationTokenSource nextCts = new();
+        CancellationTokenSource prevCts = System.Threading.Interlocked.Exchange(ref filesLoadCts, nextCts);
+        if (prevCts != null) {
+            try {
+                prevCts.Cancel();
+                prevCts.Dispose();
+            } catch {
+                // Ignore
+            }
         }
+        CancellationToken ct = nextCts.Token;
+
+        RunOnUiThread(() => {
+            if (IsFinishing || IsDestroyed || mySeq != System.Threading.Volatile.Read(ref filesLoadSeq)) {
+                return;
+            }
+            if (filesPathTv != null) {
+                filesPathTv.Text = target;
+            }
+            if (showSpinner && filesListContainer != null) {
+                OneUiTheme.UpdateStatusChip(this, filesCountChipTv, "...", OneUiTheme.IconSystemInfo);
+                filesListContainer.RemoveAllViews();
+                TextView loadingTv = new(this) {
+                    Text = S["FilesLoading"],
+                    TextSize = 13f,
+                    Typeface = FontRegular,
+                    Gravity = GravityFlags.Center,
+                };
+                loadingTv.SetTextColor(OneUiTheme.TextMuted);
+                loadingTv.SetPadding(Dp(12), Dp(20), Dp(12), Dp(20));
+                filesListContainer.AddView(loadingTv);
+            }
+        });
 
         try {
-            LocalFsListResult res = await TermuxLocalFsClient.ListDirectoryAsync(store, target).ConfigureAwait(false);
+            LocalFsListResult res = await TermuxLocalFsClient.ListDirectoryAsync(store, target, ct).ConfigureAwait(false);
+            if (ct.IsCancellationRequested || mySeq != System.Threading.Volatile.Read(ref filesLoadSeq)) {
+                return;
+            }
             RunOnUiThread(() => {
-                if (IsFinishing || IsDestroyed) {
+                if (IsFinishing || IsDestroyed || mySeq != System.Threading.Volatile.Read(ref filesLoadSeq)) {
                     return;
                 }
                 if (res.Ok) {
@@ -168,7 +210,7 @@ public sealed partial class MainActivity {
                     currentExplorerPath = target;
                     currentExplorerEntries = [];
                     filesPathTv.Text = target;
-                    filesOfflineBanner.Visibility = ViewStates.Visible;
+                    ConfigureFilesErrorBanner(res.FailureKind);
                     OneUiTheme.UpdateStatusChip(this, filesCountChipTv, "0", OneUiTheme.FunctionalAmber);
                     filesListContainer.RemoveAllViews();
                     TextView errTv = new(this) {
@@ -176,14 +218,62 @@ public sealed partial class MainActivity {
                         TextSize = 12.5f,
                         Typeface = FontRegular,
                     };
-                    errTv.SetTextColor(OneUiTheme.TextMuted);
+                    errTv.SetTextColor(OneUiTheme.TextSecondary);
                     errTv.SetPadding(Dp(6), Dp(10), Dp(6), Dp(10));
                     filesListContainer.AddView(errTv);
+
+                    Button retryBtn = MakeActionPill(S["FilesRetryBtn"], primary: false);
+                    retryBtn.Click += (_, _) => _ = LoadDirectoryAsync(target, showSpinner: true);
+                    filesListContainer.AddView(retryBtn, new LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MatchParent, ViewGroup.LayoutParams.WrapContent) { TopMargin = Dp(4) });
                 }
                 bottomDock?.RefreshBlur(force: true);
             });
-        } finally {
-            filesLoading = false;
+        } catch (System.OperationCanceledException) {
+            // Superseded by newer folder tap
+        } catch (Exception ex) {
+            OmniLogger.Error("FILES", $"LoadDirectoryAsync({target})", ex);
+        }
+    }
+
+    void ConfigureFilesErrorBanner(LocalFsFailureKind kind) {
+        if (filesOfflineBanner == null) {
+            return;
+        }
+        switch (kind) {
+            case LocalFsFailureKind.MissingPairKey:
+                filesOfflineBanner.Visibility = ViewStates.Visible;
+                filesOfflineTitleTv.Text = S["FilesMissingKeyTitle"];
+                filesOfflineBodyTv.Text = S["FilesMissingKeyBody"];
+                filesOfflinePrimaryBtn.Text = S["FilesSyncFromCavernizeBtn"];
+                filesOfflinePrimaryAction = () => _ = TryAutoBootstrapFromCavernizeAsync(showToast: true);
+                filesOfflineSecondaryBtn.Text = S["FilesConfigKeyBtn"];
+                filesOfflineSecondaryAction = ShowRelayConfigModal;
+                break;
+
+            case LocalFsFailureKind.Unauthorized:
+                filesOfflineBanner.Visibility = ViewStates.Visible;
+                filesOfflineTitleTv.Text = S["FilesAuthMismatchTitle"];
+                filesOfflineBodyTv.Text = S["FilesAuthMismatchBody"];
+                filesOfflinePrimaryBtn.Text = S["FilesSyncFromCavernizeBtn"];
+                filesOfflinePrimaryAction = () => _ = TryAutoBootstrapFromCavernizeAsync(showToast: true);
+                filesOfflineSecondaryBtn.Text = S["FilesConfigKeyBtn"];
+                filesOfflineSecondaryAction = ShowRelayConfigModal;
+                break;
+
+            case LocalFsFailureKind.DaemonOffline:
+                filesOfflineBanner.Visibility = ViewStates.Visible;
+                filesOfflineTitleTv.Text = S["FilesDaemonOfflineTitle"];
+                filesOfflineBodyTv.Text = S["FilesDaemonOfflineBody"];
+                filesOfflinePrimaryBtn.Text = S["FilesWakeNowBtn"];
+                filesOfflinePrimaryAction = TriggerTermuxWake;
+                filesOfflineSecondaryBtn.Text = S["FilesBrowseSdcardBtn"];
+                filesOfflineSecondaryAction = () => _ = LoadDirectoryAsync("/storage/emulated/0", showSpinner: true);
+                break;
+
+            default:
+                filesOfflineBanner.Visibility = ViewStates.Gone;
+                break;
         }
     }
 

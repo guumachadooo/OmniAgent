@@ -47,7 +47,7 @@ if str(SCRIPT_DIR) not in sys.path:
 
 import omni_protocol as proto
 
-AGENT_VERSION = "4.1.0"
+AGENT_VERSION = "4.1.1"
 DEFAULT_LOCAL_FS_PORT = 47921
 CRITICAL_COMMANDS = {"git_commit_push", "shell_exec", "adb_exec", "install_apk", "file_write"}
 DEFAULT_ANTIGRAVITY_CANDIDATES = (
@@ -423,6 +423,7 @@ class OmniAgentDaemon:
         self.debian_distro = debian_distro
         self.running = True
         self.headers = proto.derive_agent_headers(self.pair_secret_hex, self.channel, self.admin_key)
+        self.device_hash = self.headers["X-Device-Hash"]
 
     def send_heartbeat(self) -> None:
         env_info = detect_environment(self.repo_path, self.antigravity_dir)
@@ -925,15 +926,15 @@ def _inspect_local_triad(default_repo: Path) -> dict[str, Any]:
             "dirtyCount": 0,
         }
         if exists and (rpath / ".git").exists():
-            br = run_subprocess(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=rpath, timeout_sec=8)
+            br = run_subprocess(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=rpath, timeout=8)
             if br["ok"] and br["stdout"].strip():
                 entry["branch"] = br["stdout"].strip()
-            hd = run_subprocess(["git", "log", "-1", "--format=%h|%s"], cwd=rpath, timeout_sec=8)
+            hd = run_subprocess(["git", "log", "-1", "--format=%h|%s"], cwd=rpath, timeout=8)
             if hd["ok"] and "|" in hd["stdout"]:
                 parts = hd["stdout"].strip().split("|", 1)
                 entry["head"] = parts[0]
                 entry["lastSubject"] = parts[1][:120]
-            st = run_subprocess(["git", "status", "--porcelain"], cwd=rpath, timeout_sec=8)
+            st = run_subprocess(["git", "status", "--porcelain"], cwd=rpath, timeout=8)
             if st["ok"]:
                 lines = [ln for ln in st["stdout"].splitlines() if ln.strip()]
                 entry["dirtyCount"] = len(lines)
@@ -1010,6 +1011,15 @@ def start_local_fs_server(
                 return {}
 
         def do_GET(self) -> None:
+            try:
+                self._handle_get()
+            except Exception as exc:
+                try:
+                    self._send_json(500, {"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+                except Exception:
+                    pass
+
+        def _handle_get(self) -> None:
             if not self._check_auth():
                 return
             parsed = urllib.parse.urlparse(self.path)
@@ -1130,6 +1140,15 @@ def start_local_fs_server(
             self._send_json(404, {"ok": False, "error": f"Unknown route: {route}"})
 
         def do_POST(self) -> None:
+            try:
+                self._handle_post()
+            except Exception as exc:
+                try:
+                    self._send_json(500, {"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+                except Exception:
+                    pass
+
+        def _handle_post(self) -> None:
             if not self._check_auth():
                 return
             route = urllib.parse.urlparse(self.path).path
@@ -1197,7 +1216,7 @@ def start_local_fs_server(
                     if not (rp.is_dir() and (rp / ".git").exists()):
                         results.append({"alias": repo["alias"], "ok": False, "output": "not cloned"})
                         continue
-                    r = run_subprocess(["git", "pull", "--rebase", "--autostash"], cwd=rp, timeout_sec=60)
+                    r = run_subprocess(["git", "pull", "--rebase", "--autostash"], cwd=rp, timeout=60)
                     results.append(
                         {
                             "alias": repo["alias"],
@@ -1208,11 +1227,34 @@ def start_local_fs_server(
                 self._send_json(200, {"ok": all(x["ok"] for x in results), "results": results})
                 return
 
+            if route == "/local/logs/save":
+                content = str(body.get("content") or "")
+                raw_name = str(body.get("fileName") or "omniagent_log.txt")
+                safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", os.path.basename(raw_name)).strip("._") or "omniagent_log.txt"
+                if len(content.encode("utf-8", errors="replace")) > 2 * 1024 * 1024:
+                    content = content[-1_500_000:]
+                log_dir = Path("/sdcard/Download/OmniAgent/Logs")
+                if not log_dir.parent.parent.exists():
+                    log_dir = Path("/storage/emulated/0/Download/OmniAgent/Logs")
+                if not log_dir.parent.parent.exists():
+                    log_dir = Path.home() / ".omni_agent" / "logs"
+                try:
+                    log_dir.mkdir(parents=True, exist_ok=True)
+                    dest = log_dir / safe_name
+                    dest.write_text(content, encoding="utf-8")
+                    self._send_json(200, {"ok": True, "savedPath": str(dest), "bytes": dest.stat().st_size})
+                except OSError as exc:
+                    self._send_json(500, {"ok": False, "error": str(exc)})
+                return
+
             self._send_json(404, {"ok": False, "error": f"Unknown route: {route}"})
 
+    class _ReusableLocalFsServer(http.server.ThreadingHTTPServer):
+        allow_reuse_address = True
+        daemon_threads = True
+
     try:
-        server = http.server.ThreadingHTTPServer((host, port), LocalFsHandler)
-        server.daemon_threads = True
+        server = _ReusableLocalFsServer((host, port), LocalFsHandler)
         t = threading.Thread(target=server.serve_forever, name="omni-local-fs", daemon=True)
         t.start()
         return server
@@ -1269,6 +1311,29 @@ def main() -> int:
         print("ERROR: Provide --url and --pair-secret (or configure ~/.omni_agent/config.json via install_termux_agent.sh).", file=sys.stderr)
         return 2
 
+    lock_fd = None
+    try:
+        import fcntl  # Unix only (Termux/Debian/Linux)
+
+        lock_dir = Path(args.config).expanduser().parent
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        lock_path = lock_dir / f"daemon_{channel}.lock"
+        lock_fd = open(lock_path, "a+", encoding="utf-8")
+        try:
+            fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            lock_fd.seek(0)
+            lock_fd.truncate()
+            lock_fd.write(f"{os.getpid()}\n")
+            lock_fd.flush()
+        except BlockingIOError:
+            lock_fd.seek(0)
+            existing_pid = lock_fd.read().strip()
+            print(f"[OmniAgent] Daemon already running (channel={channel}, pid={existing_pid or '?'}). Exiting duplicate.", flush=True)
+            lock_fd.close()
+            return 0
+    except Exception:
+        lock_fd = None
+
     daemon = OmniAgentDaemon(
         relay_url=relay_url,
         pair_secret_hex=pair_secret,
@@ -1284,7 +1349,14 @@ def main() -> int:
 
     signal.signal(signal.SIGINT, _stop)
     signal.signal(signal.SIGTERM, _stop)
-    daemon.run_forever()
+    try:
+        daemon.run_forever()
+    finally:
+        if lock_fd is not None:
+            try:
+                lock_fd.close()
+            except Exception:
+                pass
     return 0
 
 

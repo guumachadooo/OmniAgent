@@ -1,3 +1,4 @@
+using System.Text.Json;
 using System.Collections.Concurrent;
 
 using Android.Content;
@@ -119,6 +120,60 @@ public static class CavernizeIpcBridgeClient {
             return (false, $"Cavernize local IPC timed out after {timeoutSeconds}s (ensure Cavernize Android is updated and signed with the matching release key).", 0);
         } finally {
             pending.TryRemove(reqId, out _);
+        }
+    }
+
+
+    /// <summary>
+    /// Queries same-signature CavernizeAndroid over local Broadcast IPC (<c>get_omni_bootstrap</c>)
+    /// to automatically import its Cloudflare Worker URL and 256-bit Pair Key without manual pasting.
+    /// </summary>
+    public static async Task<(bool imported, string detail)> TryBootstrapFromCavernizeAsync(
+        Context context,
+        OmniSettingsStore store,
+        bool overwriteExisting = false,
+        CancellationToken ct = default) {
+        if (context == null || store == null) {
+            return (false, "Missing context/store.");
+        }
+        if (!IsSignatureVerified(context)) {
+            return (false, "Cavernize not installed or signature mismatch.");
+        }
+        (bool ok, string body, long ms) = await SendCommandAsync(
+            context, "get_omni_bootstrap", "{}", maxTier: 0, timeoutSeconds: 8, ct).ConfigureAwait(false);
+        if (!ok || string.IsNullOrWhiteSpace(body)) {
+            OmniLogger.Warn("IPC", $"Cavernize bootstrap failed ({ms} ms): {body}");
+            return (false, string.IsNullOrWhiteSpace(body) ? "Cavernize did not reply (update Cavernize to latest APK)." : body);
+        }
+        try {
+            using JsonDocument doc = JsonDocument.Parse(body);
+            JsonElement root = doc.RootElement;
+            string relayUrl = root.TryGetProperty("relayUrl", out JsonElement rEl) ? (rEl.GetString() ?? "") : "";
+            string pairHex = root.TryGetProperty("pairSecretHex", out JsonElement pEl) ? (pEl.GetString() ?? "") : "";
+            string normPair = OmniCrypto.NormalizePairSecretHex(pairHex);
+
+            bool changed = false;
+            if (OmniSettingsStore.TryNormalizeRelayUrl(relayUrl, out string normRelay) &&
+                (overwriteExisting || string.IsNullOrWhiteSpace(store.RelayUrl) ||
+                 store.RelayUrl.Contains("your-worker", StringComparison.OrdinalIgnoreCase))) {
+                store.RelayUrl = normRelay;
+                changed = true;
+            }
+            if (!string.IsNullOrEmpty(normPair) && (overwriteExisting || !store.HasPairSecret)) {
+                store.SavePairSecretHex(normPair);
+                changed = true;
+            }
+            if (changed) {
+                OmniSettingsStore.AppendActivity("IPC", $"Synced Relay URL & 256-bit Pair Key from Cavernize ({ms} ms).");
+                return (true, $"Synced from Cavernize ({ms} ms)");
+            }
+            if (string.IsNullOrEmpty(normPair)) {
+                return (false, "Cavernize has no Pair Key saved yet.");
+            }
+            return (false, "Already configured.");
+        } catch (Exception ex) {
+            OmniLogger.Warn("IPC", $"Bootstrap parse error: {ex.Message}");
+            return (false, ex.Message);
         }
     }
 

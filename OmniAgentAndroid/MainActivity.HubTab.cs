@@ -362,7 +362,7 @@ public sealed partial class MainActivity {
         btn.Enabled = false;
         try {
             (bool ok, string body, long ms) = await CavernizeIpcBridgeClient.SendCommandAsync(
-                this, "self_check", "{}", maxTier: 1, timeoutSeconds: 30).ConfigureAwait(false);
+                this, "quick_check", "{}", maxTier: 1, timeoutSeconds: 30).ConfigureAwait(false);
             string display = ok ? $"({ms} ms)\n\n{body}" : body;
             OmniSettingsStore.AppendActivity("CAVERN", ok ? $"Self-check OK ({ms} ms)" : $"Self-check: {body}");
             RunOnUiThread(() => {
@@ -394,9 +394,14 @@ public sealed partial class MainActivity {
                 return;
             }
             ShowToast(S["HubApkDownloading"]);
-            (bool ok, string detail) = await TriadHubService.DownloadAndInstallApkAsync(
+            (bool ok, string apkPath, string detail) = await TriadHubService.DownloadApkAsync(
                 this, repo.LatestApkUrl, fileName).ConfigureAwait(false);
-            ShowToast(ok ? $"{S["HubApkReady"]}: {detail}" : detail);
+            if (!ok) {
+                ShowToast(detail);
+                return;
+            }
+            ShowToast($"{S["HubApkReady"]}: {detail}");
+            RunOnUiThread(() => InstallDownloadedApkWithPermissionCheck(apkPath));
         } finally {
             RunOnUiThread(() => btn.Enabled = true);
         }

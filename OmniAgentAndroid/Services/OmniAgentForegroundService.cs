@@ -41,7 +41,9 @@ public sealed class OmniAgentForegroundService : Service {
         "install_apk_url",
         "launch_termux_daemon",
         "termux_run",
-        "open_cavernize"
+        "open_cavernize",
+        "get_logs",
+        "get_diagnostics"
     ];
 
     static readonly HttpClient http = BuildClient();
@@ -164,6 +166,7 @@ public sealed class OmniAgentForegroundService : Service {
             return StartCommandResult.NotSticky;
         }
 
+        OmniLogger.Initialize(this);
         EnsureChannel();
         StartForegroundCompat(NotifId, BuildNotification());
 
@@ -268,8 +271,8 @@ public sealed class OmniAgentForegroundService : Service {
                     try {
                         await SendHeartbeatAsync(baseUrl, devHash, agentKey, store, ct).ConfigureAwait(false);
                         lastHb = DateTime.UtcNow;
-                    } catch {
-                        // Retry on next loop
+                    } catch (Exception hbEx) when (hbEx is not System.OperationCanceledException) {
+                        OmniLogger.Warn("BRIDGE", $"Heartbeat failed: {hbEx.Message}");
                     }
                 }
 
@@ -319,7 +322,8 @@ public sealed class OmniAgentForegroundService : Service {
                     }
                 } catch (System.OperationCanceledException) {
                     break;
-                } catch {
+                } catch (Exception pollEx) {
+                    OmniLogger.Warn("BRIDGE", $"PollLoop tick error: {pollEx.Message}");
                     idleTicks = Math.Min(idleTicks + 1, 15);
                 }
 
@@ -603,6 +607,34 @@ public sealed class OmniAgentForegroundService : Service {
                     return new { ok = true, cmd, bytes = apkBytes.Length, file = fileName };
                 }
 
+                case "get_logs": {
+                    int maxLines = argsEl.ValueKind == JsonValueKind.Object &&
+                        argsEl.TryGetProperty("lines", out JsonElement lEl) &&
+                        lEl.TryGetInt32(out int parsedLines)
+                        ? Math.Clamp(parsedLines, 20, 1200)
+                        : 300;
+                    return new {
+                        ok = true,
+                        cmd,
+                        logSizeBytes = OmniLogger.GetLogSizeBytes(),
+                        sessionId = OmniLogger.SessionId,
+                        counts = new {
+                            info = OmniLogger.SessionInfoCount,
+                            warn = OmniLogger.SessionWarnCount,
+                            error = OmniLogger.SessionErrorCount,
+                            fatal = OmniLogger.SessionFatalCount
+                        },
+                        tail = OmniLogger.ReadRecentLines(maxLines)
+                    };
+                }
+
+                case "get_diagnostics":
+                    return new {
+                        ok = true,
+                        cmd,
+                        summaryJson = OmniLogger.BuildDiagnosticSummaryJson(this, store)
+                    };
+
                 case "launch_termux_daemon": {
                     string scriptPath = GetStr(argsEl, "script");
                     if (string.IsNullOrEmpty(scriptPath)) {
@@ -714,8 +746,10 @@ public sealed class OmniAgentForegroundService : Service {
         // 2) Runs native Termux start.sh via setsid -f if present;
         // 3) Otherwise detaches proot-distro on the OUTSIDE via setsid -f while running the daemon
         //    in foreground inside Debian PRoot (preventing PRoot from exiting and killing child processes!).
+        // Avoid spawning a duplicate PRoot daemon if loopback 127.0.0.1:47921 is already accepting connections.
         string smartCmd =
             $"export PATH=/data/data/com.termux/files/usr/bin:$PATH; " +
+            $"if (exec 3<>/dev/tcp/127.0.0.1/47921) 2>/dev/null; then exec 3>&-; exit 0; fi; " +
             $"if [ -x '{safeCustom}' ]; then " +
             $"setsid -f bash '{safeCustom}' >\"$HOME/.omni_agent_termux.log\" 2>&1 < /dev/null; " +
             $"elif command -v proot-distro >/dev/null 2>&1; then " +
@@ -726,6 +760,7 @@ public sealed class OmniAgentForegroundService : Service {
             $"fi";
 
         (bool ok, string msg) = LaunchTermuxCommand(context, "/data/data/com.termux/files/usr/bin/bash", ["-lc", smartCmd]);
+        OmniLogger.Info("TERMUX", $"LaunchTermuxSmartDaemon ok={ok} msg={msg}");
         if (ok) {
             return (true, false, false, "Smart wake sent to Termux / Debian PRoot daemon.");
         }

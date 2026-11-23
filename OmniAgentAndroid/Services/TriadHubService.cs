@@ -162,6 +162,7 @@ public static class TriadHubService {
         string commitMsg = "";
         string ciStatus = "idle";
 
+        bool rateLimited = false;
         try {
             using HttpRequestMessage relReq = CreateGhReq($"https://api.github.com/repos/{ownerRepo}/releases/latest", pat);
             using HttpResponseMessage relResp = await http.SendAsync(relReq, ct).ConfigureAwait(false);
@@ -183,46 +184,67 @@ public static class TriadHubService {
                         }
                     }
                 }
+            } else if ((int)relResp.StatusCode == 403 || (int)relResp.StatusCode == 429) {
+                rateLimited = true;
+                OmniLogger.Warn("HUB", $"GitHub API HTTP {(int)relResp.StatusCode} for {ownerRepo} releases; using zero-quota web redirect fallback.");
             }
-        } catch {
-            // Best effort
+        } catch (Exception ex) {
+            OmniLogger.Warn("HUB", $"GitHub release lookup failed for {ownerRepo}: {ex.Message}");
         }
 
-        try {
-            using HttpRequestMessage cReq = CreateGhReq($"https://api.github.com/repos/{ownerRepo}/commits/{branch}", pat);
-            using HttpResponseMessage cResp = await http.SendAsync(cReq, ct).ConfigureAwait(false);
-            if (cResp.IsSuccessStatusCode) {
-                using JsonDocument doc = JsonDocument.Parse(await cResp.Content.ReadAsStringAsync(ct).ConfigureAwait(false));
-                string sha = Str(doc.RootElement, "sha");
-                commitSha = sha.Length >= 7 ? sha[..7] : sha;
-                if (doc.RootElement.TryGetProperty("commit", out JsonElement cObj)) {
-                    string fullMsg = Str(cObj, "message");
-                    int nl = fullMsg.IndexOf('\n');
-                    commitMsg = (nl > 0 ? fullMsg[..nl] : fullMsg).Trim();
-                }
+        if (string.IsNullOrWhiteSpace(latestTag) || latestTag == "—" ||
+            (!string.IsNullOrEmpty(preferredApkName) && string.IsNullOrWhiteSpace(latestApkUrl))) {
+            (string webTag, string webApkUrl) = await OmniUpdateService.ResolveLatestReleaseViaWebRedirectAsync(
+                ownerRepo, preferredApkName, ct).ConfigureAwait(false);
+            if (!string.IsNullOrWhiteSpace(webTag)) {
+                latestTag = webTag;
             }
-        } catch {
-            // Best effort
+            if (!string.IsNullOrWhiteSpace(webApkUrl) && string.IsNullOrWhiteSpace(latestApkUrl)) {
+                latestApkUrl = webApkUrl;
+            }
         }
 
-        try {
-            using HttpRequestMessage runReq = CreateGhReq($"https://api.github.com/repos/{ownerRepo}/actions/runs?per_page=1", pat);
-            using HttpResponseMessage runResp = await http.SendAsync(runReq, ct).ConfigureAwait(false);
-            if (runResp.IsSuccessStatusCode) {
-                using JsonDocument doc = JsonDocument.Parse(await runResp.Content.ReadAsStringAsync(ct).ConfigureAwait(false));
-                if (doc.RootElement.TryGetProperty("workflow_runs", out JsonElement arr) &&
-                    arr.ValueKind == JsonValueKind.Array &&
-                    arr.GetArrayLength() > 0) {
-                    JsonElement first = arr[0];
-                    string st = Str(first, "status");
-                    string conc = Str(first, "conclusion");
-                    if (st is "in_progress" or "queued") ciStatus = "running";
-                    else if (conc == "success") ciStatus = "pass";
-                    else if (conc is "failure" or "timed_out") ciStatus = "fail";
+        if (!rateLimited) {
+            try {
+                using HttpRequestMessage cReq = CreateGhReq($"https://api.github.com/repos/{ownerRepo}/commits/{branch}", pat);
+                using HttpResponseMessage cResp = await http.SendAsync(cReq, ct).ConfigureAwait(false);
+                if (cResp.IsSuccessStatusCode) {
+                    using JsonDocument doc = JsonDocument.Parse(await cResp.Content.ReadAsStringAsync(ct).ConfigureAwait(false));
+                    string sha = Str(doc.RootElement, "sha");
+                    commitSha = sha.Length >= 7 ? sha[..7] : sha;
+                    if (doc.RootElement.TryGetProperty("commit", out JsonElement cObj)) {
+                        string fullMsg = Str(cObj, "message");
+                        int nl = fullMsg.IndexOf('\n');
+                        commitMsg = (nl > 0 ? fullMsg[..nl] : fullMsg).Trim();
+                    }
+                } else if ((int)cResp.StatusCode == 403 || (int)cResp.StatusCode == 429) {
+                    rateLimited = true;
                 }
+            } catch (Exception ex) {
+                OmniLogger.Warn("HUB", $"GitHub commit lookup failed for {ownerRepo}: {ex.Message}");
             }
-        } catch {
-            // Best effort
+        }
+
+        if (!rateLimited) {
+            try {
+                using HttpRequestMessage runReq = CreateGhReq($"https://api.github.com/repos/{ownerRepo}/actions/runs?per_page=1", pat);
+                using HttpResponseMessage runResp = await http.SendAsync(runReq, ct).ConfigureAwait(false);
+                if (runResp.IsSuccessStatusCode) {
+                    using JsonDocument doc = JsonDocument.Parse(await runResp.Content.ReadAsStringAsync(ct).ConfigureAwait(false));
+                    if (doc.RootElement.TryGetProperty("workflow_runs", out JsonElement arr) &&
+                        arr.ValueKind == JsonValueKind.Array &&
+                        arr.GetArrayLength() > 0) {
+                        JsonElement first = arr[0];
+                        string st = Str(first, "status");
+                        string conc = Str(first, "conclusion");
+                        if (st is "in_progress" or "queued") ciStatus = "running";
+                        else if (conc == "success") ciStatus = "pass";
+                        else if (conc is "failure" or "timed_out") ciStatus = "fail";
+                    }
+                }
+            } catch (Exception ex) {
+                OmniLogger.Warn("HUB", $"GitHub CI lookup failed for {ownerRepo}: {ex.Message}");
+            }
         }
 
         return new TriadRepoCardModel {
@@ -243,31 +265,52 @@ public static class TriadHubService {
         return string.IsNullOrWhiteSpace(txt) ? "(Could not fetch document — check network connection.)" : txt;
     }
 
+    public static async Task<(bool ok, string apkPath, string detail)> DownloadApkAsync(
+        Context context,
+        string apkUrl,
+        string fileName,
+        Action<double, string> onProgress = null,
+        CancellationToken ct = default) {
+        if (context == null || string.IsNullOrWhiteSpace(apkUrl)) {
+            return (false, "", "Missing APK download URL.");
+        }
+        try {
+            string safeName = IOPath.GetFileName(string.IsNullOrWhiteSpace(fileName) ? "update.apk" : fileName);
+            string outPath = await OmniUpdateService.DownloadUpdateAsync(
+                context,
+                apkUrl,
+                expectedBytes: 0,
+                onProgress: onProgress,
+                fileName: safeName,
+                token: ct).ConfigureAwait(false);
+            long sizeBytes = File.Exists(outPath) ? new FileInfo(outPath).Length : 0;
+            OmniSettingsStore.AppendActivity("APK", $"Downloaded {safeName} ({sizeBytes / (1024 * 1024.0):0.1} MB).");
+            return (true, outPath, $"{sizeBytes / (1024 * 1024.0):0.1} MB");
+        } catch (Exception ex) {
+            OmniLogger.Error("APK", $"DownloadApkAsync({fileName})", ex);
+            return (false, "", ex.Message);
+        }
+    }
+
     public static async Task<(bool ok, string detail)> DownloadAndInstallApkAsync(
         Context context,
         string apkUrl,
         string fileName,
         CancellationToken ct = default) {
-        if (context == null || string.IsNullOrWhiteSpace(apkUrl)) {
-            return (false, "Missing APK download URL.");
+        (bool ok, string outPath, string detail) = await DownloadApkAsync(context, apkUrl, fileName, null, ct).ConfigureAwait(false);
+        if (!ok) {
+            return (false, detail);
         }
         try {
-            using HttpClient dlHttp = new() { Timeout = TimeSpan.FromMinutes(3) };
-            dlHttp.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue("OmniAgentHub", "2.1"));
-            byte[] bytes = await dlHttp.GetByteArrayAsync(apkUrl, ct).ConfigureAwait(false);
-            string safeName = IOPath.GetFileName(string.IsNullOrWhiteSpace(fileName) ? "update.apk" : fileName);
-            string dir = OmniApkFileProvider.GetApkDirectory(context);
-            string outPath = IOPath.Combine(dir, safeName);
-            await File.WriteAllBytesAsync(outPath, bytes, ct).ConfigureAwait(false);
-
+            string safeName = IOPath.GetFileName(outPath);
             Android.Net.Uri apkUri = OmniApkFileProvider.GetApkUri(context, safeName);
             Intent installIntent = new(Intent.ActionView);
             installIntent.SetDataAndType(apkUri, "application/vnd.android.package-archive");
             installIntent.AddFlags(ActivityFlags.NewTask | ActivityFlags.GrantReadUriPermission);
             context.StartActivity(installIntent);
-            OmniSettingsStore.AppendActivity("APK", $"Downloaded & launched installer for {fileName} ({bytes.Length / 1024} KB).");
-            return (true, $"Launching installer ({bytes.Length / (1024 * 1024.0):0.1} MB)");
+            return (true, $"Launching installer ({detail})");
         } catch (Exception ex) {
+            OmniLogger.Error("APK", "DownloadAndInstallApkAsync launch", ex);
             return (false, ex.Message);
         }
     }

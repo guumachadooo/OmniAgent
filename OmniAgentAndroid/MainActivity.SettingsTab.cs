@@ -23,12 +23,21 @@ public sealed partial class MainActivity {
     TextView designSyncInfoTv;
     OneUiSwitch alwaysOnSwitch;
     OneUiSwitch smartKnockSwitch;
+    OneUiSwitch autoUpdateSwitch;
+    TextView updateCurrentTv;
+    TextView updateStatusTv;
+    ProgressBar updateProgressBar;
+    Button checkUpdateBtn;
+    Button downloadUpdateBtn;
+    OmniUpdateCheckResult latestOmniUpdate;
+    bool omniUpdateBusy;
+    TextView logsSummaryTv;
     bool suppressSettingsEvents;
 
     void BuildSettingsTab(LinearLayout parent) {
         parent.AddView(MakeTabHeader(
             S["SettingsTitle"],
-            $"OmniAgent v2.1 · Kit {OneUiDesignKitManifest.KitFingerprint}",
+            $"OmniAgent v{OmniUpdateService.GetInstalledVersion(this).versionName} · Kit {OneUiDesignKitManifest.KitFingerprint}",
             OneUiIconType.Gear,
             OneUiTheme.IconSystemInfo));
 
@@ -201,7 +210,101 @@ public sealed partial class MainActivity {
             ViewGroup.LayoutParams.MatchParent, ViewGroup.LayoutParams.WrapContent));
         parent.AddView(designCard);
 
-        // 5. Language Selector Card
+        // 5. App Updates Card (GitHub Releases + Zero-Rate-Limit Fallback + Streaming APK Installer)
+        LinearLayout updateCard = MakeGlassCard();
+        updateCard.AddView(MakeCardHeader(
+            S["SettingsUpdateTitle"],
+            OneUiIconType.Refresh,
+            OneUiTheme.Primary));
+
+        (string installedVer, _) = OmniUpdateService.GetInstalledVersion(this);
+        updateCurrentTv = new TextView(this) {
+            Text = string.Format(S["SettingsUpdateCurrentFmt"], installedVer),
+            TextSize = 13.5f,
+            Typeface = FontBold,
+        };
+        updateCurrentTv.SetTextColor(OneUiTheme.TextPrimary);
+        updateCard.AddView(updateCurrentTv);
+
+        updateStatusTv = new TextView(this) {
+            Text = S["SettingsUpdateReady"],
+            TextSize = 12.5f,
+            Typeface = FontRegular,
+        };
+        updateStatusTv.SetTextColor(OneUiTheme.TextSub);
+        updateStatusTv.SetPadding(0, Dp(4), 0, Dp(10));
+        updateCard.AddView(updateStatusTv);
+
+        updateProgressBar = new ProgressBar(this, null, Android.Resource.Attribute.ProgressBarStyleHorizontal) {
+            Max = 1000,
+            Progress = 0,
+            Visibility = ViewStates.Gone,
+        };
+        OneUiTheme.StyleProgressBar(this, updateProgressBar);
+        updateCard.AddView(updateProgressBar, new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MatchParent, Dp(6)) { BottomMargin = Dp(10) });
+
+        LinearLayout updBtnRow = MakeHRow();
+        checkUpdateBtn = MakeActionPill(S["SettingsUpdateCheckBtn"], primary: false);
+        checkUpdateBtn.Click += (_, _) => _ = CheckForOmniUpdateAsync(silent: false);
+        downloadUpdateBtn = MakeActionPill(S["SettingsUpdateDownloadBtn"], primary: true);
+        downloadUpdateBtn.Visibility = ViewStates.Gone;
+        downloadUpdateBtn.Click += (_, _) => _ = StartOmniUpdateDownloadAndInstallAsync();
+        updBtnRow.AddView(checkUpdateBtn, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WrapContent, 1f) { RightMargin = Dp(8) });
+        updBtnRow.AddView(downloadUpdateBtn, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WrapContent, 1f));
+        updateCard.AddView(updBtnRow, new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MatchParent, ViewGroup.LayoutParams.WrapContent) { BottomMargin = Dp(8) });
+
+        updateCard.AddView(OneUiTheme.CreateDivider(this));
+        (LinearLayout autoUpdRow, OneUiSwitch autoUpdSw) = MakeSwitchRow(
+            S["SettingsUpdateAutoSwitch"],
+            null,
+            store.AutoCheckUpdates,
+            isChecked => {
+                if (suppressSettingsEvents) {
+                    return;
+                }
+                store.AutoCheckUpdates = isChecked;
+                OmniLogger.Info("UPDATE", $"AutoCheckUpdates -> {isChecked}");
+            });
+        autoUpdateSwitch = autoUpdSw;
+        updateCard.AddView(autoUpdRow);
+        parent.AddView(updateCard);
+
+        // 6. Diagnostics & Logs Card (persistent rolling log, viewer, export to Downloads & Share)
+        LinearLayout logsCard = MakeGlassCard();
+        logsCard.AddView(MakeCardHeader(
+            S["SettingsLogsTitle"],
+            OneUiIconType.Logs,
+            OneUiTheme.FunctionalCyan));
+
+        logsSummaryTv = new TextView(this) {
+            Text = "",
+            TextSize = 12.5f,
+            Typeface = FontRegular,
+        };
+        logsSummaryTv.SetTextColor(OneUiTheme.TextSub);
+        logsSummaryTv.SetPadding(0, 0, 0, Dp(10));
+        logsCard.AddView(logsSummaryTv);
+
+        LinearLayout logsRow = MakeHRow();
+        Button viewLogBtn = MakeActionPill(S["SettingsLogsViewBtn"], primary: true);
+        viewLogBtn.Click += (_, _) => ShowDiagnosticLogModal();
+        Button exportLogBtn = MakeActionPill(S["SettingsLogsExportBtn"], primary: false);
+        exportLogBtn.Click += (_, _) => _ = ExportAndShareDiagnosticLogAsync(exportLogBtn);
+        Button clearLogBtn = MakeActionPill(S["SettingsLogsClearBtn"], primary: false);
+        clearLogBtn.Click += (_, _) => {
+            OmniLogger.Clear(this);
+            RefreshLogsSummary();
+            ShowToast(S["SettingsLogsClearedToast"]);
+        };
+        logsRow.AddView(viewLogBtn, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WrapContent, 1f) { RightMargin = Dp(6) });
+        logsRow.AddView(exportLogBtn, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WrapContent, 1.15f) { RightMargin = Dp(6) });
+        logsRow.AddView(clearLogBtn, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WrapContent, 0.85f));
+        logsCard.AddView(logsRow);
+        parent.AddView(logsCard);
+
+        // 7. Language Selector Card
         LinearLayout langCard = MakeGlassCard();
         langCard.AddView(MakeCardHeader(
             S["SettingsLanguageLabel"],
@@ -278,6 +381,10 @@ public sealed partial class MainActivity {
                 OneUiTheme.ActiveDesignTokensSource,
                 OneUiDesignKitManifest.KitFingerprint,
                 lastSync);
+            if (autoUpdateSwitch != null) {
+                autoUpdateSwitch.Checked = store.AutoCheckUpdates;
+            }
+            RefreshLogsSummary();
         } finally {
             suppressSettingsEvents = false;
         }
@@ -316,15 +423,28 @@ public sealed partial class MainActivity {
         body.AddView(urlEt);
 
         body.AddView(MakeFieldLabel(S["PairKeyLabel"]));
-        EditText keyEt = MakeInput("64 hex chars", OmniCrypto.FormatPairKeyDisplay(store.LoadPairSecretHex()), isSecret: false);
+        string existingHex = store.LoadPairSecretHex();
+        string keyHint = string.IsNullOrEmpty(existingHex)
+            ? "64 hex chars"
+            : $"{OmniCrypto.FormatPairKeyDisplay(existingHex)} (saved)";
+        // Keep keyEt.Text empty so the masked display preview is NEVER mistaken for a 64-hex key!
+        EditText keyEt = MakeInput(keyHint, "", isSecret: false);
         body.AddView(keyEt);
 
         LinearLayout keyBtns = MakeHRow();
         keyBtns.SetPadding(0, Dp(10), 0, 0);
         Button genBtn = MakeActionPill(S["GenerateBtn"], primary: false);
-        genBtn.Click += (_, _) => keyEt.Text = OmniCrypto.FormatPairKeyDisplay(OmniCrypto.GeneratePairSecretHex());
+        genBtn.Click += (_, _) => keyEt.Text = OmniCrypto.GeneratePairSecretHex();
         Button copyBtn = MakeActionPill(S["CopyKeyBtn"], primary: false);
-        copyBtn.Click += (_, _) => CopyToClipboard("OmniAgent Pair Key", OmniCrypto.NormalizePairSecretHex(keyEt.Text));
+        copyBtn.Click += (_, _) => {
+            string typed = OmniCrypto.NormalizePairSecretHex(keyEt.Text);
+            string toCopy = !string.IsNullOrEmpty(typed) ? typed : store.LoadPairSecretHex();
+            if (string.IsNullOrEmpty(toCopy)) {
+                ShowToast(S["FilesMissingKeyTitle"]);
+                return;
+            }
+            CopyToClipboard("OmniAgent Pair Key", toCopy);
+        };
         Button testBtn = MakeActionPill(S["TestBtn"], primary: false);
         TextView testStatusTv = new(this) { Text = "", TextSize = 12f, Typeface = FontRegular };
         testStatusTv.SetTextColor(OneUiTheme.TextSub);
@@ -343,6 +463,35 @@ public sealed partial class MainActivity {
         keyBtns.AddView(copyBtn, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WrapContent, 1f) { RightMargin = Dp(6) });
         keyBtns.AddView(testBtn, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WrapContent, 1f));
         body.AddView(keyBtns);
+
+        Button syncCavBtn = MakeActionPill(S["RelaySyncCavernizeBtn"], primary: true);
+        syncCavBtn.Click += async (_, _) => {
+            syncCavBtn.Enabled = false;
+            testStatusTv.Text = "...";
+            try {
+                (bool imported, string detail) = await CavernizeIpcBridgeClient.TryBootstrapFromCavernizeAsync(
+                    this, store).ConfigureAwait(false);
+                RunOnUiThread(() => {
+                    testStatusTv.Text = detail;
+                    testStatusTv.SetTextColor(imported ? OneUiTheme.FunctionalGreen : OneUiTheme.FunctionalAmber);
+                    if (imported) {
+                        urlEt.Text = store.RelayUrl;
+                        keyEt.Hint = $"{OmniCrypto.FormatPairKeyDisplay(store.LoadPairSecretHex())} (synced)";
+                        keyEt.Text = "";
+                        lastDebianProbeMs = 0;
+                        OmniAgentForegroundService.EnsureAlwaysOn(this);
+                        RefreshAllVisibleState(probeDebian: true);
+                        if (filesInitialized) {
+                            _ = LoadDirectoryAsync(currentExplorerPath, showSpinner: true);
+                        }
+                    }
+                });
+            } finally {
+                RunOnUiThread(() => syncCavBtn.Enabled = true);
+            }
+        };
+        body.AddView(syncCavBtn, new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MatchParent, ViewGroup.LayoutParams.WrapContent) { TopMargin = Dp(8) });
         body.AddView(testStatusTv);
 
         OneUiModalDialog.Show(
@@ -356,13 +505,23 @@ public sealed partial class MainActivity {
                 if (OmniSettingsStore.TryNormalizeRelayUrl(urlEt.Text, out string norm)) {
                     store.RelayUrl = norm;
                 }
-                string normKey = OmniCrypto.NormalizePairSecretHex(keyEt.Text);
-                if (!string.IsNullOrEmpty(normKey)) {
-                    store.SavePairSecretHex(normKey);
+                string rawTypedKey = (keyEt.Text ?? "").Trim();
+                if (!string.IsNullOrEmpty(rawTypedKey)) {
+                    string normKey = OmniCrypto.NormalizePairSecretHex(rawTypedKey);
+                    if (!string.IsNullOrEmpty(normKey)) {
+                        store.SavePairSecretHex(normKey);
+                    } else {
+                        ShowToast("Invalid Pair Key (requires 64 hex chars).");
+                        return;
+                    }
                 }
                 OmniSettingsStore.AppendActivity("CFG", "Saved Cloudflare Hub URL & Keystore pairing key.");
+                lastDebianProbeMs = 0;
                 OmniAgentForegroundService.EnsureAlwaysOn(this);
-                RefreshAllVisibleState();
+                RefreshAllVisibleState(probeDebian: true);
+                if (filesInitialized) {
+                    _ = LoadDirectoryAsync(currentExplorerPath, showSpinner: true);
+                }
             },
             negativeText: S["CancelBtn"]);
     }
@@ -544,4 +703,290 @@ public sealed partial class MainActivity {
         "en" => 2,
         _ => 0,
     };
+
+    // ── Self-Updater & Persistent Diagnostics Log Handlers ───────────────────────────────
+
+    void RefreshLogsSummary() {
+        if (logsSummaryTv == null || IsFinishing || IsDestroyed) {
+            return;
+        }
+        long bytes = OmniLogger.GetLogSizeBytes();
+        int errCount = OmniLogger.SessionErrorCount + OmniLogger.SessionFatalCount;
+        int warnCount = OmniLogger.SessionWarnCount;
+        logsSummaryTv.Text = string.Format(
+            S["SettingsLogsSummaryFmt"],
+            TermuxLocalFsClient.FormatSize(bytes),
+            errCount,
+            warnCount);
+    }
+
+    async Task CheckForOmniUpdateAsync(bool silent) {
+        if (omniUpdateBusy) {
+            return;
+        }
+        omniUpdateBusy = true;
+        RunOnUiThread(() => {
+            if (IsFinishing || IsDestroyed) {
+                return;
+            }
+            if (checkUpdateBtn != null) {
+                checkUpdateBtn.Enabled = false;
+            }
+            if (!silent && updateStatusTv != null) {
+                updateStatusTv.Text = S["SettingsUpdateChecking"];
+                updateStatusTv.SetTextColor(OneUiTheme.TextSub);
+            }
+        });
+
+        try {
+            OmniUpdateCheckResult result = await OmniUpdateService.CheckForUpdateAsync(this, store).ConfigureAwait(false);
+            latestOmniUpdate = result;
+            RunOnUiThread(() => {
+                if (IsFinishing || IsDestroyed) {
+                    return;
+                }
+                if (updateCurrentTv != null) {
+                    updateCurrentTv.Text = string.Format(S["SettingsUpdateCurrentFmt"], result.CurrentVersion);
+                }
+                if (result.IsUpdateAvailable) {
+                    if (updateStatusTv != null) {
+                        string suffix = result.AssetSizeBytes > 0
+                            ? $" ({TermuxLocalFsClient.FormatSize(result.AssetSizeBytes)})"
+                            : "";
+                        updateStatusTv.Text = string.Format(S["SettingsUpdateAvailableFmt"], result.RemoteVersion) + suffix;
+                        updateStatusTv.SetTextColor(OneUiTheme.FunctionalGreen);
+                    }
+                    if (downloadUpdateBtn != null) {
+                        downloadUpdateBtn.Text = S["SettingsUpdateDownloadBtn"];
+                        downloadUpdateBtn.Visibility = ViewStates.Visible;
+                    }
+                    if (!silent) {
+                        ShowToast(string.Format(S["SettingsUpdateAvailableFmt"], result.RemoteVersion));
+                    }
+                } else {
+                    if (updateStatusTv != null) {
+                        updateStatusTv.Text = string.Format(S["SettingsUpdateUpToDateFmt"], result.CurrentVersion);
+                        updateStatusTv.SetTextColor(OneUiTheme.TextSub);
+                    }
+                    if (downloadUpdateBtn != null && !string.IsNullOrWhiteSpace(result.DownloadUrl)) {
+                        downloadUpdateBtn.Text = S["SettingsUpdateReinstallBtn"];
+                        downloadUpdateBtn.Visibility = ViewStates.Visible;
+                    }
+                }
+            });
+        } catch (Exception ex) {
+            OmniLogger.Error("UPDATE", "CheckForOmniUpdateAsync", ex);
+            if (!silent) {
+                RunOnUiThread(() => {
+                    if (updateStatusTv != null) {
+                        updateStatusTv.Text = ex.Message;
+                        updateStatusTv.SetTextColor(OneUiTheme.FunctionalAmber);
+                    }
+                    ShowToast(ex.Message);
+                });
+            }
+        } finally {
+            omniUpdateBusy = false;
+            RunOnUiThread(() => {
+                if (checkUpdateBtn != null && !IsFinishing && !IsDestroyed) {
+                    checkUpdateBtn.Enabled = true;
+                }
+            });
+        }
+    }
+
+    async Task StartOmniUpdateDownloadAndInstallAsync() {
+        if (omniUpdateBusy) {
+            return;
+        }
+        if (latestOmniUpdate == null || string.IsNullOrWhiteSpace(latestOmniUpdate.DownloadUrl)) {
+            await CheckForOmniUpdateAsync(silent: false).ConfigureAwait(false);
+            if (latestOmniUpdate == null || string.IsNullOrWhiteSpace(latestOmniUpdate.DownloadUrl)) {
+                return;
+            }
+        }
+
+        omniUpdateBusy = true;
+        RunOnUiThread(() => {
+            if (IsFinishing || IsDestroyed) {
+                return;
+            }
+            if (checkUpdateBtn != null) checkUpdateBtn.Enabled = false;
+            if (downloadUpdateBtn != null) downloadUpdateBtn.Enabled = false;
+            if (updateProgressBar != null) {
+                updateProgressBar.Progress = 0;
+                updateProgressBar.Visibility = ViewStates.Visible;
+            }
+            if (updateStatusTv != null) {
+                updateStatusTv.Text = S["SettingsUpdateDownloading"];
+                updateStatusTv.SetTextColor(OneUiTheme.Primary);
+            }
+        });
+
+        try {
+            string apkPath = await OmniUpdateService.DownloadUpdateAsync(
+                this,
+                latestOmniUpdate.DownloadUrl,
+                latestOmniUpdate.AssetSizeBytes,
+                onProgress: (frac, label) => {
+                    RunOnUiThread(() => {
+                        if (IsFinishing || IsDestroyed) {
+                            return;
+                        }
+                        if (updateProgressBar != null) {
+                            updateProgressBar.Progress = (int)Math.Clamp(frac * 1000.0, 0.0, 1000.0);
+                        }
+                        if (updateStatusTv != null && !string.IsNullOrWhiteSpace(label)) {
+                            updateStatusTv.Text = $"{S["SettingsUpdateDownloading"]} {label}";
+                        }
+                    });
+                },
+                fileName: OmniUpdateService.TargetAssetName).ConfigureAwait(false);
+
+            RunOnUiThread(() => {
+                if (IsFinishing || IsDestroyed) {
+                    return;
+                }
+                if (updateProgressBar != null) {
+                    updateProgressBar.Progress = 1000;
+                    updateProgressBar.Visibility = ViewStates.Gone;
+                }
+                if (updateStatusTv != null) {
+                    updateStatusTv.Text = S["HubApkReady"];
+                    updateStatusTv.SetTextColor(OneUiTheme.FunctionalGreen);
+                }
+                InstallDownloadedApkWithPermissionCheck(apkPath);
+            });
+        } catch (Exception ex) {
+            OmniLogger.Error("UPDATE", "StartOmniUpdateDownloadAndInstallAsync", ex);
+            RunOnUiThread(() => {
+                if (updateProgressBar != null) {
+                    updateProgressBar.Visibility = ViewStates.Gone;
+                }
+                if (updateStatusTv != null) {
+                    updateStatusTv.Text = ex.Message;
+                    updateStatusTv.SetTextColor(OneUiTheme.FunctionalRed);
+                }
+                ShowToast(ex.Message);
+            });
+        } finally {
+            omniUpdateBusy = false;
+            RunOnUiThread(() => {
+                if (!IsFinishing && !IsDestroyed) {
+                    if (checkUpdateBtn != null) checkUpdateBtn.Enabled = true;
+                    if (downloadUpdateBtn != null) downloadUpdateBtn.Enabled = true;
+                }
+            });
+        }
+    }
+
+    void InstallDownloadedApkWithPermissionCheck(string apkPath) {
+        if (string.IsNullOrWhiteSpace(apkPath) || !File.Exists(apkPath)) {
+            ShowToast(S["HubApkNotFound"]);
+            return;
+        }
+        if (!OmniUpdateService.CanInstallPackages(this)) {
+            pendingInstallApkPath = apkPath;
+            ShowToast(S["SettingsUpdateUnknownSourcesMsg"]);
+            OmniUpdateService.OpenUnknownSourcesSettings(this);
+            return;
+        }
+        try {
+            OmniUpdateService.LaunchInstaller(this, apkPath);
+        } catch (Exception ex) {
+            OmniLogger.Error("UPDATE", "InstallDownloadedApkWithPermissionCheck", ex);
+            ShowToast(ex.Message);
+        }
+    }
+
+    void ShowDiagnosticLogModal() {
+        LinearLayout custom = new(this) { Orientation = Orientation.Vertical };
+
+        TextView logTv = new(this) {
+            Text = OmniLogger.ReadRecentLines(350),
+            TextSize = 11f,
+            Typeface = Typeface.Monospace,
+        };
+        logTv.SetTextColor(OneUiTheme.TextSecondary);
+        logTv.SetTextIsSelectable(true);
+
+        LinearLayout btnRow = MakeHRow();
+        Button refreshBtn = MakeActionPill(S["SettingsLogsRefreshBtn"], primary: false);
+        refreshBtn.Click += (_, _) => {
+            logTv.Text = OmniLogger.ReadRecentLines(350);
+            RefreshLogsSummary();
+        };
+        Button copyBtn = MakeActionPill(S["FilesPreviewCopyBtn"], primary: false);
+        copyBtn.Click += (_, _) => CopyToClipboard("OmniAgent Log", OmniLogger.ReadRecentLines(450));
+        Button shareBtn = MakeActionPill(S["SettingsLogsShareBtn"], primary: true);
+        shareBtn.Click += (_, _) => ShareDiagnosticLogSheet();
+
+        btnRow.AddView(refreshBtn, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WrapContent, 1f) { RightMargin = Dp(6) });
+        btnRow.AddView(copyBtn, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WrapContent, 1f) { RightMargin = Dp(6) });
+        btnRow.AddView(shareBtn, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WrapContent, 1f));
+        custom.AddView(btnRow, new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MatchParent, ViewGroup.LayoutParams.WrapContent) { BottomMargin = Dp(10) });
+
+        ScrollView scroll = new(this) { VerticalScrollBarEnabled = true };
+        scroll.Background = OneUiTheme.CreateRoundedDrawable(
+            this,
+            OneUiTheme.SurfaceModalRow,
+            16f,
+            OneUiTheme.WithAlpha(Color.White, 28),
+            1f);
+        scroll.SetPadding(Dp(12), Dp(10), Dp(12), Dp(10));
+        scroll.AddView(logTv);
+        scroll.Post(() => scroll.FullScroll(FocusSearchDirection.Down));
+        custom.AddView(scroll, new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MatchParent, Dp(320)));
+
+        OneUiModalDialog.Show(
+            this,
+            S["SettingsLogsTitle"],
+            customContent: custom,
+            icon: OneUiIconType.Logs,
+            iconBadgeColor: OneUiTheme.FunctionalCyan,
+            positiveText: S["CloseBtn"]);
+    }
+
+    async Task ExportAndShareDiagnosticLogAsync(Button btn) {
+        btn.Enabled = false;
+        try {
+            (bool ok, string location) = await OmniLogger.ExportLogToDownloadsAsync(this, store).ConfigureAwait(false);
+            RunOnUiThread(() => {
+                RefreshLogsSummary();
+                if (ok) {
+                    ShowToast(string.Format(S["SettingsLogsExportedFmt"], location));
+                } else {
+                    ShowToast(location);
+                }
+                ShareDiagnosticLogSheet();
+            });
+        } finally {
+            RunOnUiThread(() => {
+                if (!IsFinishing && !IsDestroyed) {
+                    btn.Enabled = true;
+                }
+            });
+        }
+    }
+
+    void ShareDiagnosticLogSheet() {
+        try {
+            Android.Net.Uri uri = OmniLogger.CreateShareableLogUri(this);
+            if (uri == null) {
+                ShowToast("Log file is empty.");
+                return;
+            }
+            Intent send = new(Intent.ActionSend);
+            send.SetType("text/plain");
+            send.PutExtra(Intent.ExtraStream, uri);
+            send.PutExtra(Intent.ExtraSubject, "OmniAgent Diagnostic Log");
+            send.AddFlags(ActivityFlags.GrantReadUriPermission);
+            StartActivity(Intent.CreateChooser(send, S["SettingsLogsShareBtn"]));
+        } catch (Exception ex) {
+            OmniLogger.Error("LOG", "ShareDiagnosticLogSheet", ex);
+            ShowToast(ex.Message);
+        }
+    }
 }

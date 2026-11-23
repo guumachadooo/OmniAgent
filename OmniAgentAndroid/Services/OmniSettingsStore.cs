@@ -99,6 +99,11 @@ public sealed class OmniSettingsStore {
         set => prefs.Edit().PutString("cavernize_design_tokens_json", value ?? "").Apply();
     }
 
+    public bool AutoCheckUpdates {
+        get => prefs.GetBoolean("auto_check_updates", true);
+        set => prefs.Edit().PutBoolean("auto_check_updates", value).Apply();
+    }
+
     public string LastDesignSyncUtc {
         get => prefs.GetString("last_design_sync_utc", "") ?? "";
         set => prefs.Edit().PutString("last_design_sync_utc", value ?? "").Apply();
@@ -181,7 +186,15 @@ public sealed class OmniSettingsStore {
     }
 
     public static void AppendActivity(string tag, string message) {
-        string line = $"[{DateTime.Now:HH:mm:ss}] [{tag}] {message}";
+        string safeTag = string.IsNullOrWhiteSpace(tag) ? "APP" : tag.Trim().ToUpperInvariant();
+        if (safeTag == "ERR" || safeTag == "ERROR" || safeTag == "CRASH") {
+            OmniLogger.Error(safeTag, message ?? "");
+        } else if (safeTag == "WARN") {
+            OmniLogger.Warn(safeTag, message ?? "");
+        } else {
+            OmniLogger.Info(safeTag, message ?? "");
+        }
+        string line = $"[{DateTime.Now:HH:mm:ss}] [{safeTag}] {OmniLogger.SanitizeSensitiveText(message ?? "")}";
         lock (logLock) {
             activityLog.Insert(0, line);
             if (activityLog.Count > 140) {

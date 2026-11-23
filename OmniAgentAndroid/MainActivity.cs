@@ -58,6 +58,8 @@ public sealed partial class MainActivity : Activity {
     Handler uiHandler;
     bool pendingUiRefresh;
     IOnBackInvokedCallback predictiveBackCallback;
+    string pendingInstallApkPath;
+    static int cavBootstrapAttemptedThisProcess;
 
     static OmniStrings S => OmniStrings.Active;
     Typeface FontBold => OneUiTheme.GetAppleFontBold(this);
@@ -67,8 +69,10 @@ public sealed partial class MainActivity : Activity {
     protected override void OnCreate(Bundle savedInstanceState) {
         base.OnCreate(savedInstanceState);
 
+        OmniLogger.Initialize(this);
         uiHandler = new Handler(Looper.MainLooper);
         store = new OmniSettingsStore(this);
+        OmniLogger.LogConfigSnapshot(this, store);
         OmniStrings.Refresh(store.UiLanguage);
 
         // Apply shared Cavernize One UI 9 theme + cached live Cavernize design tokens immediately.
@@ -90,10 +94,28 @@ public sealed partial class MainActivity : Activity {
         RefreshAllVisibleState(probeDebian: false);
         _ = LoadHubSnapshotAsync(silent: false);
         _ = SyncCavernizeDesignInBackgroundAsync();
+        if (!store.HasPairSecret) {
+            _ = TryAutoBootstrapFromCavernizeAsync(showToast: false);
+        }
+        if (store.AutoCheckUpdates) {
+            _ = CheckForOmniUpdateAsync(silent: true);
+        }
     }
 
     protected override void OnResume() {
         base.OnResume();
+        if (!string.IsNullOrEmpty(pendingInstallApkPath) && OmniUpdateService.CanInstallPackages(this)) {
+            string pathToInstall = pendingInstallApkPath;
+            pendingInstallApkPath = null;
+            if (File.Exists(pathToInstall)) {
+                try {
+                    OmniUpdateService.LaunchInstaller(this, pathToInstall);
+                } catch (Exception ex) {
+                    OmniLogger.Error("UPDATE", "OnResume LaunchInstaller", ex);
+                    ShowToast(ex.Message);
+                }
+            }
+        }
         Context appCtx = ApplicationContext ?? this;
         _ = Task.Run(() => OmniAgentForegroundService.EnsureAlwaysOn(appCtx));
         RefreshAllVisibleState(probeDebian: activeTabIndex == TabBridgeIndex);
@@ -105,6 +127,13 @@ public sealed partial class MainActivity : Activity {
     }
 
     protected override void OnDestroy() {
+        try {
+            filesLoadCts?.Cancel();
+            filesLoadCts?.Dispose();
+        } catch {
+            // Ignore
+        }
+        filesLoadCts = null;
         uiHandler?.RemoveCallbacksAndMessages(null);
         pendingUiRefresh = false;
         OmniAgentForegroundService.StateChanged -= OnServiceOrActivityChanged;
@@ -425,14 +454,53 @@ public sealed partial class MainActivity : Activity {
         });
     }
 
-    async Task DelayedRefreshAfterTermuxWakeAsync() {
-        await Task.Delay(2400).ConfigureAwait(false);
+    async Task TryAutoBootstrapFromCavernizeAsync(bool showToast) {
+        if (!showToast && System.Threading.Interlocked.Exchange(ref cavBootstrapAttemptedThisProcess, 1) != 0) {
+            return;
+        }
+        (bool imported, string detail) = await CavernizeIpcBridgeClient.TryBootstrapFromCavernizeAsync(
+            this, store).ConfigureAwait(false);
+        if (showToast && !string.IsNullOrWhiteSpace(detail)) {
+            ShowToast(detail);
+        }
+        if (!imported) {
+            return;
+        }
+        Context appCtx = ApplicationContext ?? this;
+        _ = Task.Run(() => OmniAgentForegroundService.EnsureAlwaysOn(appCtx));
+        RunOnUiThread(() => {
+            if (IsFinishing || IsDestroyed) {
+                return;
+            }
+            lastDebianProbeMs = 0;
+            RefreshAllVisibleState(probeDebian: true);
+            if (activeTabIndex == TabFilesIndex || filesInitialized) {
+                _ = LoadDirectoryAsync(currentExplorerPath, showSpinner: true);
+            }
+        });
         await LoadHubSnapshotAsync(silent: true).ConfigureAwait(false);
-        if (activeTabIndex == TabFilesIndex) {
+    }
+
+    async Task DelayedRefreshAfterTermuxWakeAsync() {
+        int[] delaysMs = [1500, 2000, 3000];
+        bool online = false;
+        foreach (int waitMs in delaysMs) {
+            await Task.Delay(waitMs).ConfigureAwait(false);
+            if (IsFinishing || IsDestroyed) {
+                return;
+            }
+            (online, _) = await TermuxLocalFsClient.CheckHealthAsync(store).ConfigureAwait(false);
+            if (online) {
+                break;
+            }
+        }
+        await LoadHubSnapshotAsync(silent: true).ConfigureAwait(false);
+        if (activeTabIndex == TabFilesIndex || online) {
             await LoadDirectoryAsync(currentExplorerPath, showSpinner: false).ConfigureAwait(false);
         }
         RunOnUiThread(() => {
             if (!IsFinishing && !IsDestroyed) {
+                lastDebianProbeMs = 0;
                 RefreshBridgeTabState(probeDebian: true);
             }
         });

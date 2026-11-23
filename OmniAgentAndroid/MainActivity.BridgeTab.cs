@@ -204,12 +204,16 @@ public sealed partial class MainActivity {
         debianHealthChecking = true;
         lastDebianProbeMs = nowMs;
         try {
-            (bool online, _) = await TermuxLocalFsClient.CheckHealthAsync(store).ConfigureAwait(false);
+            (bool online, string detail) = await TermuxLocalFsClient.CheckHealthAsync(store).ConfigureAwait(false);
             RunOnUiThread(() => {
                 if (bridgeDebianStatusTv == null || IsFinishing || IsDestroyed) {
                     return;
                 }
-                bridgeDebianStatusTv.Text = online ? S["BridgeDebianOnline"] : S["BridgeDebianOffline"];
+                bridgeDebianStatusTv.Text = online
+                    ? S["BridgeDebianOnline"]
+                    : (string.IsNullOrWhiteSpace(detail)
+                        ? S["BridgeDebianOffline"]
+                        : $"{S["BridgeDebianOffline"]} ({detail})");
                 bridgeDebianStatusTv.SetTextColor(online ? OneUiTheme.FunctionalGreen : OneUiTheme.FunctionalAmber);
             });
         } finally {

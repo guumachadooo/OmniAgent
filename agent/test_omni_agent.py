@@ -741,6 +741,46 @@ class OmniAgentProtocolTests(unittest.TestCase):
                 with self.assertRaises(urllib.error.HTTPError) as ctx3:
                     urllib.request.urlopen(req3, timeout=5)
                 self.assertEqual(ctx3.exception.code, 403)
+
+                # 5. /local/triad must return 200 JSON without timeout_sec TypeError even on real git repo
+                import subprocess
+
+                cav_repo = repo / "Cavern"
+                cav_repo.mkdir()
+                (cav_repo / "README.md").write_text("# test\n", encoding="utf-8")
+                subprocess.run(["git", "init"], cwd=str(cav_repo), check=True, capture_output=True)
+                subprocess.run(["git", "config", "user.email", "t@local"], cwd=str(cav_repo), check=True, capture_output=True)
+                subprocess.run(["git", "config", "user.name", "Test"], cwd=str(cav_repo), check=True, capture_output=True)
+                subprocess.run(["git", "add", "."], cwd=str(cav_repo), check=True, capture_output=True)
+                subprocess.run(["git", "commit", "-m", "init"], cwd=str(cav_repo), check=True, capture_output=True)
+
+                triad_res = daemon._inspect_local_triad(cav_repo)
+                self.assertTrue(triad_res["ok"])
+                cav_entry = next(r for r in triad_res["repos"] if r["alias"] == "cavern")
+                self.assertTrue(cav_entry["exists"])
+                self.assertTrue(len(cav_entry["head"]) >= 7)
+
+                req_triad = urllib.request.Request(f"{base}/local/triad", headers={"X-Omni-Local-Key": key})
+                with urllib.request.urlopen(req_triad, timeout=5) as resp_t:
+                    td_json = json.loads(resp_t.read().decode("utf-8"))
+                self.assertTrue(td_json["ok"])
+
+                # 6. /local/logs/save must accept authenticated log mirror
+                log_body = json.dumps({"fileName": "omniagent_test.log", "content": "[INFO] test log line\n"}).encode("utf-8")
+                req_log = urllib.request.Request(
+                    f"{base}/local/logs/save",
+                    data=log_body,
+                    headers={"X-Omni-Local-Key": key, "Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(req_log, timeout=5) as resp_l:
+                    ld_json = json.loads(resp_l.read().decode("utf-8"))
+                self.assertTrue(ld_json["ok"])
+                self.assertTrue(Path(ld_json["savedPath"]).is_file())
+
+                # 7. OmniAgentDaemon must expose self.device_hash matching X-Device-Hash
+                inst = daemon.OmniAgentDaemon("https://example.workers.dev", pair_hex, repo)
+                self.assertEqual(inst.device_hash, inst.headers["X-Device-Hash"])
             finally:
                 srv.shutdown()
                 srv.server_close()

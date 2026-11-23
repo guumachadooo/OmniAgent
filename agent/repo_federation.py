@@ -698,35 +698,40 @@ def push_federated_repo(
 
     tok = lcap.get_secret("GITHUB_TOKEN", aliases=("GH_TOKEN",))
     if tok:
-        res = ghdirect.push_workspace_direct(
-            repo_dir,
-            commit_message,
-            owner_repo=owner_repo,
-            branch=branch,
-            token=tok,
-            explicit_files=explicit_files or None,
-            explicit_deletes=explicit_deletes or None,
-            sync_deletes=sync_deletes,
-        )
-        # Update federation baseline for non-active hydrated repos so future warms see clean state
-        current = detect_current_repo(ws, manifest)
-        if res.get("ok") and alias != current:
-            state = _read_state(mroot)
-            st_repos = state.setdefault("repos", {})
-            st_repos[alias] = {
-                "ownerRepo": owner_repo,
-                "branch": branch,
-                "headSha": res.get("headFull") or "",
-                "hydratedUtc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                "baselineHashes": _compute_dir_hashes(repo_dir),
-            }
-            _write_state(mroot, state)
+        try:
+            res = ghdirect.push_workspace_direct(
+                repo_dir,
+                commit_message,
+                owner_repo=owner_repo,
+                branch=branch,
+                token=tok,
+                explicit_files=explicit_files or None,
+                explicit_deletes=explicit_deletes or None,
+                sync_deletes=sync_deletes,
+            )
+            # Update federation baseline for non-active hydrated repos so future warms see clean state
+            current = detect_current_repo(ws, manifest)
+            if res.get("ok") and alias != current:
+                state = _read_state(mroot)
+                st_repos = state.setdefault("repos", {})
+                st_repos[alias] = {
+                    "ownerRepo": owner_repo,
+                    "branch": branch,
+                    "headSha": res.get("headFull") or "",
+                    "hydratedUtc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "baselineHashes": _compute_dir_hashes(repo_dir),
+                }
+                _write_state(mroot, state)
 
-        if not no_sync_termux and spec.get("termuxPath"):
-            res["termuxSync"] = _try_sync_termux_repo(spec, branch)
-        return res
+            if not no_sync_termux and spec.get("termuxPath"):
+                res["termuxSync"] = _try_sync_termux_repo(spec, branch)
+            return res
+        except RuntimeError as exc:
+            if "HTTP 403" not in str(exc) and "Resource not accessible" not in str(exc):
+                raise
+            print(f"WARN: Local GITHUB_TOKEN lacks Contents:Write for {owner_repo} ({exc}). Falling back to OmniAgent phone git push...")
 
-    # Fallback: push via OmniAgent phone Termux (works even with ZERO GITHUB_TOKEN in new AI Studio app!)
+    # Fallback: push via OmniAgent phone Termux (works even when GITHUB_TOKEN is missing or read-only!)
     return _push_via_omniagent_phone(
         repo_dir,
         spec,
