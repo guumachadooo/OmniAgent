@@ -1,7 +1,17 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
-import worker, { HubCoordinator } from "../docs/cloudflare_live_relay_worker.js";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const workerPath = fs.existsSync(path.resolve(__dirname, "../worker/cloudflare_live_relay_worker.js"))
+  ? path.resolve(__dirname, "../worker/cloudflare_live_relay_worker.js")
+  : path.resolve(__dirname, "../docs/cloudflare_live_relay_worker.js");
+const workerMod = await import(pathToFileURL(workerPath).href);
+const worker = workerMod.default;
+const { HubCoordinator } = workerMod;
 
 function makeMockKv() {
   const store = new Map();

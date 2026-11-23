@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Any
 
 AGENT_DIR = Path(__file__).resolve().parent
-REPO_ROOT = AGENT_DIR.parents[1]
+REPO_ROOT = AGENT_DIR.parents[1] if AGENT_DIR.parent.name == ".agents" else AGENT_DIR.parent
 ENV_MANIFEST_PATH = REPO_ROOT / ".agents" / "env_manifest.json"
 RUNTIME_ENV_FILE = Path("/tmp/.cavern_runtime_env.json")
 LEGACY_WORKSPACE_VAULT_PATH = REPO_ROOT / ".agents" / ".bridge_vault.json"
@@ -241,6 +241,19 @@ def inspect_capabilities(
         ],
     }
 
+    fed_mount = Path(os.environ.get("CAVERN_FEDERATION_ROOT", "/tmp/cavern-federation"))
+    fed_manifest = _read_json_safe(REPO_ROOT / ".agents" / "federation.json")
+    fed_repos: dict[str, Any] = {}
+    for alias, spec in (fed_manifest.get("repos") or {}).items():
+        if isinstance(spec, dict):
+            mp = fed_mount / alias
+            fed_repos[alias] = {
+                "ownerRepo": spec.get("ownerRepo", ""),
+                "branch": spec.get("branch", "main"),
+                "path": str(mp),
+                "ready": mp.exists(),
+            }
+
     return {
         "ok": True,
         "ownerRepo": manifest.get("ownerRepo", "guumachadooo/Cavern"),
@@ -257,6 +270,11 @@ def inspect_capabilities(
             else ""
         ),
         "routing": routing,
+        "federation": {
+            "mountRoot": str(fed_mount),
+            "allReady": bool(fed_repos) and all(v["ready"] for v in fed_repos.values()),
+            "repos": fed_repos,
+        },
     }
 
 

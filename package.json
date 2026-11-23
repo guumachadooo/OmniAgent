@@ -1,0 +1,16 @@
+{
+  "name": "omniagent-workspace-preview",
+  "version": "2.0.0",
+  "private": true,
+  "description": "Zero-dependency AI Studio preview shim & 3-repo federation warmer for OmniAgent (real stack: C#/.NET Android + Cloudflare Worker + Python 3).",
+  "type": "module",
+  "scripts": {
+    "dev": "node .agents/preview/server.mjs",
+    "start": "node .agents/preview/server.mjs",
+    "build": "node --check .agents/preview/server.mjs",
+    "lint": "node --check .agents/preview/server.mjs && python3 -B agent/test_omni_agent.py",
+    "test": "python3 -B agent/test_omni_agent.py"
+  },
+  "dependencies": {},
+  "devDependencies": {}
+}

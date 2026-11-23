@@ -445,6 +445,8 @@ def should_include_workspace_path(rel_posix: str) -> bool:
     name = parts[-1]
     if name in SKIP_SYNC_FILES:
         return False
+    if rel.startswith("archive/") and name.endswith(".tar.gz"):
+        return True
     ext = Path(name).suffix.lower()
     if ext in SKIP_SYNC_EXTS:
         return False

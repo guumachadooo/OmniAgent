@@ -23,14 +23,20 @@ import time
 from pathlib import Path
 from typing import Any
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+_AGENT_DIR = Path(__file__).resolve().parent
+_CANDIDATE_ROOT = _AGENT_DIR.parents[1] if _AGENT_DIR.parent.name == ".agents" else _AGENT_DIR.parent
+_FED_CAVERN = Path(os.environ.get("CAVERN_FEDERATION_ROOT", "/tmp/cavern-federation")) / "cavern"
+REPO_ROOT = _CANDIDATE_ROOT if (_CANDIDATE_ROOT / ".agents" / "scripts" / "check_android_cs.py").is_file() else _FED_CAVERN
 SCRIPTS_DIR = REPO_ROOT / ".agents" / "scripts"
-if str(SCRIPTS_DIR) not in sys.path:
+if SCRIPTS_DIR.is_dir() and str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
-if str(Path(__file__).resolve().parent) not in sys.path:
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
+if str(_AGENT_DIR) not in sys.path:
+    sys.path.insert(0, str(_AGENT_DIR))
 
-import check_android_cs as ci_checker
+try:
+    import check_android_cs as ci_checker
+except ImportError:
+    ci_checker = None  # type: ignore[assignment]
 import omni_protocol as proto
 
 

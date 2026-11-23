@@ -27,15 +27,16 @@ from pathlib import Path
 from typing import Any
 
 AGENT_DIR = Path(__file__).resolve().parent
-REPO_ROOT = AGENT_DIR.parents[1]
-PLUGIN_SCRIPTS = REPO_ROOT / ".agents" / "plugins" / "dynamic-fractal-planner" / "scripts"
+REPO_ROOT = AGENT_DIR.parents[1] if AGENT_DIR.parent.name == ".agents" else AGENT_DIR.parent
+_EMBEDDED_PLUGIN_SCRIPTS = REPO_ROOT / ".agents" / "plugins" / "dynamic-fractal-planner" / "scripts"
+_FED_PLUGIN_SCRIPTS = Path(os.environ.get("CAVERN_FEDERATION_ROOT", "/tmp/cavern-federation")) / "fractal" / "scripts"
+PLUGIN_SCRIPTS = _EMBEDDED_PLUGIN_SCRIPTS if _EMBEDDED_PLUGIN_SCRIPTS.is_dir() else _FED_PLUGIN_SCRIPTS
 for p in (str(AGENT_DIR), str(PLUGIN_SCRIPTS)):
     if p not in sys.path:
         sys.path.insert(0, p)
 
 import bridge_auth as bauth
 import github_direct as ghdirect
-import hot_probe_compiler as hpc
 import local_capabilities as lcap
 import omni_protocol as proto
 
@@ -560,6 +561,8 @@ def _is_channel_online(relay: str, secret: str, channel: str, admin: str = "") -
 
 
 def cmd_hot_exec(args: argparse.Namespace) -> int:
+    import hot_probe_compiler as hpc
+
     relay, secret, admin = _resolve_auth(args, allow_knock=True)
     if args.file:
         src = Path(args.file).read_text(encoding="utf-8")
@@ -894,7 +897,14 @@ def main() -> int:
     p_ship.add_argument("--no-sync-termux", action="store_true")
     p_ship.add_argument("--no-close-fr", action="store_true")
 
+    p_rep = sub.add_parser("repos", help="3-Repo Federation manager (status|hydrate|diff|push|sync-mirrors across Cavern, OmniAgent & Fractal)")
+    p_rep.add_argument("fed_args", nargs=argparse.REMAINDER, help="Arguments passed to repo_federation.py")
+
     args = parser.parse_args()
+
+    if args.action == "repos":
+        import repo_federation as rfed
+        return rfed.main(list(args.fed_args or []))
 
     if args.action == "checkpoint":
         import flight_recorder as fr

@@ -240,7 +240,15 @@ class OmniAgentProtocolTests(unittest.TestCase):
         )
 
     def test_live_bridge_session_expired_constant_and_vault_callback(self) -> None:
-        plugin_scripts = AGENT_DIR.parent / "plugins" / "dynamic-fractal-planner" / "scripts"
+        import os
+
+        candidates = [
+            AGENT_DIR.parent / "plugins" / "dynamic-fractal-planner" / "scripts",
+            Path(os.environ.get("CAVERN_FEDERATION_ROOT", "/tmp/cavern-federation")) / "fractal" / "scripts",
+        ]
+        plugin_scripts = next((p for p in candidates if (p / "live_bridge_client.py").is_file()), None)
+        if plugin_scripts is None:
+            self.skipTest("live_bridge_client.py not mounted locally")
         if str(plugin_scripts) not in sys.path:
             sys.path.insert(0, str(plugin_scripts))
         import live_bridge_client as lbc
@@ -569,8 +577,112 @@ class OmniAgentProtocolTests(unittest.TestCase):
             self.assertFalse(r3["synced"])
             self.assertEqual(r3["reason"], "clean")
 
+    def test_file_budget_guard_roundtrip_and_ship_skip_ci_detector(self) -> None:
+        scripts_dir = Path(__file__).resolve().parents[1] / "scripts"
+        if (scripts_dir / "file_budget_guard.py").is_file():
+            if str(scripts_dir) not in sys.path:
+                sys.path.insert(0, str(scripts_dir))
+            import file_budget_guard as fbg
+
+            with tempfile.TemporaryDirectory() as td:
+                repo = Path(td)
+                (repo / "Legacy" / "Sub").mkdir(parents=True)
+                (repo / "Legacy" / "a.txt").write_text("alpha\n", encoding="utf-8")
+                (repo / "Legacy" / "Sub" / "b.bin").write_bytes(b"\x00\x01\x02\xff")
+                (repo / "Keep.cs").write_text("// keep\n", encoding="utf-8")
+
+                out_arch = repo / "archive" / "legacy.tar.gz"
+                packed = fbg.pack_paths(repo, ["Legacy"], out_arch, remove_sources=True)
+                self.assertTrue(packed["ok"])
+                self.assertEqual(packed["packedFiles"], 2)
+                self.assertEqual(packed["removedSources"], 2)
+                self.assertFalse((repo / "Legacy" / "a.txt").exists())
+
+                verified = fbg.verify_archive(out_arch)
+                self.assertTrue(verified["ok"])
+                self.assertEqual(verified["fileCount"], 2)
+
+                restored = fbg.unpack_archive(out_arch, repo)
+                self.assertTrue(restored["ok"])
+                self.assertEqual((repo / "Legacy" / "a.txt").read_text(encoding="utf-8"), "alpha\n")
+                self.assertEqual((repo / "Legacy" / "Sub" / "b.bin").read_bytes(), b"\x00\x01\x02\xff")
+
+        # Smart [skip ci] detector
+        self.assertFalse(oac._needs_apk_ci(["README.md", ".agents/docs/HANDOFF.md", ".github/workflows/FastQualityGuard.yml"]))
+        self.assertTrue(oac._needs_apk_ci(["Cavern/Spatial/Foo.cs"]))
+        self.assertTrue(oac._needs_apk_ci([".github/workflows/BuildAndroid.yml"]))
+
+    def test_repo_federation_detection_extract_and_mirrors(self) -> None:
+        import io
+        import tarfile
+        import repo_federation as rfed
+
+        manifest = rfed.load_manifest()
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ws_cav = root / "ws_cavern"
+            (ws_cav / "Cavern").mkdir(parents=True)
+            (ws_cav / "Cavern" / "Cavern.csproj").write_text("<Project/>", encoding="utf-8")
+            (ws_cav / "CavernSamples" / "CavernizeAndroid").mkdir(parents=True)
+            (ws_cav / "CavernSamples" / "CavernizeAndroid" / "CavernizeAndroid.csproj").write_text("<Project/>", encoding="utf-8")
+            self.assertEqual(rfed.detect_current_repo(ws_cav, manifest), "cavern")
+
+            ws_omni = root / "ws_omni"
+            (ws_omni / "OmniAgentAndroid").mkdir(parents=True)
+            (ws_omni / "OmniAgentAndroid" / "OmniAgentAndroid.csproj").write_text("<Project/>", encoding="utf-8")
+            (ws_omni / "worker").mkdir(parents=True)
+            (ws_omni / "worker" / "cloudflare_live_relay_worker.js").write_text("// worker", encoding="utf-8")
+            self.assertEqual(rfed.detect_current_repo(ws_omni, manifest), "omniagent")
+
+            ws_frac = root / "ws_fractal"
+            (ws_frac / "scripts").mkdir(parents=True)
+            (ws_frac / "plugin.json").write_text("{}", encoding="utf-8")
+            (ws_frac / "scripts" / "verify_universal.py").write_text("# ok", encoding="utf-8")
+            self.assertEqual(rfed.detect_current_repo(ws_frac, manifest), "fractal")
+
+            # Safe tarball extraction (strips GitHub root folder & blocks path traversal)
+            buf = io.BytesIO()
+            with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+                info = tarfile.TarInfo("repo-main/agent/hello.py")
+                payload = b"print('ok')\n"
+                info.size = len(payload)
+                tf.addfile(info, io.BytesIO(payload))
+            ext_dir = root / "extracted"
+            cnt = rfed._safe_extract_github_tarball(buf.getvalue(), ext_dir)
+            self.assertEqual(cnt, 1)
+            self.assertEqual((ext_dir / "agent" / "hello.py").read_text(encoding="utf-8"), "print('ok')\n")
+
+            bad_buf = io.BytesIO()
+            with tarfile.open(fileobj=bad_buf, mode="w:gz") as tf:
+                info = tarfile.TarInfo("repo-main/../../escape.txt")
+                info.size = 3
+                tf.addfile(info, io.BytesIO(b"bad"))
+            with self.assertRaises(ValueError):
+                rfed._safe_extract_github_tarball(bad_buf.getvalue(), root / "bad_out")
+
+            # Mirror sync with exclusions (fractal -> cavern)
+            mount = root / "mount"
+            (mount / "fractal" / "scripts").mkdir(parents=True)
+            (mount / "fractal" / "plugin.json").write_text('{"version":"2.10.0"}', encoding="utf-8")
+            (mount / "fractal" / "scripts" / "verify_universal.py").write_text("# v2", encoding="utf-8")
+            (mount / "fractal" / "package.json").write_text('{"name":"shim"}', encoding="utf-8")
+            (mount / "fractal" / "AGENTS.md").write_text("# root only", encoding="utf-8")
+            (mount / "omniagent" / "agent").mkdir(parents=True)
+            (mount / "omniagent" / "agent" / "x.py").write_text("# x", encoding="utf-8")
+            (mount / "omniagent" / "worker").mkdir(parents=True)
+            (mount / "omniagent" / "worker" / "cloudflare_live_relay_worker.js").write_text("// w6", encoding="utf-8")
+
+            res = rfed.sync_mirrors(ws_cav, mirror_name="all", apply=True, mount_root=mount)
+            self.assertTrue(res["ok"])
+            self.assertTrue((ws_cav / ".agents" / "plugins" / "dynamic-fractal-planner" / "plugin.json").is_file())
+            self.assertFalse((ws_cav / ".agents" / "plugins" / "dynamic-fractal-planner" / "package.json").exists())
+            self.assertFalse((ws_cav / ".agents" / "plugins" / "dynamic-fractal-planner" / "AGENTS.md").exists())
+            self.assertEqual((ws_cav / ".agents" / "agent" / "x.py").read_text(encoding="utf-8"), "# x")
+            self.assertEqual((ws_cav / ".agents" / "docs" / "cloudflare_live_relay_worker.js").read_text(encoding="utf-8"), "// w6")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
 
 
