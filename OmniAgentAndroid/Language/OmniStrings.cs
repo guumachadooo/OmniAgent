@@ -186,7 +186,11 @@ public sealed class OmniStrings {
         ["TermuxCopyCmdBtn"] = "Copy 1-Line Debian Install",
         ["TermuxOpenPermsBtn"] = "App Permissions",
         ["OpenCloudflareTokenBtn"] = "Create CF Token",
-        ["OpenGithubTokenBtn"] = "Create GitHub Token"\n    };\n\n    static Dictionary<string, string> CreatePortuguese() => new(StringComparer.Ordinal) {\n        ["AppTitle"] = "OmniAgent",
+        ["OpenGithubTokenBtn"] = "Create GitHub Token",
+    };
+
+    static Dictionary<string, string> CreatePortuguese() => new(StringComparer.Ordinal) {
+        ["AppTitle"] = "OmniAgent",
         ["AppSubtitle"] = "Hub da Tríade · E2E Zero-Trust · Ponte Cavernize",
         ["TabHub"] = "Hub",
         ["TabFiles"] = "Arquivos",
@@ -337,4 +341,6 @@ public sealed class OmniStrings {
         ["TermuxCopyCmdBtn"] = "Copiar Instalação 1-Linha Debian",
         ["TermuxOpenPermsBtn"] = "Permissões do App",
         ["OpenCloudflareTokenBtn"] = "Criar Token CF",
-        ["OpenGithubTokenBtn"] = "Criar Token GitHub"\n    };\n}
+        ["OpenGithubTokenBtn"] = "Criar Token GitHub",
+    };
+}
