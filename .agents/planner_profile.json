@@ -1,6 +1,6 @@
 {
   "schema_version": 5,
-  "plugin_version": "2.16.0",
+  "plugin_version": "2.17.0",
   "docs_format_version": 1,
   "project_name": "OmniAgent",
   "planner_mode": "auto",
