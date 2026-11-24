@@ -873,6 +873,159 @@ class OmniAgentProtocolTests(unittest.TestCase):
                 if prev_fed is not None:
                     os.environ["CAVERN_FEDERATION_ROOT"] = prev_fed
 
+    def test_daemon_safe_ff_only_pull_quarantine_and_never_rebase(self) -> None:
+        import socket
+        import subprocess
+        import urllib.request
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            remote_cav = root / "remote_cavern.git"
+            remote_omni = root / "remote_omni.git"
+            subprocess.run(["git", "init", "--bare", str(remote_cav)], check=True, capture_output=True)
+            subprocess.run(["git", "init", "--bare", str(remote_omni)], check=True, capture_output=True)
+
+            def _seed_and_clone(remote: Path, local: Path) -> Path:
+                seed = root / f"seed_{local.name}"
+                subprocess.run(["git", "clone", str(remote), str(seed)], check=True, capture_output=True)
+                subprocess.run(["git", "config", "user.email", "t@local"], cwd=str(seed), check=True, capture_output=True)
+                subprocess.run(["git", "config", "user.name", "Test"], cwd=str(seed), check=True, capture_output=True)
+                (seed / "README.md").write_text("v1\n", encoding="utf-8")
+                subprocess.run(["git", "add", "."], cwd=str(seed), check=True, capture_output=True)
+                subprocess.run(["git", "commit", "-m", "c1"], cwd=str(seed), check=True, capture_output=True)
+                subprocess.run(["git", "push", "origin", "HEAD:master"], cwd=str(seed), check=True, capture_output=True)
+                subprocess.run(["git", "clone", "-b", "master", str(remote), str(local)], check=True, capture_output=True)
+                (seed / "README.md").write_text("v2\n", encoding="utf-8")
+                subprocess.run(["git", "add", "."], cwd=str(seed), check=True, capture_output=True)
+                subprocess.run(["git", "commit", "-m", "c2"], cwd=str(seed), check=True, capture_output=True)
+                subprocess.run(["git", "push", "origin", "HEAD:master"], cwd=str(seed), check=True, capture_output=True)
+                return seed
+
+            cav_local = root / "Cavern"
+            omni_local = root / "OmniAgent"
+            _seed_and_clone(remote_cav, cav_local)
+            _seed_and_clone(remote_omni, omni_local)
+
+            # Dirty Cavern repo must be quarantined and NEVER call `git pull --rebase`
+            (cav_local / "dirty.tmp").write_text("unsaved", encoding="utf-8")
+            head_before = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=str(cav_local), text=True).strip()
+            recorded_cmds: list[list[str]] = []
+            orig_run = daemon.run_subprocess
+
+            def _spy_run(cmd, cwd=None, timeout=30):
+                recorded_cmds.append(list(cmd))
+                return orig_run(cmd, cwd=cwd, timeout=timeout)
+
+            with mock.patch.object(daemon, "run_subprocess", side_effect=_spy_run):
+                q_res = daemon._safe_ff_only_pull(cav_local)
+            self.assertFalse(q_res["ok"])
+            self.assertEqual(q_res["status"], "quarantined_dirty")
+            self.assertGreaterEqual(q_res["dirtyCount"], 1)
+            head_after = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=str(cav_local), text=True).strip()
+            self.assertEqual(head_before, head_after)
+            self.assertFalse(any("--rebase" in c for c in recorded_cmds), f"Unexpected rebase call: {recorded_cmds}")
+
+            # Clean OmniAgent repo must fast-forward via `--ff-only`
+            recorded_cmds.clear()
+            with mock.patch.object(daemon, "run_subprocess", side_effect=_spy_run):
+                p_res = daemon._safe_ff_only_pull(omni_local, remote="origin", branch="master")
+            self.assertTrue(p_res["ok"])
+            self.assertEqual(p_res["status"], "pulled")
+            self.assertEqual(p_res["dirtyCount"], 0)
+            self.assertTrue(any(c[:3] == ["git", "pull", "--ff-only"] for c in recorded_cmds))
+            self.assertFalse(any("--rebase" in c for c in recorded_cmds))
+            self.assertEqual((omni_local / "README.md").read_text(encoding="utf-8"), "v2\n")
+
+            # /local/git/pull_all HTTP endpoint reports mixed triad quarantine + SO_KEEPALIVE enabled
+            srv = daemon.start_local_fs_server(self.KEY, cav_local, host="127.0.0.1", port=0)
+            self.assertIsNotNone(srv)
+            assert srv is not None
+            try:
+                keepalive = srv.socket.getsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE)
+                self.assertNotEqual(keepalive, 0)
+                key = daemon.derive_local_fs_key(self.KEY)
+                base = f"http://127.0.0.1:{srv.server_address[1]}"
+                req = urllib.request.Request(
+                    f"{base}/local/git/pull_all",
+                    data=b"{}",
+                    headers={"X-Omni-Local-Key": key, "Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    body = json.loads(resp.read().decode("utf-8"))
+                by_alias = {r["alias"]: r for r in body["results"]}
+                self.assertEqual(by_alias["cavern"]["status"], "quarantined_dirty")
+                self.assertFalse(by_alias["cavern"]["ok"])
+                self.assertEqual(by_alias["omniagent"]["status"], "pulled")
+                self.assertTrue(by_alias["omniagent"]["ok"])
+            finally:
+                srv.shutdown()
+                srv.server_close()
+
+    def test_daemon_errno_104_connection_reset_detection_and_exponential_backoff(self) -> None:
+        import errno
+        import urllib.error
+        from unittest import mock
+
+        self.assertTrue(daemon._is_connection_reset_error(ConnectionResetError(errno.ECONNRESET, "Connection reset by peer")))
+        self.assertTrue(daemon._is_connection_reset_error(OSError(errno.ECONNRESET, "reset")))
+        self.assertTrue(daemon._is_connection_reset_error(urllib.error.URLError(ConnectionResetError(104, "Connection reset by peer"))))
+        self.assertTrue(daemon._is_connection_reset_error(RuntimeError("Errno 104 connection reset")))
+        self.assertFalse(daemon._is_connection_reset_error(ValueError("unrelated error")))
+
+        with tempfile.TemporaryDirectory() as td:
+            d = daemon.OmniAgentDaemon("https://example.workers.dev", self.KEY, Path(td))
+            sleeps: list[float] = []
+            call_count = 0
+
+            def _fake_http_json(method, url, headers=None, payload=None, timeout=20):
+                nonlocal call_count
+                call_count += 1
+                raise ConnectionResetError(errno.ECONNRESET, "Connection reset by peer")
+
+            def _fake_sleep(sec: float) -> None:
+                sleeps.append(sec)
+                if len(sleeps) >= 3:
+                    d.running = False
+
+            with mock.patch.object(daemon.proto, "http_json", side_effect=_fake_http_json), \
+                 mock.patch.object(d, "probe_heartbeat_interval", return_value=9999.0), \
+                 mock.patch.object(d, "send_heartbeat", return_value=None), \
+                 mock.patch.object(daemon, "start_local_fs_server", return_value=None), \
+                 mock.patch.object(daemon.time, "sleep", side_effect=_fake_sleep):
+                d.run_forever()
+
+            self.assertEqual(sleeps, [2.0, 4.0, 8.0])
+            self.assertGreaterEqual(call_count, 3)
+
+    def test_android_etag_and_user_initiated_job_invariants(self) -> None:
+        root_hint = AGENT_DIR.parent.parent if AGENT_DIR.parent.name == ".agents" else AGENT_DIR.parent.parent / "Cavern"
+        omni_hint = (AGENT_DIR.parent if AGENT_DIR.parent.name == "OmniAgent" else root_hint.parent / "OmniAgent")
+
+        app_update = root_hint / "CavernSamples" / "CavernizeAndroid" / "Services" / "AppUpdateService.cs"
+        if app_update.is_file():
+            src = app_update.read_text(encoding="utf-8")
+            self.assertIn("IfNoneMatch", src)
+            self.assertIn("HttpStatusCode.NotModified", src)
+            self.assertIn("CachedApiEntry", src)
+
+        omni_update = omni_hint / "OmniAgentAndroid" / "Services" / "OmniUpdateService.cs"
+        if omni_update.is_file():
+            src_u = omni_update.read_text(encoding="utf-8")
+            self.assertIn("IfNoneMatch", src_u)
+            self.assertIn("HttpStatusCode.NotModified", src_u)
+            self.assertIn("ETag", src_u)
+
+        watchdog = omni_hint / "OmniAgentAndroid" / "Services" / "OmniWatchdogJobService.cs"
+        fgs = omni_hint / "OmniAgentAndroid" / "Services" / "OmniAgentForegroundService.cs"
+        if watchdog.is_file() and fgs.is_file():
+            src_w = watchdog.read_text(encoding="utf-8")
+            src_f = fgs.read_text(encoding="utf-8")
+            self.assertIn("SetUserInitiated(true)", src_w)
+            self.assertIn("ScheduleUserInitiated", src_w)
+            self.assertIn("OmniAgentBinder", src_f)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -1,3 +1,5 @@
+using System.Collections.Concurrent;
+using System.Net;
 using System.Net.Http.Headers;
 using System.Text.Json;
 using System.Text.RegularExpressions;
@@ -21,27 +23,159 @@ public sealed class OmniUpdateCheckResult {
     public bool ResolvedViaWebFallback { get; init; }
 }
 
+public readonly record struct GitHubCachedResponse(bool Ok, int StatusCode, string Body, bool FromCache, bool RateLimited);
+
 /// <summary>
-/// Self-update manager for OmniAgent Companion matching CavernizeAndroid's <c>AppUpdateService</c>.
-/// Checks GitHub Releases (<c>guumachadooo/OmniAgent</c> tags <c>omniagent-latest</c> / <c>latest</c>)
-/// with automatic zero-rate-limit GitHub Web redirect fallback when unauthenticated API hits 403/429,
-/// streams APK downloads in 64 KB chunks with live progress, verifies Unknown Sources install permission,
-/// and invokes the Android package installer via <see cref="OmniApkFileProvider"/>.
+/// Self-update manager &amp; centralized GitHub API cache for OmniAgent Companion matching CavernizeAndroid's
+/// <c>AppUpdateService</c>. Persists <c>ETag</c> (<c>If-None-Match</c> / <c>304 Not Modified</c>) and
+/// <c>/releases/latest</c> HTML redirect resolutions across <see cref="OmniUpdateService"/> and
+/// <see cref="TriadHubService"/> to keep GitHub 403/429 rates &lt;= 1%.
 /// </summary>
 public static class OmniUpdateService {
     const string RepoSlug = "guumachadooo/OmniAgent";
     const string OtaTagApiUrl = "https://api.github.com/repos/guumachadooo/OmniAgent/releases/tags/omniagent-latest";
     const string LatestApiUrl = "https://api.github.com/repos/guumachadooo/OmniAgent/releases/latest";
     const string LatestWebReleaseUrl = "https://github.com/guumachadooo/OmniAgent/releases/latest";
+    const string CachePrefsName = "omni_github_http_cache_v1";
+    const long RedirectCacheTtlSeconds = 600;
+    const long RateLimitCooldownSeconds = 300;
     public const string TargetAssetName = "OmniAgent-Android.apk";
 
+    sealed record CachedApiEntry(string ETag, string Body, long SavedAtUnixSec);
+    sealed record CachedRedirectEntry(string Tag, long SavedAtUnixSec);
+
     static readonly HttpClient http = BuildGitHubHttpClient();
+    static readonly ConcurrentDictionary<string, CachedApiEntry> apiCache = new(StringComparer.Ordinal);
+    static readonly ConcurrentDictionary<string, CachedRedirectEntry> redirectCache = new(StringComparer.OrdinalIgnoreCase);
+    static readonly object cacheLock = new();
+    static Context cachedAppContext;
+    static bool cacheLoaded;
+    static long apiCooldownUntilUnixSec;
 
     static HttpClient BuildGitHubHttpClient() {
         HttpClient client = new() { Timeout = TimeSpan.FromSeconds(30) };
         client.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue("OmniAgentAndroid", "2.1"));
         client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/vnd.github+json"));
         return client;
+    }
+
+    public static void InitializeCacheContext(Context context) => EnsureCacheLoaded(context);
+
+    static Context ResolveAppContext(Context context) {
+        if (context != null) {
+            cachedAppContext = context.ApplicationContext ?? context;
+        }
+        return cachedAppContext ?? Application.Context;
+    }
+
+    static void EnsureCacheLoaded(Context context) {
+        Context appCtx = ResolveAppContext(context);
+        if (appCtx == null) {
+            return;
+        }
+        lock (cacheLock) {
+            if (cacheLoaded) {
+                return;
+            }
+            cacheLoaded = true;
+            try {
+                ISharedPreferences prefs = appCtx.GetSharedPreferences(CachePrefsName, FileCreationMode.Private);
+                if (prefs == null) {
+                    return;
+                }
+                apiCooldownUntilUnixSec = prefs.GetLong("api_cooldown_until", 0L);
+                string apiJson = prefs.GetString("api_entries", "") ?? "";
+                if (!string.IsNullOrWhiteSpace(apiJson)) {
+                    Dictionary<string, CachedApiEntry> loaded = JsonSerializer.Deserialize<Dictionary<string, CachedApiEntry>>(apiJson);
+                    if (loaded != null) {
+                        foreach (KeyValuePair<string, CachedApiEntry> kv in loaded) {
+                            apiCache[kv.Key] = kv.Value;
+                        }
+                    }
+                }
+                string redirJson = prefs.GetString("redirect_entries", "") ?? "";
+                if (!string.IsNullOrWhiteSpace(redirJson)) {
+                    Dictionary<string, CachedRedirectEntry> loaded = JsonSerializer.Deserialize<Dictionary<string, CachedRedirectEntry>>(redirJson);
+                    if (loaded != null) {
+                        foreach (KeyValuePair<string, CachedRedirectEntry> kv in loaded) {
+                            redirectCache[kv.Key] = kv.Value;
+                        }
+                    }
+                }
+            } catch {
+                // Best effort cache load
+            }
+        }
+    }
+
+    static void PersistCache(Context context) {
+        Context appCtx = ResolveAppContext(context);
+        if (appCtx == null) {
+            return;
+        }
+        lock (cacheLock) {
+            try {
+                ISharedPreferences prefs = appCtx.GetSharedPreferences(CachePrefsName, FileCreationMode.Private);
+                prefs?.Edit()
+                    ?.PutLong("api_cooldown_until", Interlocked.Read(ref apiCooldownUntilUnixSec))
+                    ?.PutString("api_entries", JsonSerializer.Serialize(new Dictionary<string, CachedApiEntry>(apiCache)))
+                    ?.PutString("redirect_entries", JsonSerializer.Serialize(new Dictionary<string, CachedRedirectEntry>(redirectCache)))
+                    ?.Apply();
+            } catch {
+                // Best effort cache save
+            }
+        }
+    }
+
+    /// <summary>
+    /// Centralized GitHub REST GET with persisted <c>ETag</c>/<c>If-None-Match</c>, <c>304 Not Modified</c>
+    /// cache hits, and 403/429 rate-limit cooldown protection.
+    /// </summary>
+    public static async Task<GitHubCachedResponse> SendCachedGitHubGetAsync(
+        string url,
+        string pat = "",
+        Context context = null,
+        CancellationToken token = default) {
+        EnsureCacheLoaded(context);
+        long nowUnix = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        apiCache.TryGetValue(url, out CachedApiEntry cached);
+
+        if (string.IsNullOrWhiteSpace(pat) && nowUnix < Interlocked.Read(ref apiCooldownUntilUnixSec)) {
+            return new GitHubCachedResponse(
+                Ok: cached != null && !string.IsNullOrEmpty(cached.Body),
+                StatusCode: 429,
+                Body: cached?.Body ?? "",
+                FromCache: cached != null && !string.IsNullOrEmpty(cached.Body),
+                RateLimited: true);
+        }
+
+        using HttpRequestMessage req = new(HttpMethod.Get, url);
+        if (!string.IsNullOrWhiteSpace(pat)) {
+            req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", pat);
+        }
+        if (cached != null && !string.IsNullOrWhiteSpace(cached.ETag)) {
+            req.Headers.IfNoneMatch.TryParseAdd(cached.ETag);
+        }
+
+        using HttpResponseMessage resp = await http.SendAsync(req, token).ConfigureAwait(false);
+        int code = (int)resp.StatusCode;
+        if (resp.StatusCode == HttpStatusCode.NotModified && cached != null && !string.IsNullOrEmpty(cached.Body)) {
+            return new GitHubCachedResponse(Ok: true, StatusCode: 304, Body: cached.Body, FromCache: true, RateLimited: false);
+        }
+        if (code == 403 || code == 429) {
+            Interlocked.Exchange(ref apiCooldownUntilUnixSec, nowUnix + RateLimitCooldownSeconds);
+            PersistCache(context);
+            return new GitHubCachedResponse(Ok: false, StatusCode: code, Body: cached?.Body ?? "", FromCache: false, RateLimited: true);
+        }
+        if (!resp.IsSuccessStatusCode) {
+            return new GitHubCachedResponse(Ok: false, StatusCode: code, Body: "", FromCache: false, RateLimited: false);
+        }
+
+        string body = await resp.Content.ReadAsStringAsync(token).ConfigureAwait(false);
+        string etag = resp.Headers.ETag?.ToString() ?? "";
+        apiCache[url] = new CachedApiEntry(etag, body, nowUnix);
+        PersistCache(context);
+        return new GitHubCachedResponse(Ok: true, StatusCode: code, Body: body, FromCache: false, RateLimited: false);
     }
 
     public static (string versionName, long versionCode) GetInstalledVersion(Context context) {
@@ -63,30 +197,30 @@ public static class OmniUpdateService {
         Context context,
         OmniSettingsStore store = null,
         CancellationToken token = default) {
+        EnsureCacheLoaded(context);
         (string currentVer, _) = GetInstalledVersion(context);
         string pat = store?.LoadGitHubPat() ?? "";
 
         Exception lastApiError = null;
+        string staleCachedJson = "";
         foreach (string apiUrl in new[] { LatestApiUrl, OtaTagApiUrl }) {
             try {
-                using HttpRequestMessage req = new(HttpMethod.Get, apiUrl);
-                if (!string.IsNullOrWhiteSpace(pat)) {
-                    req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", pat);
-                }
-                using HttpResponseMessage resp = await http.SendAsync(req, token).ConfigureAwait(false);
-                if ((int)resp.StatusCode == 403 || (int)resp.StatusCode == 429) {
-                    OmniLogger.Warn("UPDATE", $"GitHub API rate-limited ({(int)resp.StatusCode}) on {apiUrl}; switching to web redirect fallback.");
+                GitHubCachedResponse res = await SendCachedGitHubGetAsync(apiUrl, pat, context, token).ConfigureAwait(false);
+                if (res.RateLimited) {
+                    if (string.IsNullOrEmpty(staleCachedJson) && !string.IsNullOrEmpty(res.Body)) {
+                        staleCachedJson = res.Body;
+                    }
+                    OmniLogger.Warn("UPDATE", $"GitHub API rate-limited ({res.StatusCode}) on {apiUrl}; switching to cached web redirect fallback.");
                     break;
                 }
-                if (!resp.IsSuccessStatusCode) {
-                    OmniLogger.Warn("UPDATE", $"GitHub API returned HTTP {(int)resp.StatusCode} for {apiUrl}");
+                if (!res.Ok) {
+                    OmniLogger.Warn("UPDATE", $"GitHub API returned HTTP {res.StatusCode} for {apiUrl}");
                     continue;
                 }
 
-                string json = await resp.Content.ReadAsStringAsync(token).ConfigureAwait(false);
-                OmniUpdateCheckResult parsed = ParseReleaseApiJson(currentVer, json);
+                OmniUpdateCheckResult parsed = ParseReleaseApiJson(currentVer, res.Body);
                 if (parsed != null && !string.IsNullOrEmpty(parsed.DownloadUrl)) {
-                    OmniLogger.Info("UPDATE", $"Checked update via API: installed=v{currentVer}, remote=v{parsed.RemoteVersion}, available={parsed.IsUpdateAvailable}");
+                    OmniLogger.Info("UPDATE", $"Checked update via API (cached={res.FromCache}): installed=v{currentVer}, remote=v{parsed.RemoteVersion}, available={parsed.IsUpdateAvailable}");
                     return parsed;
                 }
             } catch (Exception ex) when (ex is not OperationCanceledException) {
@@ -95,11 +229,18 @@ public static class OmniUpdateService {
             }
         }
 
-        // Zero-rate-limit GitHub web redirect fallback (/releases/latest -> /releases/tag/v2.1.X)
+        // Zero-rate-limit GitHub web redirect fallback (/releases/latest -> /releases/tag/v2.1.X) with TTL cache
         OmniUpdateCheckResult webRes = await CheckForUpdateViaWebRedirectAsync(RepoSlug, TargetAssetName, currentVer, token).ConfigureAwait(false);
         if (webRes != null) {
             OmniLogger.Info("UPDATE", $"Checked update via web fallback: installed=v{currentVer}, remote=v{webRes.RemoteVersion}, available={webRes.IsUpdateAvailable}");
             return webRes;
+        }
+
+        if (!string.IsNullOrEmpty(staleCachedJson)) {
+            OmniUpdateCheckResult staleParsed = ParseReleaseApiJson(currentVer, staleCachedJson);
+            if (staleParsed != null && !string.IsNullOrEmpty(staleParsed.DownloadUrl)) {
+                return staleParsed;
+            }
         }
 
         if (lastApiError != null) {
@@ -163,6 +304,20 @@ public static class OmniUpdateService {
         string ownerRepo,
         string assetFileName,
         CancellationToken token = default) {
+        if (string.IsNullOrWhiteSpace(ownerRepo)) {
+            return ("", "");
+        }
+        EnsureCacheLoaded(null);
+        long nowUnix = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        if (redirectCache.TryGetValue(ownerRepo, out CachedRedirectEntry cached) &&
+            !string.IsNullOrEmpty(cached.Tag) &&
+            nowUnix - cached.SavedAtUnixSec < RedirectCacheTtlSeconds) {
+            string cachedDl = string.IsNullOrWhiteSpace(assetFileName)
+                ? ""
+                : $"https://github.com/{ownerRepo}/releases/download/{Uri.EscapeDataString(cached.Tag)}/{Uri.EscapeDataString(assetFileName)}";
+            return (cached.Tag, cachedDl);
+        }
+
         try {
             string webUrl = $"https://github.com/{ownerRepo}/releases/latest";
             using HttpRequestMessage req = new(HttpMethod.Get, webUrl);
@@ -175,6 +330,8 @@ public static class OmniUpdateService {
                 return ("", "");
             }
             string tag = Uri.UnescapeDataString(m.Groups[1].Value);
+            redirectCache[ownerRepo] = new CachedRedirectEntry(tag, nowUnix);
+            PersistCache(null);
             string dl = string.IsNullOrWhiteSpace(assetFileName)
                 ? ""
                 : $"https://github.com/{ownerRepo}/releases/download/{Uri.EscapeDataString(tag)}/{Uri.EscapeDataString(assetFileName)}";

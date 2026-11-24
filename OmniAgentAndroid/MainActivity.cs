@@ -173,12 +173,12 @@ public sealed partial class MainActivity : Activity {
         if (OperatingSystem.IsAndroidVersionAtLeast(30)) {
             Window.SetDecorFitsSystemWindows(false);
         } else {
-#pragma warning disable CA1422
-            Window.DecorView.SystemUiVisibility = (StatusBarVisibility)(
+#pragma warning disable CS0618, CA1422
+            Window.DecorView.SystemUiFlags =
                 SystemUiFlags.LayoutStable |
                 SystemUiFlags.LayoutFullscreen |
-                SystemUiFlags.LayoutHideNavigation);
-#pragma warning restore CA1422
+                SystemUiFlags.LayoutHideNavigation;
+#pragma warning restore CS0618, CA1422
         }
         if (!OperatingSystem.IsAndroidVersionAtLeast(35)) {
 #pragma warning disable CA1422

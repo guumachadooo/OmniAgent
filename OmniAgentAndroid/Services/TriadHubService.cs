@@ -64,14 +64,6 @@ public static class TriadHubService {
         return c;
     }
 
-    static HttpRequestMessage CreateGhReq(string url, string pat) {
-        HttpRequestMessage req = new(HttpMethod.Get, url);
-        if (!string.IsNullOrWhiteSpace(pat)) {
-            req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", pat);
-        }
-        return req;
-    }
-
     public static async Task<TriadHubSnapshot> FetchSnapshotAsync(OmniSettingsStore store, CancellationToken ct = default) {
         string pat = store?.LoadGitHubPat() ?? "";
 
@@ -164,10 +156,10 @@ public static class TriadHubService {
 
         bool rateLimited = false;
         try {
-            using HttpRequestMessage relReq = CreateGhReq($"https://api.github.com/repos/{ownerRepo}/releases/latest", pat);
-            using HttpResponseMessage relResp = await http.SendAsync(relReq, ct).ConfigureAwait(false);
-            if (relResp.IsSuccessStatusCode) {
-                using JsonDocument doc = JsonDocument.Parse(await relResp.Content.ReadAsStringAsync(ct).ConfigureAwait(false));
+            GitHubCachedResponse relResp = await OmniUpdateService.SendCachedGitHubGetAsync(
+                $"https://api.github.com/repos/{ownerRepo}/releases/latest", pat, token: ct).ConfigureAwait(false);
+            if (relResp.Ok && !string.IsNullOrWhiteSpace(relResp.Body)) {
+                using JsonDocument doc = JsonDocument.Parse(relResp.Body);
                 latestTag = Str(doc.RootElement, "tag_name");
                 if (!string.IsNullOrEmpty(preferredApkName) &&
                     doc.RootElement.TryGetProperty("assets", out JsonElement assets) &&
@@ -184,9 +176,9 @@ public static class TriadHubService {
                         }
                     }
                 }
-            } else if ((int)relResp.StatusCode == 403 || (int)relResp.StatusCode == 429) {
+            } else if (relResp.RateLimited) {
                 rateLimited = true;
-                OmniLogger.Warn("HUB", $"GitHub API HTTP {(int)relResp.StatusCode} for {ownerRepo} releases; using zero-quota web redirect fallback.");
+                OmniLogger.Warn("HUB", $"GitHub API HTTP {relResp.StatusCode} for {ownerRepo} releases; using cached web redirect fallback.");
             }
         } catch (Exception ex) {
             OmniLogger.Warn("HUB", $"GitHub release lookup failed for {ownerRepo}: {ex.Message}");
@@ -206,10 +198,10 @@ public static class TriadHubService {
 
         if (!rateLimited) {
             try {
-                using HttpRequestMessage cReq = CreateGhReq($"https://api.github.com/repos/{ownerRepo}/commits/{branch}", pat);
-                using HttpResponseMessage cResp = await http.SendAsync(cReq, ct).ConfigureAwait(false);
-                if (cResp.IsSuccessStatusCode) {
-                    using JsonDocument doc = JsonDocument.Parse(await cResp.Content.ReadAsStringAsync(ct).ConfigureAwait(false));
+                GitHubCachedResponse cResp = await OmniUpdateService.SendCachedGitHubGetAsync(
+                    $"https://api.github.com/repos/{ownerRepo}/commits/{branch}", pat, token: ct).ConfigureAwait(false);
+                if (cResp.Ok && !string.IsNullOrWhiteSpace(cResp.Body)) {
+                    using JsonDocument doc = JsonDocument.Parse(cResp.Body);
                     string sha = Str(doc.RootElement, "sha");
                     commitSha = sha.Length >= 7 ? sha[..7] : sha;
                     if (doc.RootElement.TryGetProperty("commit", out JsonElement cObj)) {
@@ -217,7 +209,7 @@ public static class TriadHubService {
                         int nl = fullMsg.IndexOf('\n');
                         commitMsg = (nl > 0 ? fullMsg[..nl] : fullMsg).Trim();
                     }
-                } else if ((int)cResp.StatusCode == 403 || (int)cResp.StatusCode == 429) {
+                } else if (cResp.RateLimited) {
                     rateLimited = true;
                 }
             } catch (Exception ex) {
@@ -227,10 +219,10 @@ public static class TriadHubService {
 
         if (!rateLimited) {
             try {
-                using HttpRequestMessage runReq = CreateGhReq($"https://api.github.com/repos/{ownerRepo}/actions/runs?per_page=1", pat);
-                using HttpResponseMessage runResp = await http.SendAsync(runReq, ct).ConfigureAwait(false);
-                if (runResp.IsSuccessStatusCode) {
-                    using JsonDocument doc = JsonDocument.Parse(await runResp.Content.ReadAsStringAsync(ct).ConfigureAwait(false));
+                GitHubCachedResponse runResp = await OmniUpdateService.SendCachedGitHubGetAsync(
+                    $"https://api.github.com/repos/{ownerRepo}/actions/runs?per_page=1", pat, token: ct).ConfigureAwait(false);
+                if (runResp.Ok && !string.IsNullOrWhiteSpace(runResp.Body)) {
+                    using JsonDocument doc = JsonDocument.Parse(runResp.Body);
                     if (doc.RootElement.TryGetProperty("workflow_runs", out JsonElement arr) &&
                         arr.ValueKind == JsonValueKind.Array &&
                         arr.GetArrayLength() > 0) {

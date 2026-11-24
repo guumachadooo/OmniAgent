@@ -34,8 +34,10 @@ public sealed class OmniBootReceiver : BroadcastReceiver {
             if ((store.ServiceEnabled || forceWake) &&
                 store.HasPairSecret &&
                 OmniSettingsStore.TryNormalizeRelayUrl(store.RelayUrl, out _)) {
-                OmniSettingsStore.AppendActivity("WAKE", $"Auto-waking Always-On service ({action}).");
-                OmniAgentForegroundService.EnsureAlwaysOn(context);
+                OmniSettingsStore.AppendActivity("WAKE", $"Auto-waking bridge via JobScheduler ({action}).");
+                Context appCtx = context.ApplicationContext ?? context;
+                OmniWatchdogJobService.Schedule(appCtx);
+                OmniWatchdogJobService.ScheduleUserInitiated(appCtx);
             }
         } catch (Exception ex) {
             OmniSettingsStore.AppendActivity("ERR", $"Auto-wake skipped: {ex.Message}");

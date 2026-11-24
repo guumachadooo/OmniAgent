@@ -22,6 +22,8 @@ from __future__ import annotations
 import argparse
 import base64
 import concurrent.futures
+import errno
+import fcntl
 import hashlib
 import hmac
 import http.server
@@ -31,10 +33,12 @@ import platform
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
@@ -481,17 +485,16 @@ class OmniAgentDaemon:
             if cmd == "git_pull":
                 remote = str(args.get("remote") or "origin")
                 branch = str(args.get("branch") or "master")
-                rebase = bool(args.get("rebase", True))
-                fetch_r = run_subprocess(["git", "fetch", remote], cwd=repo, timeout=60)
-                pull_cmd = ["git", "pull", "--rebase", remote, branch] if rebase else ["git", "pull", remote, branch]
-                pull_r = run_subprocess(pull_cmd, cwd=repo, timeout=90)
+                pull_res = _safe_ff_only_pull(repo, remote=remote, branch=branch)
                 head_r = run_subprocess(["git", "rev-parse", "--short", "HEAD"], cwd=repo, timeout=15)
                 return {
-                    "ok": pull_r["ok"],
+                    "ok": bool(pull_res["ok"]),
                     "cmd": cmd,
+                    "status": pull_res.get("status", ""),
                     "head": head_r["stdout"].strip(),
-                    "fetch": fetch_r,
-                    "pull": pull_r,
+                    "fetch": pull_res.get("fetch"),
+                    "pull": pull_res.get("pull"),
+                    "output": pull_res.get("output", ""),
                 }
 
             if cmd == "git_diff":
@@ -547,7 +550,7 @@ class OmniAgentDaemon:
                 pull_first = bool(args.get("pullFirst", False))
                 pull_info = None
                 if pull_first:
-                    pull_info = run_subprocess(["git", "pull", "--rebase", "origin", str(args.get("branch") or "master")], cwd=repo, timeout=90)
+                    pull_info = _safe_ff_only_pull(repo, remote="origin", branch=str(args.get("branch") or "master"))
                 applied = proto.apply_delta_bundle(repo, bundle, allow_delete=bool(args.get("allowDelete", True)))
                 if cmd == "git_apply_bundle":
                     st_r = run_subprocess(["git", "status", "-sb"], cwd=repo, timeout=20)
@@ -798,6 +801,7 @@ class OmniAgentDaemon:
         last_hb = 0.0
         last_knock_wake = 0.0
         idle_ticks = 0
+        reset_streak = 0
         try:
             while self.running:
                 now = time.time()
@@ -808,11 +812,19 @@ class OmniAgentDaemon:
                     try:
                         self.send_heartbeat()
                         last_hb = now
+                        reset_streak = 0
                     except Exception as exc:
+                        if _is_connection_reset_error(exc):
+                            reset_streak = min(reset_streak + 1, 6)
+                            backoff = min(60.0, 2.0 ** reset_streak)
+                            print(f"[OmniAgent] Heartbeat connection reset (Errno 104); backoff {backoff:.1f}s (streak={reset_streak})", file=sys.stderr, flush=True)
+                            time.sleep(backoff)
+                            continue
                         print(f"[OmniAgent] Heartbeat warning: {exc}", file=sys.stderr, flush=True)
 
                 try:
                     st, poll = proto.http_json("GET", f"{self.relay_url}/v1/agent/poll", self.headers, timeout=20)
+                    reset_streak = 0
                     if st == 200 and poll.get("ok") and poll.get("hasCommand"):
                         idle_ticks = 0
                         cmd_wrap = poll["command"]
@@ -851,6 +863,12 @@ class OmniAgentDaemon:
                     break
                 except Exception as exc:
                     idle_ticks = min(idle_ticks + 1, 20)
+                    if _is_connection_reset_error(exc):
+                        reset_streak = min(reset_streak + 1, 6)
+                        backoff = min(60.0, 2.0 ** reset_streak)
+                        print(f"[OmniAgent] Poll connection reset (Errno 104); exponential backoff {backoff:.1f}s (streak={reset_streak})", file=sys.stderr, flush=True)
+                        time.sleep(backoff)
+                        continue
                     print(f"[OmniAgent] Poll error: {exc}", file=sys.stderr, flush=True)
 
                 time.sleep(poll_idle_sec if idle_ticks >= 5 else poll_fast_sec)
@@ -901,6 +919,79 @@ def _resolve_confined_path(raw_path: str, allowed_roots: list[str]) -> tuple[str
     return None, f"Path outside allowed roots: {clean}"
 
 
+def _is_connection_reset_error(exc: BaseException) -> bool:
+    if isinstance(exc, ConnectionResetError):
+        return True
+    if getattr(exc, "errno", None) == errno.ECONNRESET:
+        return True
+    reason = getattr(exc, "reason", None)
+    if isinstance(reason, BaseException):
+        if isinstance(reason, ConnectionResetError) or getattr(reason, "errno", None) == errno.ECONNRESET:
+            return True
+    msg = str(exc).lower()
+    return ("104" in msg and "reset" in msg) or "connection reset by peer" in msg
+
+
+def _safe_ff_only_pull(repo_path: Path, remote: str = "origin", branch: str = "") -> dict[str, Any]:
+    if not (repo_path.is_dir() and (repo_path / ".git").exists()):
+        return {"ok": False, "status": "not_cloned", "dirtyCount": 0, "output": "not cloned"}
+
+    st = run_subprocess(["git", "status", "--porcelain"], cwd=repo_path, timeout=15)
+    if not st["ok"]:
+        return {
+            "ok": False,
+            "status": "status_error",
+            "dirtyCount": 0,
+            "output": (st["stderr"] or st["stdout"] or "git status failed").strip()[-240:],
+        }
+    dirty_lines = [ln for ln in st["stdout"].splitlines() if ln.strip()]
+    if dirty_lines:
+        return {
+            "ok": False,
+            "status": "quarantined_dirty",
+            "dirtyCount": len(dirty_lines),
+            "output": f"quarantined_dirty ({len(dirty_lines)} dirty path(s)); skipping pull",
+        }
+
+    lock_path = repo_path / ".git" / "omni_pull.lock"
+    with open(lock_path, "a+", encoding="utf-8") as lock_fh:
+        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+        try:
+            st2 = run_subprocess(["git", "status", "--porcelain"], cwd=repo_path, timeout=15)
+            dirty2 = [ln for ln in (st2["stdout"] if st2["ok"] else "").splitlines() if ln.strip()]
+            if dirty2:
+                return {
+                    "ok": False,
+                    "status": "quarantined_dirty",
+                    "dirtyCount": len(dirty2),
+                    "output": f"quarantined_dirty ({len(dirty2)} dirty path(s)); skipping pull",
+                }
+            fetch_r = run_subprocess(["git", "fetch", remote], cwd=repo_path, timeout=60)
+            if not fetch_r["ok"]:
+                return {
+                    "ok": False,
+                    "status": "fetch_failed",
+                    "dirtyCount": 0,
+                    "fetch": fetch_r,
+                    "output": (fetch_r["stderr"] or fetch_r["stdout"] or "git fetch failed").strip()[-240:],
+                }
+            pull_cmd = ["git", "pull", "--ff-only", remote, branch] if branch else ["git", "pull", "--ff-only"]
+            pull_r = run_subprocess(pull_cmd, cwd=repo_path, timeout=90)
+            return {
+                "ok": bool(pull_r["ok"]),
+                "status": "pulled" if pull_r["ok"] else "pull_failed",
+                "dirtyCount": 0,
+                "fetch": fetch_r,
+                "pull": pull_r,
+                "output": (pull_r["stdout"] or pull_r["stderr"] or "").strip()[-240:],
+            }
+        finally:
+            try:
+                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+
+
 def _inspect_local_triad(default_repo: Path) -> dict[str, Any]:
     scratch_base = default_repo.parent if default_repo.parent.is_dir() else Path("/root/.gemini/antigravity/scratch")
     specs = (
@@ -924,6 +1015,8 @@ def _inspect_local_triad(default_repo: Path) -> dict[str, Any]:
             "head": "",
             "lastSubject": "",
             "dirtyCount": 0,
+            "quarantinedDirty": False,
+            "status": "not_cloned",
         }
         if exists and (rpath / ".git").exists():
             br = run_subprocess(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=rpath, timeout=8)
@@ -938,6 +1031,10 @@ def _inspect_local_triad(default_repo: Path) -> dict[str, Any]:
             if st["ok"]:
                 lines = [ln for ln in st["stdout"].splitlines() if ln.strip()]
                 entry["dirtyCount"] = len(lines)
+                entry["quarantinedDirty"] = len(lines) > 0
+                entry["status"] = "quarantined_dirty" if len(lines) > 0 else "clean"
+            else:
+                entry["status"] = "status_error"
         if alias == "cavern" and exists:
             hf = rpath / ".agents" / "docs" / "HANDOFF.md"
             if hf.is_file():
@@ -982,17 +1079,27 @@ def start_local_fs_server(
     started_ts = time.time()
 
     class LocalFsHandler(http.server.BaseHTTPRequestHandler):
+        def setup(self) -> None:
+            super().setup()
+            try:
+                self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            except OSError:
+                pass
+
         def log_message(self, format: str, *args: Any) -> None:
             return  # Keep daemon stdout clean
 
         def _send_json(self, code: int, payload: dict[str, Any]) -> None:
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-            self.send_response(code)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
-            self.wfile.write(body)
+            try:
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
 
         def _check_auth(self) -> bool:
             got = (self.headers.get("X-Omni-Local-Key") or "").strip().lower()
@@ -1213,15 +1320,14 @@ def start_local_fs_server(
                 results = []
                 for repo in triad.get("repos", []):
                     rp = Path(repo["path"])
-                    if not (rp.is_dir() and (rp / ".git").exists()):
-                        results.append({"alias": repo["alias"], "ok": False, "output": "not cloned"})
-                        continue
-                    r = run_subprocess(["git", "pull", "--rebase", "--autostash"], cwd=rp, timeout=60)
+                    pull_res = _safe_ff_only_pull(rp)
                     results.append(
                         {
                             "alias": repo["alias"],
-                            "ok": bool(r["ok"]),
-                            "output": (r["stdout"] or r["stderr"] or "").strip()[-240:],
+                            "ok": bool(pull_res["ok"]),
+                            "status": pull_res.get("status", ""),
+                            "dirtyCount": int(pull_res.get("dirtyCount", 0)),
+                            "output": pull_res.get("output", ""),
                         }
                     )
                 self._send_json(200, {"ok": all(x["ok"] for x in results), "results": results})
@@ -1252,6 +1358,13 @@ def start_local_fs_server(
     class _ReusableLocalFsServer(http.server.ThreadingHTTPServer):
         allow_reuse_address = True
         daemon_threads = True
+
+        def server_bind(self) -> None:
+            super().server_bind()
+            try:
+                self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            except OSError:
+                pass
 
     try:
         server = _ReusableLocalFsServer((host, port), LocalFsHandler)

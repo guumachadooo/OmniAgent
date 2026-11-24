@@ -10,18 +10,30 @@ using Path = System.IO.Path;
 namespace OmniAgentAndroid.Services;
 
 /// <summary>
-/// Standalone background Foreground Service (<c>dataSync</c>) running independently of Cavernize.
-/// Connects to Cloudflare Hub v4 on channel <c>android</c> using zero-trust E2E encryption,
-/// supporting direct GitHub atomic multi-file push, one-tap APK install, and Termux daemon wake.
+/// Standalone background Foreground Service (<c>dataSync</c>) &amp; bindable local bridge
+/// running independently of Cavernize. Connects to Cloudflare Hub on channel <c>android</c>
+/// using zero-trust E2E encryption, with Android 14–17 <c>ForegroundServiceStartNotAllowedException</c>
+/// and 6-hour <c>dataSync</c> timeout protection via <see cref="OmniWatchdogJobService"/> (<c>UserInitiated</c>)
+/// and same-signature <see cref="OmniAgentBinder"/> (<c>BIND_AUTO_CREATE</c>).
 /// </summary>
-[Service(Exported = false, ForegroundServiceType = Android.Content.PM.ForegroundService.TypeDataSync)]
+[Service(
+    Exported = true,
+    Permission = CavernizeIpcBridgeClient.BridgePermission,
+    ForegroundServiceType = Android.Content.PM.ForegroundService.TypeDataSync)]
 public sealed class OmniAgentForegroundService : Service {
     public const string TermuxRunCommandPermission = "com.termux.permission.RUN_COMMAND";
-    const int NotifId = 9188;
+    public const string ActionBindBridge = "hu.sbence.cavern.omniagent.BIND_BRIDGE";
+    internal const int NotifId = 9188;
     const string ChannelId = "omni_agent_foreground";
     const string ActionStop = "hu.sbence.cavern.omniagent.ACTION_STOP";
 
     const string AgentVersion = "2.1.0";
+
+    public sealed class OmniAgentBinder : Binder {
+        public OmniAgentForegroundService Service { get; }
+        public OmniAgentBinder(OmniAgentForegroundService service) => Service = service;
+        public bool IsBridgeRunning => isRunning;
+    }
 
     static readonly HashSet<string> CriticalCommands = new(StringComparer.OrdinalIgnoreCase) {
         "github_push_bundle",
@@ -49,12 +61,17 @@ public sealed class OmniAgentForegroundService : Service {
     static readonly HttpClient http = BuildClient();
     static volatile bool isRunning;
     static volatile int commandsHandled;
-
+    static int activeLoopFlag;
     public static bool IsRunning => isRunning;
     public static int CommandsHandled => commandsHandled;
     public static event Action StateChanged;
 
+    readonly IBinder binder;
     CancellationTokenSource cts;
+
+    public OmniAgentForegroundService() {
+        binder = new OmniAgentBinder(this);
+    }
 
     static HttpClient BuildClient() {
         HttpClient c = new() { Timeout = TimeSpan.FromSeconds(30) };
@@ -79,7 +96,9 @@ public sealed class OmniAgentForegroundService : Service {
     /// Starts OmniAgent's Always-On background bridge and schedules the persisted watchdog job
     /// whenever Relay URL + Pair Key are configured (zero manual Start clicks required).
     /// </summary>
-    public static bool EnsureAlwaysOn(Context context) {
+    public static bool EnsureAlwaysOn(Context context) => EnsureAlwaysOn(context, fromBackground: false);
+
+    public static bool EnsureAlwaysOn(Context context, bool fromBackground) {
         if (context == null) {
             return false;
         }
@@ -89,7 +108,9 @@ public sealed class OmniAgentForegroundService : Service {
             return false;
         }
         OmniWatchdogJobService.Schedule(appCtx);
-        if (!isRunning) {
+        if (fromBackground) {
+            OmniWatchdogJobService.ScheduleUserInitiated(appCtx);
+        } else if (!isRunning) {
             Start(appCtx);
         }
         return true;
@@ -108,8 +129,12 @@ public sealed class OmniAgentForegroundService : Service {
                 appCtx.StartService(intent);
             }
         } catch (Exception ex) {
-            OmniSettingsStore.AppendActivity("WAKE", $"StartForegroundService deferred to watchdog: {ex.Message}");
+            string kind = OperatingSystem.IsAndroidVersionAtLeast(31) && ex is ForegroundServiceStartNotAllowedException
+                ? "ForegroundServiceStartNotAllowedException"
+                : ex.GetType().Name;
+            OmniSettingsStore.AppendActivity("WAKE", $"StartForegroundService deferred ({kind}) -> UserInitiated job: {ex.Message}");
             OmniWatchdogJobService.Schedule(appCtx);
+            OmniWatchdogJobService.ScheduleUserInitiated(appCtx);
         }
     }
 
@@ -125,31 +150,26 @@ public sealed class OmniAgentForegroundService : Service {
         }
     }
 
-    public override IBinder OnBind(Intent intent) => null;
+    public override IBinder OnBind(Intent intent) {
+        OmniLogger.Initialize(this);
+        try {
+            OmniSettingsStore store = new(this);
+            if (store.ServiceEnabled && store.HasPairSecret && OmniSettingsStore.TryNormalizeRelayUrl(store.RelayUrl, out _)) {
+                StartPollLoopIfNeeded(isForegroundService: false);
+            }
+        } catch {
+            // Best effort
+        }
+        return binder;
+    }
 
     public override void OnTaskRemoved(Intent rootIntent) {
         base.OnTaskRemoved(rootIntent);
         try {
             OmniSettingsStore store = new(this);
             if (store.ServiceEnabled && store.HasPairSecret && OmniSettingsStore.TryNormalizeRelayUrl(store.RelayUrl, out _)) {
-                ScheduleQuickRestart(this);
                 OmniWatchdogJobService.Schedule(this);
-            }
-        } catch {
-            // Best effort
-        }
-    }
-
-    static void ScheduleQuickRestart(Context context) {
-        try {
-            Intent restart = new(context, typeof(OmniBootReceiver));
-            restart.SetAction(OmniBootReceiver.ActionWatchdogRestart);
-            PendingIntentFlags flags = OperatingSystem.IsAndroidVersionAtLeast(23)
-                ? PendingIntentFlags.OneShot | PendingIntentFlags.Immutable
-                : PendingIntentFlags.OneShot;
-            PendingIntent pi = PendingIntent.GetBroadcast(context, 9198, restart, flags);
-            if (context.GetSystemService(AlarmService) is AlarmManager am) {
-                am.Set(AlarmType.ElapsedRealtimeWakeup, SystemClock.ElapsedRealtime() + 1800L, pi);
+                OmniWatchdogJobService.ScheduleUserInitiated(this);
             }
         } catch {
             // Best effort
@@ -167,19 +187,49 @@ public sealed class OmniAgentForegroundService : Service {
         }
 
         OmniLogger.Initialize(this);
-        EnsureChannel();
-        StartForegroundCompat(NotifId, BuildNotification());
+        EnsureNotificationChannel(this);
+        try {
+            StartForegroundCompat(NotifId, BuildServiceNotification(this, isJobMode: false));
+        } catch (Exception ex) {
+            string kind = OperatingSystem.IsAndroidVersionAtLeast(31) && ex is ForegroundServiceStartNotAllowedException
+                ? "ForegroundServiceStartNotAllowedException"
+                : ex.GetType().Name;
+            OmniSettingsStore.AppendActivity("WAKE", $"OnStartCommand StartForeground blocked ({kind}); routing to UserInitiated job: {ex.Message}");
+            OmniWatchdogJobService.Schedule(this);
+            OmniWatchdogJobService.ScheduleUserInitiated(this);
+            try {
+                StopSelf(startId);
+            } catch {
+                StopSelf();
+            }
+            return StartCommandResult.NotSticky;
+        }
 
+        StartPollLoopIfNeeded(isForegroundService: true);
+        return StartCommandResult.NotSticky;
+    }
+
+    void StartPollLoopIfNeeded(bool isForegroundService) {
         if (cts == null || cts.IsCancellationRequested) {
             cts?.Dispose();
             cts = new CancellationTokenSource();
-            isRunning = true;
-            NotifyState();
-            OmniSettingsStore.AppendActivity("AGENT", $"Foreground service v{AgentVersion} started (channel=android).");
             CancellationToken token = cts.Token;
-            _ = Task.Run(() => PollLoopAsync(token));
+            OmniSettingsStore.AppendActivity("AGENT", $"Bridge v{AgentVersion} started (fgs={isForegroundService}, channel=android).");
+            _ = Task.Run(async () => {
+                try {
+                    await RunBridgeLoopAsync(this, token).ConfigureAwait(false);
+                } finally {
+                    if (isForegroundService) {
+                        StopForegroundCompat(true);
+                        try {
+                            StopSelf();
+                        } catch {
+                            // Ignore
+                        }
+                    }
+                }
+            });
         }
-        return StartCommandResult.Sticky;
     }
 
     [System.Runtime.Versioning.SupportedOSPlatform("android34.0")]
@@ -199,13 +249,22 @@ public sealed class OmniAgentForegroundService : Service {
     }
 
     void HandleTimeout(int startId) {
-        OmniSettingsStore.AppendActivity("AGENT", $"Foreground timeout reached (startId={startId}); stopping cleanly.");
+        OmniSettingsStore.AppendActivity("AGENT", $"Foreground timeout reached (startId={startId}); stopping FGS cleanly & handing off to JobScheduler.");
+        try {
+            cts?.Cancel();
+        } catch {
+            // Ignore
+        }
+        isRunning = false;
+        NotifyState();
         StopForegroundCompat(true);
         try {
             StopSelf(startId);
         } catch {
             StopSelf();
         }
+        OmniWatchdogJobService.Schedule(this);
+        OmniWatchdogJobService.ScheduleUserInitiated(this);
     }
 
     public override void OnDestroy() {
@@ -242,14 +301,28 @@ public sealed class OmniAgentForegroundService : Service {
         return 180;
     }
 
-    async Task PollLoopAsync(CancellationToken ct) {
+    internal static async Task RunBridgeLoopAsync(Context context, CancellationToken ct, TimeSpan? maxDuration = null) {
+        if (context == null) {
+            return;
+        }
+        if (Interlocked.CompareExchange(ref activeLoopFlag, 1, 0) != 0) {
+            return;
+        }
+        Context appCtx = context.ApplicationContext ?? context;
+        System.Diagnostics.Stopwatch runSw = System.Diagnostics.Stopwatch.StartNew();
+        isRunning = true;
+        NotifyState();
+
         DateTime lastHb = DateTime.MinValue;
         DateTime lastHealthProbe = DateTime.MinValue;
         int heartbeatSec = 180;
         int idleTicks = 0;
         try {
             while (!ct.IsCancellationRequested) {
-                OmniSettingsStore store = new(this);
+                if (maxDuration.HasValue && runSw.Elapsed >= maxDuration.Value) {
+                    break;
+                }
+                OmniSettingsStore store = new(appCtx);
                 if (!store.ServiceEnabled) {
                     break;
                 }
@@ -269,7 +342,7 @@ public sealed class OmniAgentForegroundService : Service {
 
                 if ((DateTime.UtcNow - lastHb).TotalSeconds >= heartbeatSec) {
                     try {
-                        await SendHeartbeatAsync(baseUrl, devHash, agentKey, store, ct).ConfigureAwait(false);
+                        await SendHeartbeatAsync(appCtx, baseUrl, devHash, agentKey, store, ct).ConfigureAwait(false);
                         lastHb = DateTime.UtcNow;
                     } catch (Exception hbEx) when (hbEx is not System.OperationCanceledException) {
                         OmniLogger.Warn("BRIDGE", $"Heartbeat failed: {hbEx.Message}");
@@ -288,7 +361,7 @@ public sealed class OmniAgentForegroundService : Service {
                             idleTicks = 0;
                             string reqId = cmdWrap.TryGetProperty("requestId", out JsonElement idEl) ? (idEl.GetString() ?? "") : "";
                             JsonElement envEl = cmdWrap.GetProperty("envelope");
-                            object resultObj = await HandleEncryptedCommandAsync(baseUrl, devHash, agentKey, pairHex, store, reqId, envEl, ct).ConfigureAwait(false);
+                            object resultObj = await HandleEncryptedCommandAsync(appCtx, baseUrl, devHash, agentKey, pairHex, store, reqId, envEl, ct).ConfigureAwait(false);
                             object resEnv = OmniCrypto.EncryptEnvelope(pairHex, $"res:{reqId}", resultObj);
                             using HttpRequestMessage postRes = CreateAgentReq(HttpMethod.Post, $"{baseUrl}/v1/agent/result", devHash, agentKey);
                             postRes.Content = new StringContent(
@@ -315,7 +388,7 @@ public sealed class OmniAgentForegroundService : Service {
                                 hkEl.GetBoolean() &&
                                 kDoc.RootElement.TryGetProperty("knock", out JsonElement knockEl)) {
                                 idleTicks = 0;
-                                await HandleSmartKnockAsync(baseUrl, devHash, pairHex, knockEl, ct).ConfigureAwait(false);
+                                await HandleSmartKnockAsync(appCtx, baseUrl, devHash, pairHex, knockEl, ct).ConfigureAwait(false);
                                 continue;
                             }
                         }
@@ -333,13 +406,12 @@ public sealed class OmniAgentForegroundService : Service {
             // Normal cancel
         } finally {
             isRunning = false;
+            Interlocked.Exchange(ref activeLoopFlag, 0);
             NotifyState();
-            StopForegroundCompat(true);
-            StopSelf();
         }
     }
 
-    async Task SendHeartbeatAsync(string baseUrl, string devHash, string agentKey, OmniSettingsStore store, CancellationToken ct) {
+    static async Task SendHeartbeatAsync(Context context, string baseUrl, string devHash, string agentKey, OmniSettingsStore store, CancellationToken ct) {
         using HttpRequestMessage req = CreateAgentReq(HttpMethod.Post, $"{baseUrl}/v1/agent/heartbeat", devHash, agentKey);
         object payload = new {
             agentVersion = AgentVersion,
@@ -350,13 +422,13 @@ public sealed class OmniAgentForegroundService : Service {
             tools = new {
                 githubDirectPush = store.HasGitHubPat,
                 cloudflareDeployReady = store.HasCloudflareToken,
-                overlayPermissionGranted = OmniKnockApprovalActivity.CanDrawInstantOverlay(this),
-                batteryUnrestricted = IsBatteryUnrestricted(this),
+                overlayPermissionGranted = OmniKnockApprovalActivity.CanDrawInstantOverlay(context),
+                batteryUnrestricted = IsBatteryUnrestricted(context),
                 apkInstaller = true,
-                termuxInstalled = IsPackageInstalled(this, "com.termux"),
-                termuxPermissionGranted = HasTermuxPermission(this),
-                cavernizeInstalled = IsPackageInstalled(this, "hu.sbence.cavern.cavernize"),
-                cavernizeSignatureMatch = CavernizeIpcBridgeClient.IsSignatureVerified(this)
+                termuxInstalled = IsPackageInstalled(context, "com.termux"),
+                termuxPermissionGranted = HasTermuxPermission(context),
+                cavernizeInstalled = IsPackageInstalled(context, "hu.sbence.cavern.cavernize"),
+                cavernizeSignatureMatch = CavernizeIpcBridgeClient.IsSignatureVerified(context)
             },
             capabilities = Capabilities
         };
@@ -364,7 +436,7 @@ public sealed class OmniAgentForegroundService : Service {
         using HttpResponseMessage _ = await http.SendAsync(req, ct).ConfigureAwait(false);
     }
 
-    async Task HandleSmartKnockAsync(string baseUrl, string devHash, string pairHex, JsonElement knockEl, CancellationToken ct) {
+    static async Task HandleSmartKnockAsync(Context context, string baseUrl, string devHash, string pairHex, JsonElement knockEl, CancellationToken ct) {
         string knockReqId = knockEl.TryGetProperty("knockReqId", out JsonElement idEl) ? (idEl.GetString() ?? "") : "";
         string clientPub = knockEl.TryGetProperty("clientPubKey", out JsonElement pkEl) ? (pkEl.GetString() ?? "") : "";
         string requester = knockEl.TryGetProperty("requester", out JsonElement rqEl) ? (rqEl.GetString() ?? "AI Studio") : "AI Studio";
@@ -376,7 +448,7 @@ public sealed class OmniAgentForegroundService : Service {
         string sas = OmniCrypto.ComputeKnockSasCode(knockId, knockReqId, clientPub);
         OmniSettingsStore.AppendActivity("KNOCK", $"Incoming Smart Knock (SAS={sas}) from {requester}...");
 
-        (bool approved, bool bioOk, string hwSig) = await OmniKnockApprovalActivity.RequestApprovalAsync(this, knockReqId, sas, requester, reason, clientPub, ct).ConfigureAwait(false);
+        (bool approved, bool bioOk, string hwSig) = await OmniKnockApprovalActivity.RequestApprovalAsync(context, knockReqId, sas, requester, reason, clientPub, ct).ConfigureAwait(false);
         if (!approved || !bioOk) {
             using HttpRequestMessage denyReq = new(HttpMethod.Post, $"{baseUrl}/v1/knock/deny");
             denyReq.Headers.Add("X-Device-Hash", devHash);
@@ -412,7 +484,8 @@ public sealed class OmniAgentForegroundService : Service {
             : $"Smart Knock approve failed (HTTP {(int)resp.StatusCode}).");
     }
 
-    async Task<object> HandleEncryptedCommandAsync(
+    static async Task<object> HandleEncryptedCommandAsync(
+        Context context,
         string baseUrl,
         string devHash,
         string agentKey,
@@ -432,7 +505,7 @@ public sealed class OmniAgentForegroundService : Service {
 
             if (string.Equals(store.SecurityMode, "biometric", StringComparison.OrdinalIgnoreCase) && CriticalCommands.Contains(cmd)) {
                 bool approved = await OmniBiometricGateActivity.RequestApprovalAsync(
-                    this,
+                    context,
                     reqId,
                     Language.OmniStrings.Active["GatePromptTitle"],
                     $"CMD: {cmd}",
@@ -460,12 +533,12 @@ public sealed class OmniAgentForegroundService : Service {
                         githubRepo = store.GitHubRepo,
                         cloudflareDeployReady = store.HasCloudflareToken,
                         cloudflareWorkerName = store.ResolveEffectiveWorkerName(),
-                        overlayPermissionGranted = OmniKnockApprovalActivity.CanDrawInstantOverlay(this),
-                        batteryUnrestricted = IsBatteryUnrestricted(this),
-                        termuxInstalled = IsPackageInstalled(this, "com.termux"),
-                        termuxPermissionGranted = HasTermuxPermission(this),
-                        cavernizeInstalled = IsPackageInstalled(this, "hu.sbence.cavern.cavernize"),
-                        cavernizeSignatureMatch = CavernizeIpcBridgeClient.IsSignatureVerified(this),
+                        overlayPermissionGranted = OmniKnockApprovalActivity.CanDrawInstantOverlay(context),
+                        batteryUnrestricted = IsBatteryUnrestricted(context),
+                        termuxInstalled = IsPackageInstalled(context, "com.termux"),
+                        termuxPermissionGranted = HasTermuxPermission(context),
+                        cavernizeInstalled = IsPackageInstalled(context, "hu.sbence.cavern.cavernize"),
+                        cavernizeSignatureMatch = CavernizeIpcBridgeClient.IsSignatureVerified(context),
                         commandsHandled,
                         utc = DateTime.UtcNow.ToString("O")
                     };
@@ -554,7 +627,7 @@ public sealed class OmniAgentForegroundService : Service {
                         ? Math.Clamp(parsedTo, 5, 120)
                         : 45;
                     (bool ipcOk, string ipcBody, long ipcElapsedMs) = await CavernizeIpcBridgeClient.SendCommandAsync(
-                        this, subCmd, subArgsJson, maxTier, timeoutSec, ct).ConfigureAwait(false);
+                        context, subCmd, subArgsJson, maxTier, timeoutSec, ct).ConfigureAwait(false);
                     OmniSettingsStore.AppendActivity(ipcOk ? "IPC" : "ERR", $"cavernize_cmd '{subCmd}' ({ipcElapsedMs}ms, ok={ipcOk})");
                     return new {
                         ok = ipcOk,
@@ -596,13 +669,13 @@ public sealed class OmniAgentForegroundService : Service {
                         return new { ok = false, cmd, error = "Downloaded file is not a valid APK archive." };
                     }
                     string fileName = $"omni_install_{DateTime.UtcNow:yyyyMMdd_HHmmss}.apk";
-                    string path = Path.Combine(OmniApkFileProvider.GetApkDirectory(this), fileName);
+                    string path = Path.Combine(OmniApkFileProvider.GetApkDirectory(context), fileName);
                     await File.WriteAllBytesAsync(path, apkBytes, ct).ConfigureAwait(false);
-                    Android.Net.Uri contentUri = OmniApkFileProvider.GetApkUri(this, fileName);
+                    Android.Net.Uri contentUri = OmniApkFileProvider.GetApkUri(context, fileName);
                     Intent installIntent = new(Intent.ActionView);
                     installIntent.SetDataAndType(contentUri, "application/vnd.android.package-archive");
                     installIntent.AddFlags(ActivityFlags.GrantReadUriPermission | ActivityFlags.NewTask);
-                    StartActivity(installIntent);
+                    context.StartActivity(installIntent);
                     OmniSettingsStore.AppendActivity("APK", $"Launched installer ({apkBytes.Length / 1024} KB).");
                     return new { ok = true, cmd, bytes = apkBytes.Length, file = fileName };
                 }
@@ -632,7 +705,7 @@ public sealed class OmniAgentForegroundService : Service {
                     return new {
                         ok = true,
                         cmd,
-                        summaryJson = OmniLogger.BuildDiagnosticSummaryJson(this, store)
+                        summaryJson = OmniLogger.BuildDiagnosticSummaryJson(context, store)
                     };
 
                 case "launch_termux_daemon": {
@@ -640,15 +713,15 @@ public sealed class OmniAgentForegroundService : Service {
                     if (string.IsNullOrEmpty(scriptPath)) {
                         scriptPath = store.TermuxStartScript;
                     }
-                    (bool ok, bool needsPermission, bool needsExternalApps, string detail) = LaunchTermuxSmartDaemon(this, scriptPath);
+                    (bool ok, bool needsPermission, bool needsExternalApps, string detail) = LaunchTermuxSmartDaemon(context, scriptPath);
                     OmniSettingsStore.AppendActivity(ok ? "TERMUX" : "ERR", detail);
                     return new {
                         ok,
                         cmd,
                         needsPermission,
                         needsExternalApps,
-                        termuxInstalled = IsPackageInstalled(this, "com.termux"),
-                        permissionGranted = HasTermuxPermission(this),
+                        termuxInstalled = IsPackageInstalled(context, "com.termux"),
+                        permissionGranted = HasTermuxPermission(context),
                         message = detail
                     };
                 }
@@ -659,18 +732,18 @@ public sealed class OmniAgentForegroundService : Service {
                         execPath = "/data/data/com.termux/files/usr/bin/bash";
                     }
                     string command = GetStr(argsEl, "command");
-                    (bool ok, string detail) = LaunchTermuxCommand(this, execPath, string.IsNullOrEmpty(command) ? [] : ["-lc", command]);
+                    (bool ok, string detail) = LaunchTermuxCommand(context, execPath, string.IsNullOrEmpty(command) ? [] : ["-lc", command]);
                     OmniSettingsStore.AppendActivity("TERMUX", detail);
                     return new { ok, cmd, message = detail };
                 }
 
                 case "open_cavernize": {
-                    Intent launch = PackageManager?.GetLaunchIntentForPackage("hu.sbence.cavern.cavernize");
+                    Intent launch = context.PackageManager?.GetLaunchIntentForPackage("hu.sbence.cavern.cavernize");
                     if (launch == null) {
                         return new { ok = false, cmd, error = "Cavernize Android is not installed." };
                     }
                     launch.AddFlags(ActivityFlags.NewTask);
-                    StartActivity(launch);
+                    context.StartActivity(launch);
                     OmniSettingsStore.AppendActivity("APP", "Brought Cavernize Android to foreground.");
                     return new { ok = true, cmd, message = "Opened Cavernize Android." };
                 }
@@ -684,7 +757,7 @@ public sealed class OmniAgentForegroundService : Service {
         }
     }
 
-    async Task<JsonDocument> DownloadEncryptedBlobAsync(
+    static async Task<JsonDocument> DownloadEncryptedBlobAsync(
         string baseUrl,
         string devHash,
         string agentKey,
@@ -781,7 +854,14 @@ public sealed class OmniAgentForegroundService : Service {
             }
             intent.PutExtra("com.termux.RUN_COMMAND_BACKGROUND", true);
             if (OperatingSystem.IsAndroidVersionAtLeast(26)) {
-                context.StartForegroundService(intent);
+                try {
+                    context.StartForegroundService(intent);
+                } catch (Exception fgsEx) {
+                    if (OperatingSystem.IsAndroidVersionAtLeast(31) && fgsEx is ForegroundServiceStartNotAllowedException) {
+                        return (false, $"Termux background start blocked (ForegroundServiceStartNotAllowedException): {fgsEx.Message}");
+                    }
+                    throw;
+                }
             } else {
                 context.StartService(intent);
             }
@@ -851,11 +931,11 @@ public sealed class OmniAgentForegroundService : Service {
             ? (p.GetString() ?? "")
             : "";
 
-    void EnsureChannel() {
-        if (!OperatingSystem.IsAndroidVersionAtLeast(26)) {
+    internal static void EnsureNotificationChannel(Context context) {
+        if (context == null || !OperatingSystem.IsAndroidVersionAtLeast(26)) {
             return;
         }
-        NotificationManager nm = (NotificationManager)GetSystemService(NotificationService);
+        NotificationManager nm = (NotificationManager)context.GetSystemService(NotificationService);
         if (nm == null) {
             return;
         }
@@ -866,27 +946,27 @@ public sealed class OmniAgentForegroundService : Service {
         nm.CreateNotificationChannel(ch);
     }
 
-    Notification BuildNotification() {
+    internal static Notification BuildServiceNotification(Context context, bool isJobMode = false) {
         PendingIntentFlags piFlags = OperatingSystem.IsAndroidVersionAtLeast(23)
             ? PendingIntentFlags.UpdateCurrent | PendingIntentFlags.Immutable
             : PendingIntentFlags.UpdateCurrent;
-        Intent openIntent = new(this, typeof(MainActivity));
+        Intent openIntent = new(context, typeof(MainActivity));
         openIntent.AddFlags(ActivityFlags.NewTask | ActivityFlags.SingleTop);
-        PendingIntent openPi = PendingIntent.GetActivity(this, NotifId, openIntent, piFlags);
+        PendingIntent openPi = PendingIntent.GetActivity(context, NotifId, openIntent, piFlags);
 
-        Intent stopIntent = new(this, typeof(OmniAgentForegroundService));
+        Intent stopIntent = new(context, typeof(OmniAgentForegroundService));
         stopIntent.SetAction(ActionStop);
-        PendingIntent stopPi = PendingIntent.GetService(this, NotifId + 1, stopIntent, piFlags);
+        PendingIntent stopPi = PendingIntent.GetService(context, NotifId + 1, stopIntent, piFlags);
 
-        Notification.Builder b = new(this, ChannelId);
+        Notification.Builder b = new(context, ChannelId);
         b.SetSmallIcon(Resource.Drawable.omni_icon)
-            .SetContentTitle("OmniAgent · Always-On")
+            .SetContentTitle(isJobMode ? "OmniAgent · Scheduled Bridge" : "OmniAgent · Always-On")
             .SetContentText($"Channel: android • {commandsHandled} cmd(s) handled")
-            .SetOngoing(true)
+            .SetOngoing(!isJobMode)
             .SetContentIntent(openPi);
         if (OperatingSystem.IsAndroidVersionAtLeast(23)) {
             Notification.Action act = new Notification.Action.Builder(
-                Android.Graphics.Drawables.Icon.CreateWithResource(this, Resource.Drawable.omni_icon),
+                Android.Graphics.Drawables.Icon.CreateWithResource(context, Resource.Drawable.omni_icon),
                 "Stop",
                 stopPi).Build();
             b.AddAction(act);
