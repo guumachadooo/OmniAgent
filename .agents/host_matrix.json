@@ -1,0 +1,336 @@
+{
+  "schema": 1,
+  "strict_coverage": false,
+  "note": "Declarative multi-host tool & integration matrix (`antigravity-termux` <-> `antigravity-local` <-> `ai-studio-cloud` <-> `ci-runner` <-> `local-ide`). Audited by `verify_universal.py` & `plan_tool.py host-audit`.",
+  "hosts": {
+    "antigravity-termux": {
+      "label": "Antigravity (Termux PRoot on S25 Ultra)",
+      "ignore_cloud_env_alerts": true,
+      "boot_steps": [
+        "python3 -B .agents/plugins/dynamic-fractal-planner/scripts/plan_tool.py host-boot",
+        "git status -sb && git fetch origin --quiet"
+      ]
+    },
+    "antigravity-local": {
+      "label": "Antigravity (Local Workstation)",
+      "ignore_cloud_env_alerts": true,
+      "boot_steps": [
+        "python3 -B .agents/plugins/dynamic-fractal-planner/scripts/plan_tool.py host-boot",
+        "git status -sb"
+      ]
+    },
+    "ai-studio-cloud": {
+      "label": "Google AI Studio Cloud Container",
+      "ignore_cloud_env_alerts": false,
+      "boot_steps": [
+        "python3 -B agent/flight_recorder.py recover",
+        "python3 -B .agents/plugins/dynamic-fractal-planner/scripts/plan_tool.py host-boot"
+      ]
+    },
+    "ci-runner": {
+      "label": "GitHub Actions CI Runner",
+      "ignore_cloud_env_alerts": true,
+      "boot_steps": [
+        "python3 -B .agents/plugins/dynamic-fractal-planner/scripts/verify_universal.py --all"
+      ]
+    },
+    "local-ide": {
+      "label": "Generic Local IDE",
+      "ignore_cloud_env_alerts": true,
+      "boot_steps": [
+        "python3 -B .agents/plugins/dynamic-fractal-planner/scripts/plan_tool.py host-boot"
+      ]
+    }
+  },
+  "scan_globs": [
+    "agent/*.py",
+    "agent/*.mjs",
+    "agent/*.sh",
+    "worker/*.js",
+    ".agents/preview/*.mjs",
+    ".agents/env_manifest.json",
+    ".agents/federation.json",
+    ".agents/bridge_profile.json",
+    ".agents/host_matrix.json",
+    "package.json"
+  ],
+  "ignore_globs": [
+    "**/__pycache__/**",
+    "**/test_*.py",
+    "**/test_*.mjs",
+    "**/*.test.mjs",
+    "**/*_test.py"
+  ],
+  "entries": [
+    {
+      "id": "preview-shim",
+      "category": "ai-studio-only",
+      "paths": [
+        "package.json",
+        ".agents/preview/server.mjs"
+      ],
+      "purpose": "Zero-dependency Node.js preview server on port 3000 keeping AI Studio preview healthy, bridging container Secrets, and warming 3-repo federation.",
+      "per_host": {
+        "ai-studio-cloud": {
+          "mode": "active",
+          "how": "runs npm run dev on 0.0.0.0:3000"
+        },
+        "antigravity-termux": {
+          "mode": "skip_preserve",
+          "how": "do not run; preserve files & checks for AI Studio"
+        },
+        "ci-runner": {
+          "mode": "test_only",
+          "how": "syntax checked via node --check .agents/preview/server.mjs"
+        },
+        "local-ide": {
+          "mode": "optional",
+          "how": "preserve compatibility"
+        }
+      }
+    },
+    {
+      "id": "live-sync-watcher",
+      "category": "ai-studio-only",
+      "paths": [
+        "agent/live_sync_watcher.py"
+      ],
+      "purpose": "Zero-quota background watcher mirroring AI Studio workspace edits to Tier 1/2/3 & Phone Antigravity.",
+      "per_host": {
+        "ai-studio-cloud": {
+          "mode": "active",
+          "how": "auto-spawned by .agents/preview/server.mjs"
+        },
+        "antigravity-termux": {
+          "mode": "skip_preserve",
+          "how": "do not run; Antigravity edits local workspace directly"
+        },
+        "ci-runner": {
+          "mode": "test_only",
+          "how": "unit-tested via agent/test_omni_agent.py"
+        },
+        "local-ide": {
+          "mode": "skip_preserve",
+          "how": "AI Studio cloud watcher only"
+        }
+      }
+    },
+    {
+      "id": "flight-recorder",
+      "category": "ai-studio-only",
+      "paths": [
+        "agent/flight_recorder.py"
+      ],
+      "purpose": "3-tier anti-cancellation/anti-rollback session snapshot & recovery recorder for AI Studio containers.",
+      "per_host": {
+        "ai-studio-cloud": {
+          "mode": "active",
+          "how": "run recover at boot, save -b at milestones, close on ship"
+        },
+        "antigravity-termux": {
+          "mode": "skip_preserve",
+          "how": "skip locally; native git + filesystem persist edits directly"
+        },
+        "ci-runner": {
+          "mode": "test_only",
+          "how": "unit-tested via agent/test_omni_agent.py"
+        },
+        "local-ide": {
+          "mode": "skip_preserve",
+          "how": "native git persists edits"
+        }
+      }
+    },
+    {
+      "id": "ai-studio-env-manifest",
+      "category": "ai-studio-only",
+      "paths": [
+        ".agents/env_manifest.json"
+      ],
+      "purpose": "Expected AI Studio Secrets manifest used to detect missing cloud environment variables.",
+      "per_host": {
+        "ai-studio-cloud": {
+          "mode": "active",
+          "how": "missingExpectedVars triggers immediate user restore alert"
+        },
+        "antigravity-termux": {
+          "mode": "skip_preserve",
+          "how": "ignore cloud missingExpectedVars alerts; native gh + ~/.omni_agent used"
+        },
+        "ci-runner": {
+          "mode": "skip_preserve",
+          "how": "CI uses GitHub Actions secrets"
+        },
+        "local-ide": {
+          "mode": "skip_preserve",
+          "how": "cloud-only expectation"
+        }
+      }
+    },
+    {
+      "id": "omni-agent-cli",
+      "category": "dual-adapted",
+      "paths": [
+        "agent/omni_agent_client.py",
+        "agent/omni_protocol.py",
+        "agent/bridge_auth.py",
+        "agent/local_capabilities.py",
+        ".agents/bridge_profile.json"
+      ],
+      "purpose": "Unified OmniAgent client, E2E crypto, zero-paste auth & live Android Cavernize/OmniAgent IPC controller.",
+      "per_host": {
+        "ai-studio-cloud": {
+          "mode": "full_cloud_bridge",
+          "how": "git push/pull, Termux shell, CF relay, hot_exec & cavernize-cmd via Hub v6"
+        },
+        "antigravity-termux": {
+          "mode": "android_ipc_and_hot_exec_only",
+          "how": "use ONLY for cavernize-cmd / hot_exec / logcat (auth via ~/.omni_agent/config.json); use native git/gh/fs directly"
+        },
+        "ci-runner": {
+          "mode": "test_only",
+          "how": "run agent/test_omni_agent.py"
+        },
+        "local-ide": {
+          "mode": "android_ipc_and_hot_exec_only",
+          "how": "optional remote Android bridge"
+        }
+      }
+    },
+    {
+      "id": "hot-probe",
+      "category": "dual-adapted",
+      "paths": [
+        "agent/hot_probe_compiler.py"
+      ],
+      "purpose": "Compiles tiny collectible C# IL hot-probes for live W^X RAM execution inside running Android apps.",
+      "per_host": {
+        "ai-studio-cloud": {
+          "mode": "cloud_compile_and_relay",
+          "how": "compiles w/ cached portable dotnet-11 and sends via Hub v6 -> OmniAgent IPC"
+        },
+        "antigravity-termux": {
+          "mode": "local_compile_and_ipc",
+          "how": "compiles locally and invokes live RAM probe via OmniAgent IPC"
+        },
+        "ci-runner": {
+          "mode": "test_only",
+          "how": "unit-tested via agent/test_omni_agent.py"
+        },
+        "local-ide": {
+          "mode": "local_compile_and_ipc",
+          "how": "optional"
+        }
+      }
+    },
+    {
+      "id": "repo-federation",
+      "category": "dual-adapted",
+      "paths": [
+        "agent/repo_federation.py",
+        ".agents/federation.json"
+      ],
+      "purpose": "3-repo ecosystem coordinator across Cavern, OmniAgent, and dynamic-fractal-planner.",
+      "per_host": {
+        "ai-studio-cloud": {
+          "mode": "tarball_mount",
+          "how": "hydrates sibling repos into /tmp/cavern-federation/ at boot"
+        },
+        "antigravity-termux": {
+          "mode": "local_scratch_clones",
+          "how": "resolves sibling repos directly in /root/.gemini/antigravity/scratch/ without /tmp tarballs"
+        },
+        "ci-runner": {
+          "mode": "test_only",
+          "how": "unit-tested via agent/test_omni_agent.py"
+        },
+        "local-ide": {
+          "mode": "local_scratch_clones",
+          "how": "resolves sibling git clones if present"
+        }
+      }
+    },
+    {
+      "id": "direct-cloud-apis",
+      "category": "dual-adapted",
+      "paths": [
+        "agent/github_direct.py",
+        "agent/deploy_worker.py"
+      ],
+      "purpose": "Direct GitHub Git Data API & Cloudflare Workers API clients for gitless/token-based environments.",
+      "per_host": {
+        "ai-studio-cloud": {
+          "mode": "active",
+          "how": "used for direct push, ci-status, and ~1s Cloudflare Worker deploys"
+        },
+        "antigravity-termux": {
+          "mode": "fallback_only",
+          "how": "prefer native git & gh CLI; deploy_worker used only when deploying relay worker"
+        },
+        "ci-runner": {
+          "mode": "test_only",
+          "how": "unit-tested via agent/test_omni_agent.py"
+        },
+        "local-ide": {
+          "mode": "fallback_only",
+          "how": "prefer native git & gh CLI"
+        }
+      }
+    },
+    {
+      "id": "phone-bridge-infra",
+      "category": "phone-daemon",
+      "paths": [
+        "agent/omni_agent_daemon.py",
+        "agent/termux_auto_pilot.py",
+        "agent/install_termux_agent.sh",
+        "worker/cloudflare_live_relay_worker.js"
+      ],
+      "purpose": "Phone Termux daemon, zero-quota Auto-Pilot APK/plugin sync, installer & Cloudflare Unified Hub v6 Worker.",
+      "per_host": {
+        "ai-studio-cloud": {
+          "mode": "remote_target",
+          "how": "receives AI Studio relay commands & keeps AI Studio <-> phone synced"
+        },
+        "antigravity-termux": {
+          "mode": "infra_managed",
+          "how": "background phone infra serving AI Studio & OmniAgent Android loopback; keep compatible when editing"
+        },
+        "ci-runner": {
+          "mode": "test_only",
+          "how": "tested via agent/test_omni_agent.py & agent/test_worker_v4.mjs"
+        },
+        "local-ide": {
+          "mode": "remote_target",
+          "how": "remote phone infra"
+        }
+      }
+    },
+    {
+      "id": "host-matrix-config",
+      "category": "universal",
+      "paths": [
+        ".agents/host_matrix.json"
+      ],
+      "purpose": "Declarative multi-host capability, routing & auto-classification manifest.",
+      "per_host": {
+        "ai-studio-cloud": {
+          "mode": "active",
+          "how": "checked by verify_universal.py & host-boot"
+        },
+        "antigravity-termux": {
+          "mode": "active",
+          "how": "checked by verify_universal.py & host-boot"
+        },
+        "ci-runner": {
+          "mode": "active",
+          "how": "checked by verify_universal.py --all"
+        },
+        "local-ide": {
+          "mode": "active",
+          "how": "checked by verify_universal.py"
+        }
+      }
+    }
+  ]
+}

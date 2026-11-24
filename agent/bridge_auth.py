@@ -199,12 +199,17 @@ def resolve_connection(
     )
     relay_url = ""
     relay_source = "none"
-    for src_name, val in (
+    relay_candidates = [
         ("cli", cli_url),
-        (env_relay_src if env_relay and not env_relay_src.startswith("vault:") else "env", env_relay if not env_relay_src.startswith("vault:") else ""),
+        (
+            env_relay_src if (env_relay and not env_relay_src.startswith(("vault:", "omni_local_config:"))) else "env",
+            env_relay if (env_relay and not env_relay_src.startswith(("vault:", "omni_local_config:"))) else "",
+        ),
         ("vault", vault.get("relayUrl", "")),
+        ("omni_local_config", env_relay if env_relay_src.startswith("omni_local_config:") else ""),
         ("profile", profile.get("relayUrl", "")),
-    ):
+    ]
+    for src_name, val in relay_candidates:
         clean = str(val or "").strip()
         if clean:
             relay_url = proto.validate_https_url(clean)
@@ -219,11 +224,16 @@ def resolve_connection(
     )
     pair_secret = ""
     pair_source = "none"
-    for src_name, val in (
+    pair_candidates = [
         ("cli", cli_pair_secret),
-        (env_pair_src if env_pair and not env_pair_src.startswith("vault:") else "env", env_pair if not env_pair_src.startswith("vault:") else ""),
+        (
+            env_pair_src if (env_pair and not env_pair_src.startswith(("vault:", "omni_local_config:"))) else "env",
+            env_pair if (env_pair and not env_pair_src.startswith(("vault:", "omni_local_config:"))) else "",
+        ),
         ("vault", vault.get("pairSecret", "")),
-    ):
+        ("omni_local_config", env_pair if env_pair_src.startswith("omni_local_config:") else ""),
+    ]
+    for src_name, val in pair_candidates:
         clean = str(val or "").strip()
         if clean:
             pair_secret = proto.normalize_pair_secret_hex(clean)

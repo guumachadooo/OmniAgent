@@ -81,7 +81,7 @@ DEFAULT_MANIFEST: dict[str, Any] = {
                 "scripts/verify_universal.py",
             ],
             "termuxPath": "/root/.gemini/antigravity/scratch/dynamic-fractal-planner",
-            "termuxGlobalPluginPath": "/root/.gemini/antigravity/plugins/dynamic-fractal-planner",
+            "termuxGlobalPluginPath": "/root/.gemini/config/plugins/dynamic-fractal-planner",
             "ciWorkflow": "",
         },
     },
@@ -251,6 +251,11 @@ def get_repo_path(
     cur = detect_current_repo(workspace_root, manifest)
     if alias == cur:
         return Path(workspace_root).resolve()
+    if mount_root is None and not os.environ.get("CAVERN_FEDERATION_ROOT", "").strip():
+        spec = (manifest.get("repos") or {}).get(alias) or {}
+        termux_path = str(spec.get("termuxPath") or "").strip()
+        if termux_path and (Path(termux_path) / ".git").exists():
+            return Path(termux_path).resolve()
     return get_mount_root(manifest, mount_root) / alias
 
 

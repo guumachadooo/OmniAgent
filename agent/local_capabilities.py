@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +34,7 @@ ENV_MANIFEST_PATH = REPO_ROOT / ".agents" / "env_manifest.json"
 RUNTIME_ENV_FILE = Path("/tmp/.cavern_runtime_env.json")
 LEGACY_WORKSPACE_VAULT_PATH = REPO_ROOT / ".agents" / ".bridge_vault.json"
 LOCAL_VAULT_PATH = Path("/tmp/.cavern_bridge_vault.json")
+OMNI_LOCAL_CONFIG_PATH = Path.home() / ".omni_agent" / "config.json"
 
 WHITELISTED_KEYS: tuple[str, ...] = (
     "GITHUB_TOKEN",
@@ -51,6 +53,11 @@ _VAULT_FIELD_MAP: dict[str, str] = {
     "CAVERN_RELAY_URL": "relayUrl",
     "CAVERN_ADMIN_KEY": "adminKey",
     "CAVERN_KNOCK_ID": "knockId",
+}
+
+_OMNI_CONFIG_FIELD_MAP: dict[str, str] = {
+    "CAVERN_BRIDGE_PAIR_SECRET": "pair_secret",
+    "CAVERN_RELAY_URL": "relay_url",
 }
 
 
@@ -99,6 +106,7 @@ def resolve_secret_with_source(
     runtime_file: Path = RUNTIME_ENV_FILE,
     vault_path: Path = LOCAL_VAULT_PATH,
     allow_proc_scan: bool = True,
+    omni_config_path: Path | None = None,
 ) -> tuple[str, str]:
     """Return `(value, source)` for a whitelisted secret without ever logging value."""
     keys = (name,) + tuple(aliases)
@@ -126,7 +134,8 @@ def resolve_secret_with_source(
 
     # 4. Private /tmp vault (fallback to legacy .agents/.bridge_vault.json if present)
     vault = _read_json_safe(vault_path)
-    if not vault and Path(vault_path).resolve() == LOCAL_VAULT_PATH.resolve():
+    is_default_vault = Path(vault_path).resolve() == LOCAL_VAULT_PATH.resolve()
+    if not vault and is_default_vault:
         vault = _read_json_safe(LEGACY_WORKSPACE_VAULT_PATH)
     for k in keys:
         vf = _VAULT_FIELD_MAP.get(k)
@@ -134,6 +143,17 @@ def resolve_secret_with_source(
             val = str(vault.get(vf) or "").strip()
             if val:
                 return val, f"vault:{vf}"
+
+    # 5. Local Termux/Debian OmniAgent daemon config (~/.omni_agent/config.json, read-only)
+    cfg_path = omni_config_path if omni_config_path is not None else (OMNI_LOCAL_CONFIG_PATH if is_default_vault else None)
+    if cfg_path is not None:
+        omni_cfg = _read_json_safe(cfg_path)
+        for k in keys:
+            cf = _OMNI_CONFIG_FIELD_MAP.get(k)
+            if cf:
+                val = str(omni_cfg.get(cf) or "").strip()
+                if val:
+                    return val, f"omni_local_config:{cf}"
 
     return "", "none"
 
@@ -145,6 +165,7 @@ def get_secret(
     runtime_file: Path = RUNTIME_ENV_FILE,
     vault_path: Path = LOCAL_VAULT_PATH,
     allow_proc_scan: bool = True,
+    omni_config_path: Path | None = None,
 ) -> str:
     val, _ = resolve_secret_with_source(
         name,
@@ -152,8 +173,54 @@ def get_secret(
         runtime_file=runtime_file,
         vault_path=vault_path,
         allow_proc_scan=allow_proc_scan,
+        omni_config_path=omni_config_path,
     )
     return val
+
+
+def _load_host_context_module() -> Any:
+    candidates = (
+        REPO_ROOT / ".agents" / "plugins" / "dynamic-fractal-planner" / "scripts",
+        Path(os.environ.get("CAVERN_FEDERATION_ROOT", "/tmp/cavern-federation")) / "fractal" / "scripts",
+        Path.home() / ".gemini" / "config" / "plugins" / "dynamic-fractal-planner" / "scripts",
+    )
+    for c in candidates:
+        if (c / "host_context.py").is_file():
+            if str(c) not in sys.path:
+                sys.path.insert(0, str(c))
+            try:
+                import host_context  # noqa: E402
+                return host_context
+            except Exception:
+                continue
+    return None
+
+
+def detect_runtime_host(
+    *,
+    runtime_file: Path = RUNTIME_ENV_FILE,
+    allow_proc_scan: bool = True,
+    host_override: str = "",
+) -> dict[str, Any]:
+    """Detect effective runtime host while preserving isolated AI Studio unit-test fixtures."""
+    if host_override.strip():
+        hid = host_override.strip()
+        return {"host_id": hid, "reason": "arg:host_override", "is_cloud": hid == "ai-studio-cloud"}
+    if Path(runtime_file) != RUNTIME_ENV_FILE and Path(runtime_file).is_file():
+        return {"host_id": "ai-studio-cloud", "reason": "isolated_runtime_file", "is_cloud": True}
+
+    hc = _load_host_context_module()
+    if hc is not None:
+        return hc.detect_host(REPO_ROOT)
+
+    if any(os.environ.get(k, "").strip() for k in ("ANTIGRAVITY_AGENT", "ANTIGRAVITY_CONVERSATION_ID")):
+        hid = "antigravity-termux" if (os.environ.get("PROOT_L2S_DIR") or Path("/sdcard").is_dir()) else "antigravity-local"
+        return {"host_id": hid, "reason": "env:ANTIGRAVITY", "is_cloud": False}
+    if os.environ.get("GITHUB_ACTIONS", "").lower() == "true" or os.environ.get("CI", "").lower() in ("1", "true"):
+        return {"host_id": "ci-runner", "reason": "env:CI", "is_cloud": False}
+    if str(REPO_ROOT).startswith("/app/applet") or RUNTIME_ENV_FILE.is_file():
+        return {"host_id": "ai-studio-cloud", "reason": "fallback:cloud", "is_cloud": True}
+    return {"host_id": "local-ide", "reason": "fallback:local-ide", "is_cloud": False}
 
 
 def load_env_manifest(manifest_path: Path = ENV_MANIFEST_PATH) -> dict[str, Any]:
@@ -169,15 +236,25 @@ def inspect_capabilities(
     runtime_file: Path = RUNTIME_ENV_FILE,
     vault_path: Path = LOCAL_VAULT_PATH,
     allow_proc_scan: bool = True,
+    omni_config_path: Path | None = None,
+    host_override: str = "",
 ) -> dict[str, Any]:
-    """Return a 100% secret-free capability & missing-variable audit report."""
+    """Return a 100% secret-free host-aware capability & missing-variable audit report."""
     manifest = load_env_manifest(manifest_path)
     var_entries = manifest.get("variables") or []
+    host_info = detect_runtime_host(
+        runtime_file=runtime_file,
+        allow_proc_scan=allow_proc_scan,
+        host_override=host_override,
+    )
+    host_id = str(host_info.get("host_id") or "local-ide")
+    is_cloud = bool(host_info.get("is_cloud"))
 
     present: list[dict[str, Any]] = []
-    missing_expected: list[dict[str, Any]] = []
+    raw_missing_expected: list[dict[str, Any]] = []
     optional_absent: list[str] = []
     present_names: set[str] = set()
+    omni_local_used = False
 
     for item in var_entries:
         name = str(item.get("name") or "").strip()
@@ -190,10 +267,13 @@ def inspect_capabilities(
             runtime_file=runtime_file,
             vault_path=vault_path,
             allow_proc_scan=allow_proc_scan,
+            omni_config_path=omni_config_path,
         )
         expected = bool(item.get("expectedInAiStudio"))
         if val:
             present_names.add(name)
+            if src.startswith("omni_local_config:"):
+                omni_local_used = True
             present.append(
                 {
                     "name": name,
@@ -203,7 +283,7 @@ def inspect_capabilities(
                 }
             )
         elif expected:
-            missing_expected.append(
+            raw_missing_expected.append(
                 {
                     "name": name,
                     "capability": item.get("capability", ""),
@@ -220,33 +300,24 @@ def inspect_capabilities(
     has_relay = "CAVERN_RELAY_URL" in present_names
 
     dotnet_cached = Path("/root/.cache/cavern-android-ref/dotnet-11/dotnet").is_file() or bool(shutil.which("dotnet"))
-
-    routing = {
-        "githubPush": "local_github_api" if has_gh else "phone_omniagent",
-        "githubCiInspect": "local_github_api" if has_gh else "public_readonly_or_phone",
-        "cloudflareWorkerDeploy": "local_cloudflare_api" if has_cf else "phone_omniagent",
-        "omniAgentAuth": "local_zero_knock" if (has_pair and has_relay) else "smart_knock_biometric",
-        "localBuildAndTests": {
-            "mode": "local",
-            "python3": bool(shutil.which("python3")),
-            "node": bool(shutil.which("node")),
-            "gcc": bool(shutil.which("gcc")),
-            "dotnet11CiParity": dotnet_cached,
-        },
-        "phoneOnly": [
-            "hot_exec (live S25U Cavernize RAM C# probe)",
-            "cavernize-cmd (live S25U audio/UI/SelfAudit IPC)",
-            "ag-sync / git_pull (sync Termux Antigravity mirror & repo)",
-            "install-apk / logcat / shell (live S25U device ops)",
-        ],
-    }
+    gh_hosts_file = Path.home() / ".config" / "gh" / "hosts.yml"
+    has_native_git = (REPO_ROOT / ".git").exists()
+    has_gh_cli = (gh_hosts_file.is_file() and gh_hosts_file.stat().st_size > 0) or has_gh
+    has_local_dotnet = Path("/root/.dotnet/dotnet").is_file() or dotnet_cached
+    has_sdcard = Path("/sdcard").is_dir()
+    cfg_probe = omni_config_path if omni_config_path is not None else OMNI_LOCAL_CONFIG_PATH
+    has_local_omni_cfg = cfg_probe.is_file()
 
     fed_mount = Path(os.environ.get("CAVERN_FEDERATION_ROOT", "/tmp/cavern-federation"))
     fed_manifest = _read_json_safe(REPO_ROOT / ".agents" / "federation.json")
     fed_repos: dict[str, Any] = {}
+    local_scratch_repos: dict[str, bool] = {}
     for alias, spec in (fed_manifest.get("repos") or {}).items():
         if isinstance(spec, dict):
-            mp = fed_mount / alias
+            termux_p = str(spec.get("termuxPath") or "").strip()
+            local_git_ok = bool(termux_p and (Path(termux_p) / ".git").exists())
+            local_scratch_repos[alias] = local_git_ok
+            mp = Path(termux_p) if (not is_cloud and local_git_ok) else (fed_mount / alias)
             fed_repos[alias] = {
                 "ownerRepo": spec.get("ownerRepo", ""),
                 "branch": spec.get("branch", "main"),
@@ -254,21 +325,78 @@ def inspect_capabilities(
                 "ready": mp.exists(),
             }
 
-    return {
+    if is_cloud:
+        missing_expected = raw_missing_expected
+        alert_str = (
+            "MISSING_EXPECTED_ENV_VARS: Ask user to restore: "
+            + ", ".join(m["name"] for m in missing_expected)
+            if missing_expected
+            else ""
+        )
+        omni_auth = "local_zero_knock" if (has_pair and has_relay) else "smart_knock_biometric"
+        routing: dict[str, Any] = {
+            "githubPush": "local_github_api" if has_gh else "phone_omniagent",
+            "githubCiInspect": "local_github_api" if has_gh else "public_readonly_or_phone",
+            "cloudflareWorkerDeploy": "local_cloudflare_api" if has_cf else "phone_omniagent",
+            "omniAgentAuth": omni_auth,
+            "localBuildAndTests": {
+                "mode": "local",
+                "python3": bool(shutil.which("python3")),
+                "node": bool(shutil.which("node")),
+                "gcc": bool(shutil.which("gcc")),
+                "dotnet11CiParity": dotnet_cached,
+            },
+            "phoneOnly": [
+                "hot_exec (live S25U Cavernize RAM C# probe)",
+                "cavernize-cmd (live S25U audio/UI/SelfAudit IPC)",
+                "ag-sync / git_pull (sync Termux Antigravity mirror & repo)",
+                "install-apk / logcat / shell (live S25U device ops)",
+            ],
+        }
+    else:
+        missing_expected = []
+        alert_str = ""
+        if has_pair and has_relay:
+            omni_auth = "local_omni_config" if omni_local_used else "local_zero_knock"
+        else:
+            omni_auth = "smart_knock_biometric"
+        routing = {
+            "githubPush": "native_git" if has_native_git else ("local_github_api" if has_gh else "phone_omniagent"),
+            "githubCiInspect": "native_gh_cli" if has_gh_cli else "public_readonly_or_phone",
+            "cloudflareWorkerDeploy": "local_cloudflare_api" if has_cf else "phone_omniagent",
+            "omniAgentAuth": omni_auth,
+            "omniAgentScope": "android_ipc_and_hot_exec_only",
+            "federationMode": "local_scratch_clones" if any(local_scratch_repos.values()) else "tarball_mount",
+            "flightRecorder": "skip_native_git",
+            "previewShim": "skip_preserve_only",
+            "localBuildAndTests": {
+                "mode": "local",
+                "python3": bool(shutil.which("python3")),
+                "node": bool(shutil.which("node")),
+                "gcc": bool(shutil.which("gcc")),
+                "dotnet11CiParity": has_local_dotnet,
+            },
+            "phoneOnly": [
+                "hot_exec (live S25U Cavernize RAM C# probe via OmniAgent IPC)",
+                "cavernize-cmd (live S25U audio/UI/SelfAudit IPC via OmniAgent)",
+            ],
+        }
+
+    out: dict[str, Any] = {
         "ok": True,
         "ownerRepo": manifest.get("ownerRepo", "guumachadooo/Cavern"),
         "defaultBranch": manifest.get("defaultBranch", "master"),
+        "hostProfile": {
+            "hostId": host_id,
+            "reason": host_info.get("reason", ""),
+            "ignoreCloudEnvAlerts": not is_cloud,
+        },
         "presentCount": len(present),
         "presentVars": present,
         "missingExpectedCount": len(missing_expected),
         "missingExpectedVars": missing_expected,
         "optionalAbsentVars": optional_absent,
-        "alert": (
-            "MISSING_EXPECTED_ENV_VARS: Ask user to restore: "
-            + ", ".join(m["name"] for m in missing_expected)
-            if missing_expected
-            else ""
-        ),
+        "alert": alert_str,
         "routing": routing,
         "federation": {
             "mountRoot": str(fed_mount),
@@ -276,6 +404,17 @@ def inspect_capabilities(
             "repos": fed_repos,
         },
     }
+    if not is_cloud:
+        out["aiStudioExpectedVarsMissing"] = [m["name"] for m in raw_missing_expected]
+        out["nativeCapabilities"] = {
+            "git": has_native_git,
+            "ghCliAuthed": has_gh_cli,
+            "localDotnet": has_local_dotnet,
+            "sdcard": has_sdcard,
+            "localOmniConfig": has_local_omni_cfg,
+            "localScratchRepos": local_scratch_repos,
+        }
+    return out
 
 
 if __name__ == "__main__":

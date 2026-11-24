@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "models": {
+    "gemini-pro-orchestrator-neon": {
+      "mode": "lean",
+      "source": "native_plan_tool",
+      "why": "Observed native exit_plan_mode",
+      "raw_model": "gemini-pro-orchestrator-neon",
+      "updated_ts": 1795516048
+    }
+  },
+  "pending": {}
+}

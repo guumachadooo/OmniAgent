@@ -370,6 +370,17 @@ def cmd_push_workspace(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
 
+    if (
+        via == "auto"
+        and (repo_root / ".git").exists()
+        and not local_gh_token
+        and any(os.environ.get(k, "").strip() for k in ("ANTIGRAVITY_AGENT", "ANTIGRAVITY_CONVERSATION_ID"))
+    ):
+        msg = "Local Antigravity host has native .git repo; run `git commit && git push` directly (or pass `--via phone` to force relay push)."
+        print(f"INFO: {msg}", file=sys.stderr)
+        print(json.dumps({"ok": False, "host": "antigravity", "routing": "native_git", "message": msg}, indent=2))
+        return 1
+
     relay, secret, admin = _resolve_auth(args, allow_knock=True)
     channel = pick_channel(relay, secret, args.channel, admin)
 
@@ -920,6 +931,21 @@ def main() -> int:
 
     if args.action == "capabilities":
         report = lcap.inspect_capabilities()
+        try:
+            import host_context  # noqa: E402
+
+            hid = str((report.get("hostProfile") or {}).get("hostId") or "local-ide")
+            report["baton"] = host_context.detect_baton_state(REPO_ROOT, hid)
+            aud = host_context.audit_host_matrix(REPO_ROOT)
+            report["hostMatrixCoverage"] = {
+                "present": aud.get("present", False),
+                "ok": aud.get("ok", True),
+                "entries": aud.get("entry_count", 0),
+                "unclassifiedCount": len(aud.get("unclassified") or []),
+                "staleCount": len(aud.get("stale") or []),
+            }
+        except Exception:
+            pass
         print(json.dumps(report, indent=2, ensure_ascii=False))
         return 0
     if args.action == "ci-status":

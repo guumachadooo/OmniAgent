@@ -1,0 +1,331 @@
+{
+  "schema_version": 5,
+  "plugin_version": "2.14.0",
+  "docs_format_version": 1,
+  "project_name": "OmniAgent",
+  "planner_mode": "auto",
+  "auto_mode": {
+    "overrides": {}
+  },
+  "read_budget": {
+    "max_full_read_lines": 300,
+    "max_slice_lines": 250
+  },
+  "secret_guard": {
+    "enabled": true
+  },
+  "blast_radius": {
+    "simple_tier_max_files": 3
+  },
+  "code_weight_limits": {
+    "enabled": true,
+    "warn_lines": 1200,
+    "warn_lines_all": 2000
+  },
+  "memory_weight_limits": {
+    "project_history_max_lines": 150,
+    "project_history_max_kb": 28,
+    "external_sync_max_kb": 48
+  },
+  "file_budget_limits": {
+    "enabled": true,
+    "warn_files": 850,
+    "fail_files": 920,
+    "hard_platform_cap": 999
+  },
+  "code_path_prefixes": [
+    "OmniAgentAndroid/",
+    "agent/",
+    "worker/",
+    ".github/workflows/"
+  ],
+  "code_extensions": [
+    ".cs",
+    ".csproj",
+    ".xml",
+    ".yml",
+    ".yaml",
+    ".py",
+    ".js",
+    ".mjs",
+    ".sh"
+  ],
+  "build_extensions": [
+    ".py",
+    ".js",
+    ".mjs",
+    ".cs",
+    ".csproj"
+  ],
+  "extra_requests_file": ".agents/docs/EXTRA_REQUESTS.md",
+  "session": {
+    "version_files": [
+      {
+        "label": "csproj",
+        "path": "OmniAgentAndroid/OmniAgentAndroid.csproj",
+        "regex": "<ApplicationDisplayVersion>([^<]+)</ApplicationDisplayVersion>",
+        "sync_prefix": true
+      },
+      {
+        "label": "CI",
+        "path": ".github/workflows/BuildOmniAgent.yml",
+        "regex": "-p:ApplicationDisplayVersion=\"?([^\"\\n\\\\]+)",
+        "sync_prefix": true
+      }
+    ],
+    "env_notes": [
+      {
+        "conditions": {
+          "exists_path": "/root/.dotnet/dotnet"
+        },
+        "text": "PRoot `.NET`: `DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1 DOTNET_GCHeapHardLimit=20000000 -m:1 /p:UseSharedCompilation=false`; APK: `BuildOmniAgent.yml`."
+      }
+    ]
+  },
+  "memory_feedback": {
+    "enabled": true,
+    "min_code_files": 2,
+    "docs": [
+      ".agents/docs/PROJECT_HISTORY.md",
+      ".agents/docs/SAVED_IDEAS.md",
+      "AGENTS.md"
+    ]
+  },
+  "file_guards": [
+    {
+      "path_suffix": "OmniAgentAndroid/Properties/AndroidManifest.xml",
+      "check_when_touching_regex": "targetSdkVersion",
+      "must_contain_regex": "android:targetSdkVersion\\s*=\\s*\"(?:35|36)\"",
+      "decision": "force_ask",
+      "verify_severity": "fail",
+      "reason": "PROJECT SAFETY GUARD: AndroidManifest.xml must keep android:targetSdkVersion=\"35\" (35 or 36) for Modern Android Scoped Storage, Foreground Service, and Predictive Back compliance."
+    }
+  ],
+  "command_guards": [
+    {
+      "conditions": {
+        "exists_path": "/root/.dotnet/dotnet",
+        "not_exists_glob": "/root/.dotnet/packs/Microsoft.Android*"
+      },
+      "match_regex": "^(?:/root/\\.dotnet/)?dotnet\\s+(?:build|publish|test|pack|restore|run)\\b",
+      "forbid_args_regex": "(?:OmniAgentAndroid\\.csproj|net11\\.0-android|InstallAndroidDependencies)",
+      "reason": "Local Termux ARM64 PRoot lacks the Android SDK / `net11.0-android` workload. Build signed APK via `.github/workflows/BuildOmniAgent.yml`."
+    },
+    {
+      "conditions": {
+        "exists_path": "/root/.dotnet/dotnet"
+      },
+      "match_regex": "^(?:/root/\\.dotnet/)?dotnet\\s+(?:build|publish|test|pack|restore|run)\\b",
+      "require_env_vars": [
+        "DOTNET_GCHeapHardLimit",
+        "DOTNET_SYSTEM_GLOBALIZATION_INVARIANT"
+      ],
+      "reason": "CoreCLR fails in Termux ARM64 PRoot without required env vars ({missing}). Run with:\nDOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1 DOTNET_GCHeapHardLimit=20000000 DOTNET_EnableDiagnostics=0 /root/.dotnet/dotnet <subcommand> -m:1 /p:UseSharedCompilation=false"
+    }
+  ],
+  "diff_rules": [
+    {
+      "path_prefix": "OmniAgentAndroid/",
+      "path_regex": "\\.cs$",
+      "forbid_regex": "\\bAlertDialog\\b",
+      "severity": "fail",
+      "message": "Legacy `AlertDialog` detected; use `OneUiModalDialog` instead."
+    },
+    {
+      "path_prefix": "OmniAgentAndroid/",
+      "path_regex": "\\.cs$",
+      "forbid_regex": "\\bnew\\s+(?:Android\\.Widget\\.)?Spinner\\s*\\(",
+      "severity": "fail",
+      "message": "Stock `Spinner` detected; use `OneUiInlineSelector` instead."
+    },
+    {
+      "path_prefix": "OmniAgentAndroid/",
+      "path_regex": "\\.cs$",
+      "forbid_regex": "\\b(?:SetStatusBarColor|SetNavigationBarColor|SystemUiVisibility)\\b",
+      "severity": "fail",
+      "message": "Deprecated SystemUI/Window bar color API detected; use WindowInsets / WindowInsetsController Edge-to-Edge APIs."
+    },
+    {
+      "path_prefix": "OmniAgentAndroid/",
+      "path_regex": "\\.cs$",
+      "forbid_regex": "\\bAllCaps\\s*=",
+      "severity": "fail",
+      "message": "`.NET Android` `TextView`/`Button` exposes `SetAllCaps(bool)` method, not an `AllCaps` property."
+    },
+    {
+      "path_prefix": "OmniAgentAndroid/",
+      "path_regex": "\\.cs$",
+      "forbid_regex": "\\bBuild\\.VERSION\\.SdkInt\\s*(?:>=|<=|>|<|==|!=)",
+      "severity": "warn",
+      "message": "Prefer `OperatingSystem.IsAndroidVersionAtLeast(N)` over `Build.VERSION.SdkInt` comparisons so Roslyn CA1416/CA1422 platform analyzers recognize the OS guard."
+    },
+    {
+      "path_prefix": "OmniAgentAndroid/Properties/",
+      "path_regex": "AndroidManifest\\.xml$",
+      "forbid_regex": "requestLegacyExternalStorage",
+      "severity": "fail",
+      "message": "requestLegacyExternalStorage is forbidden on targetSdkVersion >= 35; use MediaStore/SAF Scoped Storage."
+    }
+  ],
+  "build_rules": [
+    {
+      "label": "OmniAgent Python Suite",
+      "command": "python3 -B agent/test_omni_agent.py",
+      "trigger_extensions": [
+        ".py",
+        ".js",
+        ".mjs"
+      ],
+      "run_on_force": true
+    },
+    {
+      "label": "Cloudflare Worker v6 Tests",
+      "command": "node --test agent/test_worker_v4.mjs",
+      "trigger_extensions": [
+        ".js",
+        ".mjs"
+      ],
+      "run_on_force": true
+    }
+  ],
+  "domains": {
+    "agent-infra": {
+      "module_id": "MOD-AGENT-INFRA",
+      "module_title": "OmniAgent Bridge, Cloudflare Hub v6 & 3-Repo Federation",
+      "lens": "Principal Distributed Systems & Security Engineer (0-dep Python3/Node stdlib, E2E Encrypt-then-MAC, non-secret profiles, 3-repo mirror parity)",
+      "keywords": [
+        "omniagent",
+        "hub",
+        "cloudflare",
+        "worker",
+        "relay",
+        "knock",
+        "federation",
+        "flight_recorder",
+        "live_sync",
+        "daemon",
+        "auto_pilot",
+        "termux",
+        "ai_studio",
+        "hot_exec",
+        "hot_probe",
+        "bridge",
+        "crypto",
+        "biometric",
+        "strongbox",
+        "ecdsa",
+        "host_matrix",
+        "sync-mirrors"
+      ],
+      "checklist": [
+        "Keep `agent/*.py` & `.agents/preview/server.mjs` zero-third-party-dep stdlib only; never store secrets in `bridge_profile.json`, `env_manifest.json`, or `federation.json`.",
+        "Preserve Encrypt-then-MAC / StrongBox ECDSA auth contracts & sync shared mirrors to Cavern (`repos sync-mirrors`) when changing `agent/` or `worker/`.",
+        "Classify any new script/config in `.agents/host_matrix.json` via `plan_tool.py host-classify <path> --apply` and run `agent/test_omni_agent.py` + `agent/test_worker_v4.mjs`."
+      ]
+    },
+    "build-ci": {
+      "module_id": "MOD-SHIP",
+      "module_title": "Version Sync, Commit, Worker Deploy & APK Release",
+      "lens": "Release & CI Reliability Engineer (synced ApplicationDisplayVersion, shared cavernize keystore IPC, auto-advancing releases)",
+      "is_ship": true,
+      "keywords": [
+        "build",
+        "apk",
+        "release",
+        "github actions",
+        "buildomniagent",
+        "ota",
+        "version",
+        "commit",
+        "push",
+        "deliver",
+        "signing",
+        "keystore",
+        "ci",
+        "workflow",
+        "deploy-worker"
+      ],
+      "checklist": [
+        "Read `.agents/docs/EXTRA_REQUESTS.md` FIRST; resolve pending items before shipping.",
+        "Keep `ApplicationDisplayVersion` prefix synced (`OmniAgentAndroid.csproj` & `BuildOmniAgent.yml`) and preserve `.github/signing/cavernize.keystore.b64` same-signature IPC.",
+        "Publish `v2.1.<run>` (`make_latest: true`) + `omniagent-latest` OTA alias (`make_latest: false`) and run `verify_universal.py --all` pre-push."
+      ]
+    },
+    "media-native": {
+      "module_id": "MOD-MEDIA-NATIVE",
+      "module_title": "OmniAgentAndroid One UI 9, Biometric Overlay & Cavernize IPC",
+      "lens": "Android Platform & One UI 9 Systems Engineer (API 35+ FGS/JobScheduler, StrongBox BiometricPrompt, <10ms same-signature Cavernize IPC)",
+      "keywords": [
+        "androidmanifest",
+        "targetsdk",
+        "selinux",
+        "foreground",
+        "jobscheduler",
+        "biometricprompt",
+        "oneui",
+        "sharedoneui",
+        "omnilogger",
+        "ipc",
+        "cavernizeipc",
+        "filesdir",
+        "scoped storage",
+        "windowinsets",
+        "onbackinvoked",
+        "receiver",
+        "pendingintent"
+      ],
+      "checklist": [
+        "Keep `android:targetSdkVersion >= 35`, `hu.sbence.cavern.omniagent` package ID, and `SharedOneUi/` parity with Cavern's One UI 9 Design Kit.",
+        "Use `OperatingSystem.IsAndroidVersionAtLeast(N)` in scope for versioned APIs, `OneUiModalDialog`/`OneUiInlineSelector`, and `WindowInsets` Edge-to-Edge."
+      ]
+    }
+  },
+  "plugin_evolution": {
+    "enabled": true,
+    "auto_sync_higher_version": true,
+    "plugin_path": ".agents/plugins/dynamic-fractal-planner",
+    "plugin_sync_doc": ".agents/plugins/dynamic-fractal-planner/.agents/docs/EXTERNAL_AI_SYNC.md",
+    "host_sync_doc": ".agents/docs/EXTERNAL_AI_SYNC.md"
+  },
+  "delegation": {
+    "enabled": true,
+    "thin_coordinator_min_tier": 2,
+    "max_subagent_reply_lines": 20,
+    "require_explicit_model": true,
+    "prefer_cheap_models": true,
+    "enforce_google_only": true,
+    "exempt_subagent_types": [
+      "image-generator"
+    ],
+    "model_tiers": {
+      "trivial": "flash_lite",
+      "routine": "flash",
+      "complex": "pro"
+    },
+    "allowed_model_vendors": [
+      "google",
+      "gemini"
+    ],
+    "blocked_model_patterns": [
+      "claude",
+      "anthropic",
+      "opus",
+      "sonnet",
+      "haiku",
+      "gpt-",
+      "gpt4",
+      "gpt5",
+      "chatgpt",
+      "openai",
+      "o1-",
+      "o3-",
+      "o4-",
+      "codex"
+    ],
+    "sequential_proot_ops": [
+      "dotnet_build",
+      "heavy_tests",
+      "git_push"
+    ]
+  }
+}

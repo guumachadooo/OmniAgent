@@ -17,6 +17,7 @@ away from AI Studio sessions:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -32,6 +33,10 @@ DEFAULT_STATE_FILE = Path("/root/.omni_agent/auto_pilot_state.json")
 DEFAULT_VERIFY_CACHE = Path("/root/.omni_agent/last_verify.json")
 DEFAULT_DOWNLOAD_DIR = Path("/sdcard/Download")
 DEFAULT_CAVERN_REPO = Path("/root/.gemini/antigravity/scratch/Cavern")
+DEFAULT_OMNIAGENT_REPO = Path("/root/.gemini/antigravity/scratch/OmniAgent")
+DEFAULT_FRACTAL_REPO = Path("/root/.gemini/antigravity/scratch/dynamic-fractal-planner")
+_PLUGIN_EXCLUDE_DIRS = frozenset({".git", "__pycache__", ".diagnostics", ".agents", "node_modules", ".last_good_backup"})
+_PLUGIN_EXCLUDE_FILES = frozenset({".metrics.jsonl", ".model_modes.json", ".hook_state.json", ".workspaces.json", "package.json", "AGENTS.md"})
 
 WATCHED_REPOS = (
     {
@@ -207,14 +212,139 @@ def run_preverify_if_head_changed(repo: Path, state: dict[str, Any], verify_cach
     return digest
 
 
-def run_once(state_file: Path, verify_cache: Path, repo: Path, do_verify: bool) -> dict[str, Any]:
+def _plugin_roots() -> tuple[Path, ...]:
+    gemini_home = Path(os.environ.get("GEMINI_HOME") or (Path.home() / ".gemini"))
+    candidates = (
+        DEFAULT_FRACTAL_REPO,
+        gemini_home / "config" / "plugins" / "dynamic-fractal-planner",
+        DEFAULT_CAVERN_REPO / ".agents" / "plugins" / "dynamic-fractal-planner",
+        DEFAULT_OMNIAGENT_REPO / ".agents" / "plugins" / "dynamic-fractal-planner",
+    )
+    return tuple(p for p in candidates if p.is_dir())
+
+
+def _compute_plugin_fingerprint(roots: tuple[Path, ...]) -> str:
+    h = hashlib.sha256()
+    for root in roots:
+        h.update(f"ROOT|{root}\n".encode("utf-8"))
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = sorted(d for d in dirnames if d not in _PLUGIN_EXCLUDE_DIRS)
+            for fn in sorted(filenames):
+                if fn in _PLUGIN_EXCLUDE_FILES or fn.endswith((".pyc", ".pyo")):
+                    continue
+                fp = Path(dirpath) / fn
+                try:
+                    st = fp.stat()
+                except OSError:
+                    continue
+                rel = fp.relative_to(root).as_posix()
+                h.update(f"{rel}|{st.st_size}|{st.st_mtime_ns}\n".encode("utf-8"))
+    return h.hexdigest()
+
+
+def _resolve_plan_tool() -> Path | None:
+    gemini_home = Path(os.environ.get("GEMINI_HOME") or (Path.home() / ".gemini"))
+    for p in (
+        gemini_home / "config" / "plugins" / "dynamic-fractal-planner" / "scripts" / "plan_tool.py",
+        DEFAULT_FRACTAL_REPO / "scripts" / "plan_tool.py",
+        DEFAULT_CAVERN_REPO / ".agents" / "plugins" / "dynamic-fractal-planner" / "scripts" / "plan_tool.py",
+    ):
+        if p.is_file():
+            return p
+    return None
+
+
+def sync_plugins_if_changed(state: dict[str, Any]) -> dict[str, Any]:
+    roots = _plugin_roots()
+    if not roots:
+        return {"status": "no_plugin_roots"}
+    fp = _compute_plugin_fingerprint(roots)
+    if fp == state.get("lastPluginSyncFingerprint"):
+        return {"status": "unchanged", "fingerprint": fp[:12]}
+
+    plan_tool = _resolve_plan_tool()
+    if plan_tool is None:
+        return {"status": "no_plan_tool"}
+
+    probe = subprocess.run(
+        [sys.executable, "-B", str(plan_tool), "evolve", "sync-all", "--json"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    if probe.returncode != 0:
+        return {
+            "status": "probe_failed",
+            "exitCode": probe.returncode,
+            "tail": (probe.stdout + "\n" + probe.stderr).strip()[-300:],
+        }
+
+    needs_sync = True
+    try:
+        pdata = json.loads(probe.stdout)
+        if isinstance(pdata, dict):
+            has_drift = bool(
+                pdata.get("drift")
+                or pdata.get("dirty")
+                or pdata.get("needsSync")
+                or pdata.get("needs_sync")
+                or pdata.get("outOfSync")
+                or pdata.get("out_of_sync")
+                or pdata.get("changes")
+                or pdata.get("pending")
+                or pdata.get("actions")
+                or pdata.get("dirtyRepos")
+            )
+            explicit_clean = (
+                pdata.get("inSync") is True
+                or pdata.get("in_sync") is True
+                or pdata.get("status") in ("clean", "in_sync", "unchanged", "ok")
+            )
+            if explicit_clean and not has_drift:
+                needs_sync = False
+    except Exception:
+        pass
+
+    if not needs_sync:
+        state["lastPluginSyncFingerprint"] = fp
+        return {"status": "in_sync", "fingerprint": fp[:12]}
+
+    applied = subprocess.run(
+        [sys.executable, "-B", str(plan_tool), "evolve", "sync-all", "--apply", "--push"],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    if applied.returncode != 0:
+        tail = [ln.strip() for ln in (applied.stdout + "\n" + applied.stderr).splitlines() if ln.strip()][-8:]
+        return {"status": "sync_failed", "exitCode": applied.returncode, "tail": tail}
+
+    new_fp = _compute_plugin_fingerprint(_plugin_roots())
+    state["lastPluginSyncFingerprint"] = new_fp
+    state["lastPluginSyncUnix"] = int(time.time())
+    return {"status": "synced", "fingerprint": new_fp[:12]}
+
+
+def run_once(
+    state_file: Path,
+    verify_cache: Path,
+    repo: Path,
+    do_verify: bool,
+    do_sync_plugins: bool = False,
+) -> dict[str, Any]:
     state = _load_json(state_file)
     token = _gh_token()
     results = [check_and_download_release(item, state, token) for item in WATCHED_REPOS]
     verify_res = run_preverify_if_head_changed(repo, state, verify_cache) if do_verify else {"status": "skipped"}
+    sync_res = sync_plugins_if_changed(state) if do_sync_plugins else None
     state["lastTickUnix"] = int(time.time())
     _save_json(state_file, state)
-    return {"ok": True, "releases": results, "preVerify": verify_res}
+    out: dict[str, Any] = {"ok": True, "releases": results, "preVerify": verify_res}
+    if sync_res is not None:
+        out["pluginSync"] = sync_res
+    return out
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -222,6 +352,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--daemon", action="store_true", help="Loop continuously in background")
     parser.add_argument("--interval", type=int, default=90, help="Poll interval seconds (default 90s; ETag 304 = 0 quota)")
     parser.add_argument("--with-preverify", action="store_true", help="Also pre-run check_android_cs.py on new git HEAD")
+    parser.add_argument("--sync-plugins", action="store_true", help="Opt-in zero-quota plugin sync on drift/dirty changes")
     parser.add_argument("--state-file", default=str(DEFAULT_STATE_FILE))
     parser.add_argument("--verify-cache", default=str(DEFAULT_VERIFY_CACHE))
     parser.add_argument("--repo", default=str(DEFAULT_CAVERN_REPO))
@@ -232,14 +363,14 @@ def main(argv: list[str] | None = None) -> int:
     repo = Path(args.repo)
 
     if not args.daemon:
-        res = run_once(state_file, verify_cache, repo, bool(args.with_preverify))
+        res = run_once(state_file, verify_cache, repo, bool(args.with_preverify), bool(args.sync_plugins))
         print(json.dumps(res, indent=2, ensure_ascii=False))
         return 0
 
     interval = max(30, int(args.interval))
     while True:
         try:
-            run_once(state_file, verify_cache, repo, bool(args.with_preverify))
+            run_once(state_file, verify_cache, repo, bool(args.with_preverify), bool(args.sync_plugins))
         except Exception as exc:
             sys.stderr.write(f"[auto_pilot] tick error: {exc}\n")
         time.sleep(interval)

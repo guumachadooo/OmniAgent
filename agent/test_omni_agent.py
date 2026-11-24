@@ -785,6 +785,94 @@ class OmniAgentProtocolTests(unittest.TestCase):
                 srv.shutdown()
                 srv.server_close()
 
+    def test_host_aware_capabilities_antigravity_vs_aistudio_and_local_omni_config(self) -> None:
+        import os
+        import local_capabilities as lcap
+        import repo_federation as rfed
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            manifest = root / "env_manifest.json"
+            rt_missing = root / "nonexistent_rt_env.json"
+            vault = root / "vault.json"
+            omni_cfg = root / "omni_config.json"
+
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "schema": 1,
+                        "ownerRepo": "guumachadooo/Cavern",
+                        "defaultBranch": "master",
+                        "variables": [
+                            {"name": "GITHUB_TOKEN", "aliases": ["GH_TOKEN"], "expectedInAiStudio": True, "capability": "githubDirectPushAndCi"},
+                            {"name": "CLOUDFLARE_API_TOKEN", "aliases": [], "expectedInAiStudio": True, "capability": "cloudflareDirectDeploy"},
+                            {"name": "CAVERN_BRIDGE_PAIR_SECRET", "aliases": [], "expectedInAiStudio": True, "capability": "omniAgentZeroKnockAuth"},
+                            {"name": "CAVERN_RELAY_URL", "aliases": [], "expectedInAiStudio": True, "capability": "omniAgentZeroKnockAuth"},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            omni_cfg.write_text(
+                json.dumps({"pair_secret": "cd" * 32, "relay_url": "https://omni-test.workers.dev"}),
+                encoding="utf-8",
+            )
+
+            ag_rep = lcap.inspect_capabilities(
+                manifest_path=manifest,
+                runtime_file=rt_missing,
+                vault_path=vault,
+                allow_proc_scan=False,
+                omni_config_path=omni_cfg,
+                host_override="antigravity-termux",
+            )
+            self.assertEqual(ag_rep["hostProfile"]["hostId"], "antigravity-termux")
+            self.assertEqual(ag_rep["missingExpectedCount"], 0)
+            self.assertEqual(ag_rep["missingExpectedVars"], [])
+            self.assertEqual(ag_rep["alert"], "")
+            self.assertEqual(ag_rep["routing"]["githubPush"], "native_git")
+            self.assertEqual(ag_rep["routing"]["omniAgentAuth"], "local_omni_config")
+            self.assertEqual(ag_rep["routing"]["omniAgentScope"], "android_ipc_and_hot_exec_only")
+            self.assertIn("GITHUB_TOKEN", ag_rep["aiStudioExpectedVarsMissing"])
+            self.assertNotIn("cd" * 32, json.dumps(ag_rep))
+
+            empty_cfg = root / "empty_omni_config.json"
+            cloud_rep = lcap.inspect_capabilities(
+                manifest_path=manifest,
+                runtime_file=rt_missing,
+                vault_path=vault,
+                allow_proc_scan=False,
+                omni_config_path=empty_cfg,
+                host_override="ai-studio-cloud",
+            )
+            self.assertEqual(cloud_rep["hostProfile"]["hostId"], "ai-studio-cloud")
+            self.assertEqual(cloud_rep["missingExpectedCount"], 4)
+            self.assertIn("GITHUB_TOKEN", cloud_rep["alert"])
+
+            # repo_federation.get_repo_path prefers existing local git termuxPath when mount_root=None
+            ws_cav = root / "ws_cavern"
+            (ws_cav / "Cavern").mkdir(parents=True)
+            (ws_cav / "Cavern" / "Cavern.csproj").write_text("<Project/>", encoding="utf-8")
+            (ws_cav / "CavernSamples" / "CavernizeAndroid").mkdir(parents=True)
+            (ws_cav / "CavernSamples" / "CavernizeAndroid" / "CavernizeAndroid.csproj").write_text("<Project/>", encoding="utf-8")
+            local_omni = root / "local_omni_git"
+            (local_omni / ".git").mkdir(parents=True)
+            fake_manifest = {
+                "mountRoot": str(root / "fed_mount"),
+                "repos": {
+                    "cavern": {"detectFiles": ["Cavern/Cavern.csproj", "CavernSamples/CavernizeAndroid/CavernizeAndroid.csproj"]},
+                    "omniagent": {"detectFiles": ["OmniAgentAndroid/OmniAgentAndroid.csproj"], "termuxPath": str(local_omni)},
+                },
+            }
+            prev_fed = os.environ.pop("CAVERN_FEDERATION_ROOT", None)
+            try:
+                self.assertEqual(rfed.get_repo_path("omniagent", ws_cav, fake_manifest, mount_root=None), local_omni.resolve())
+                explicit_mount = root / "explicit_mount"
+                self.assertEqual(rfed.get_repo_path("omniagent", ws_cav, fake_manifest, mount_root=explicit_mount), explicit_mount / "omniagent")
+            finally:
+                if prev_fed is not None:
+                    os.environ["CAVERN_FEDERATION_ROOT"] = prev_fed
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

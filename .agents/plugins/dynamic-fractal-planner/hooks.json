@@ -1,0 +1,89 @@
+{
+  "dynamic-fractal-planner": {
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "python3 ./hooks/planner_session_start.py",
+        "timeout": 5
+      }
+    ],
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "python3 ./hooks/planner_pre_invocation.py",
+        "timeout": 8
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "read_file|view_file",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ./hooks/planner_guard_read.py",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "edit_file|write_file|replace_file_content|write_to_file",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ./hooks/planner_guard_files.py",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "run_command",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ./hooks/planner_guard_command.py",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "enter_plan_mode|exit_plan_mode",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ./hooks/planner_post_tool.py --pre",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "invoke_subagent|swarm|run_workflow",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ./hooks/planner_guard_delegation.py",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "read_file|view_file|edit_file|write_file|replace_file_content|write_to_file|run_command|enter_plan_mode|exit_plan_mode",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ./hooks/planner_post_tool.py",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "python3 ./hooks/planner_stop.py",
+        "timeout": 5
+      }
+    ]
+  }
+}
