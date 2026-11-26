@@ -50,6 +50,7 @@ public sealed class OmniAgentForegroundService : Service {
         "cf_status",
         "cf_deploy_worker",
         "cavernize_cmd",
+        "cavernize_watchdog",
         "install_apk_url",
         "launch_termux_daemon",
         "termux_run",
@@ -691,6 +692,7 @@ public sealed class OmniAgentForegroundService : Service {
                         : 45;
                     (bool ipcOk, string ipcBody, long ipcElapsedMs) = await CavernizeIpcBridgeClient.SendCommandAsync(
                         context, subCmd, subArgsJson, maxTier, timeoutSec, ct).ConfigureAwait(false);
+                    CavernizeIpcBridgeClient.NoteExternalIpcOutcome(ipcOk, ipcBody);
                     OmniSettingsStore.AppendActivity(ipcOk ? "IPC" : "ERR", $"cavernize_cmd '{subCmd}' ({ipcElapsedMs}ms, ok={ipcOk})");
                     return new {
                         ok = ipcOk,
@@ -699,6 +701,18 @@ public sealed class OmniAgentForegroundService : Service {
                         elapsedMs = ipcElapsedMs,
                         body = ipcBody
                     };
+                }
+
+                case "cavernize_watchdog": {
+                    int timeoutSec = argsEl.ValueKind == JsonValueKind.Object && argsEl.TryGetProperty("timeoutSec", out JsonElement toEl) && toEl.TryGetInt32(out int parsedTo)
+                        ? Math.Clamp(parsedTo, 2, 15)
+                        : 6;
+                    bool resetBaseline = argsEl.ValueKind == JsonValueKind.Object &&
+                        argsEl.TryGetProperty("resetBaseline", out JsonElement rbEl) &&
+                        rbEl.ValueKind == JsonValueKind.True;
+                    object wd = await CavernizeIpcBridgeClient.ProbeCavernizeWatchdogAsync(
+                        context, timeoutSec, resetBaseline, ct).ConfigureAwait(false);
+                    return wd;
                 }
 
                 case "github_push_bundle": {

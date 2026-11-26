@@ -34,6 +34,15 @@ public static class CavernizeIpcBridgeClient {
     static long cachedSigCheckedMs;
     static bool cachedSigResult;
 
+    static readonly object watchdogLock = new();
+    static int watchdogLastPid;
+    static string watchdogLastSessionId = "";
+    static string watchdogLastAliveUtc = "";
+    static int watchdogConsecutiveTimeouts;
+    static int watchdogPidChanges;
+    static int watchdogTotalProbes;
+    static string watchdogLastError = "";
+
     /// <summary>
     /// Verifies that <c>CavernizeAndroid</c> is installed and signed by the exact same release keystore certificate.
     /// Cached for 30s to avoid repeated PackageManager Binder IPC on the UI thread.
@@ -113,7 +122,8 @@ public static class CavernizeIpcBridgeClient {
             intent.PutExtra(ExtraReplyPackage, context.PackageName);
             context.SendBroadcast(intent, BridgePermission);
 
-            Task completed = await Task.WhenAny(tcs.Task, Task.Delay(TimeSpan.FromSeconds(Math.Clamp(timeoutSeconds, 5, 180)), ct)).ConfigureAwait(false);
+            int clampedTimeout = Math.Clamp(timeoutSeconds, 2, 180);
+            Task completed = await Task.WhenAny(tcs.Task, Task.Delay(TimeSpan.FromSeconds(clampedTimeout), ct)).ConfigureAwait(false);
             if (completed == tcs.Task) {
                 return await tcs.Task.ConfigureAwait(false);
             }
@@ -123,6 +133,183 @@ public static class CavernizeIpcBridgeClient {
         }
     }
 
+
+
+    /// <summary>
+    /// Updates external OmniAgent IPC health counters whenever any <c>cavernize_cmd</c> completes or times out.
+    /// </summary>
+    public static void NoteExternalIpcOutcome(bool ok, string detail) {
+        lock (watchdogLock) {
+            if (ok) {
+                watchdogConsecutiveTimeouts = 0;
+                watchdogLastAliveUtc = DateTime.UtcNow.ToString("O");
+                watchdogLastError = "";
+            } else if (!string.IsNullOrEmpty(detail) &&
+                       detail.Contains("timed out", StringComparison.OrdinalIgnoreCase)) {
+                watchdogConsecutiveTimeouts++;
+                watchdogLastError = detail.Length > 220 ? detail[..220] : detail;
+            }
+        }
+    }
+
+    /// <summary>
+    /// External Q2 Cavernize PID, heartbeat &amp; ANR timeout watchdog executed inside OmniAgent's isolated process.
+    /// Detects frozen/ANR main-thread deadlocks (bounded ping timeout) and silent crash-restarts (PID/sessionId change)
+    /// even when Cavernize itself cannot emit logs or telemetry.
+    /// </summary>
+    public static async Task<object> ProbeCavernizeWatchdogAsync(
+        Context context,
+        int timeoutSeconds = 6,
+        bool resetBaseline = false,
+        CancellationToken ct = default) {
+        if (resetBaseline) {
+            lock (watchdogLock) {
+                watchdogLastPid = 0;
+                watchdogLastSessionId = "";
+                watchdogConsecutiveTimeouts = 0;
+                watchdogPidChanges = 0;
+                watchdogLastError = "";
+            }
+        }
+        if (context == null || !OmniAgentForegroundService.IsPackageInstalled(context, CavernizePackage)) {
+            return new {
+                ok = false,
+                state = "NOT_INSTALLED",
+                alive = false,
+                pid = 0,
+                prevPid = 0,
+                sessionId = "",
+                prevSessionId = "",
+                pidRestarted = false,
+                consecutiveTimeouts = 0,
+                pidChanges = 0,
+                elapsedMs = 0L,
+                detail = "Cavernize Android is not installed."
+            };
+        }
+        if (!IsSignatureVerified(context)) {
+            return new {
+                ok = false,
+                state = "SIGNATURE_MISMATCH",
+                alive = false,
+                pid = 0,
+                prevPid = 0,
+                sessionId = "",
+                prevSessionId = "",
+                pidRestarted = false,
+                consecutiveTimeouts = 0,
+                pidChanges = 0,
+                elapsedMs = 0L,
+                detail = "Cavernize APK signature mismatch."
+            };
+        }
+
+        int probeTimeout = Math.Clamp(timeoutSeconds, 2, 15);
+        System.Diagnostics.Stopwatch sw = System.Diagnostics.Stopwatch.StartNew();
+        (bool ipcOk, string body, long ipcElapsedMs) = await SendCommandAsync(
+            context, "ping", "{}", maxTier: 0, timeoutSeconds: probeTimeout, ct).ConfigureAwait(false);
+        sw.Stop();
+        long elapsedMs = ipcElapsedMs > 0 ? ipcElapsedMs : sw.ElapsedMilliseconds;
+
+        int curPid = 0;
+        string curSid = "";
+        string appVer = "";
+        bool uiHost = false;
+        if (ipcOk && !string.IsNullOrWhiteSpace(body)) {
+            try {
+                using JsonDocument doc = JsonDocument.Parse(body);
+                JsonElement root = doc.RootElement;
+                if (root.TryGetProperty("pid", out JsonElement pidEl) && pidEl.TryGetInt32(out int parsedPid)) {
+                    curPid = parsedPid;
+                }
+                if (root.TryGetProperty("sessionId", out JsonElement sidEl)) {
+                    curSid = sidEl.GetString() ?? "";
+                }
+                if (root.TryGetProperty("appVersion", out JsonElement verEl)) {
+                    appVer = verEl.GetString() ?? "";
+                }
+                if (root.TryGetProperty("uiHostAttached", out JsonElement uiEl) &&
+                    (uiEl.ValueKind == JsonValueKind.True || uiEl.ValueKind == JsonValueKind.False)) {
+                    uiHost = uiEl.GetBoolean();
+                }
+            } catch {
+                // Non-JSON reply still treated via ipcOk
+            }
+        }
+
+        int prevPid;
+        string prevSid;
+        bool pidRestarted = false;
+        int consecTimeouts;
+        int totalChanges;
+        int totalProbes;
+        string lastAlive;
+        string state;
+        string detail;
+
+        lock (watchdogLock) {
+            watchdogTotalProbes++;
+            totalProbes = watchdogTotalProbes;
+            prevPid = watchdogLastPid;
+            prevSid = watchdogLastSessionId;
+
+            if (!ipcOk) {
+                watchdogConsecutiveTimeouts++;
+                consecTimeouts = watchdogConsecutiveTimeouts;
+                totalChanges = watchdogPidChanges;
+                lastAlive = watchdogLastAliveUtc;
+                state = "UNRESPONSIVE_ANR";
+                detail = string.IsNullOrWhiteSpace(body)
+                    ? $"Cavernize failed to reply to external watchdog ping within {probeTimeout}s"
+                    : (body.Length > 260 ? body[..260] : body);
+                watchdogLastError = detail;
+            } else {
+                watchdogConsecutiveTimeouts = 0;
+                consecTimeouts = 0;
+                bool pidChanged = prevPid > 0 && curPid > 0 && curPid != prevPid;
+                bool sidChanged = !string.IsNullOrEmpty(prevSid) && !string.IsNullOrEmpty(curSid) &&
+                                  !string.Equals(prevSid, curSid, StringComparison.Ordinal);
+                if (pidChanged || sidChanged) {
+                    pidRestarted = true;
+                    watchdogPidChanges++;
+                }
+                if (curPid > 0) {
+                    watchdogLastPid = curPid;
+                }
+                if (!string.IsNullOrEmpty(curSid)) {
+                    watchdogLastSessionId = curSid;
+                }
+                watchdogLastAliveUtc = DateTime.UtcNow.ToString("O");
+                watchdogLastError = "";
+                totalChanges = watchdogPidChanges;
+                lastAlive = watchdogLastAliveUtc;
+                state = pidRestarted ? "PID_RESTARTED_CRASH" : "ALIVE";
+                detail = pidRestarted
+                    ? $"Cavernize process restarted externally (pid {prevPid}->{curPid}, sid '{prevSid}'->'{curSid}')"
+                    : $"Cavernize alive (pid={curPid}, sid={curSid}, uiHost={uiHost}, {elapsedMs}ms)";
+            }
+        }
+
+        OmniLogger.Info("WATCHDOG", $"cavernize_watchdog state={state} pid={curPid} sid={curSid} elapsed={elapsedMs}ms");
+        return new {
+            ok = ipcOk && !pidRestarted,
+            state,
+            alive = ipcOk,
+            pid = curPid,
+            prevPid,
+            sessionId = curSid,
+            prevSessionId = prevSid,
+            pidRestarted,
+            consecutiveTimeouts = consecTimeouts,
+            pidChanges = totalChanges,
+            totalProbes,
+            lastAliveUtc = lastAlive,
+            uiHostAttached = uiHost,
+            appVersion = appVer,
+            elapsedMs,
+            detail
+        };
+    }
 
     /// <summary>
     /// Queries same-signature CavernizeAndroid over local Broadcast IPC (<c>get_omni_bootstrap</c>)
