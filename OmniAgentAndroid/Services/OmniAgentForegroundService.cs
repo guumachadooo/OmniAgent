@@ -3,6 +3,7 @@ using System.Text.Json;
 
 using Android.App;
 using Android.Content;
+using Android.Net;
 using Android.OS;
 
 using Path = System.IO.Path;
@@ -19,7 +20,7 @@ namespace OmniAgentAndroid.Services;
 [Service(
     Exported = true,
     Permission = CavernizeIpcBridgeClient.BridgePermission,
-    ForegroundServiceType = Android.Content.PM.ForegroundService.TypeDataSync)]
+    ForegroundServiceType = Android.Content.PM.ForegroundService.TypeRemoteMessaging | Android.Content.PM.ForegroundService.TypeDataSync)]
 public sealed class OmniAgentForegroundService : Service {
     public const string TermuxRunCommandPermission = "com.termux.permission.RUN_COMMAND";
     public const string ActionBindBridge = "hu.sbence.cavern.omniagent.BIND_BRIDGE";
@@ -27,7 +28,7 @@ public sealed class OmniAgentForegroundService : Service {
     const string ChannelId = "omni_agent_foreground";
     const string ActionStop = "hu.sbence.cavern.omniagent.ACTION_STOP";
 
-    const string AgentVersion = "2.1.0";
+    const string AgentVersion = "2.2.0";
 
     public sealed class OmniAgentBinder : Binder {
         public OmniAgentForegroundService Service { get; }
@@ -62,12 +63,15 @@ public sealed class OmniAgentForegroundService : Service {
     static volatile bool isRunning;
     static volatile int commandsHandled;
     static int activeLoopFlag;
+    static volatile bool forceImmediateHeartbeat;
+    static string lastExitReason = "startup";
     public static bool IsRunning => isRunning;
     public static int CommandsHandled => commandsHandled;
     public static event Action StateChanged;
 
     readonly IBinder binder;
     CancellationTokenSource cts;
+    ConnectivityManager.NetworkCallback networkCallback;
 
     public OmniAgentForegroundService() {
         binder = new OmniAgentBinder(this);
@@ -109,7 +113,11 @@ public sealed class OmniAgentForegroundService : Service {
         }
         OmniWatchdogJobService.Schedule(appCtx);
         if (fromBackground) {
-            OmniWatchdogJobService.ScheduleUserInitiated(appCtx);
+            if (IsBatteryUnrestricted(appCtx) && !isRunning) {
+                Start(appCtx);
+            } else {
+                OmniWatchdogJobService.ScheduleUserInitiated(appCtx);
+            }
         } else if (!isRunning) {
             Start(appCtx);
         }
@@ -205,8 +213,9 @@ public sealed class OmniAgentForegroundService : Service {
             return StartCommandResult.NotSticky;
         }
 
+        RegisterNetworkRecoveryCallback();
         StartPollLoopIfNeeded(isForegroundService: true);
-        return StartCommandResult.NotSticky;
+        return StartCommandResult.Sticky;
     }
 
     void StartPollLoopIfNeeded(bool isForegroundService) {
@@ -249,6 +258,7 @@ public sealed class OmniAgentForegroundService : Service {
     }
 
     void HandleTimeout(int startId) {
+        lastExitReason = $"fgs_timeout_{startId}";
         OmniSettingsStore.AppendActivity("AGENT", $"Foreground timeout reached (startId={startId}); stopping FGS cleanly & handing off to JobScheduler.");
         try {
             cts?.Cancel();
@@ -269,6 +279,7 @@ public sealed class OmniAgentForegroundService : Service {
 
     public override void OnDestroy() {
         isRunning = false;
+        UnregisterNetworkRecoveryCallback();
         try {
             cts?.Cancel();
             cts?.Dispose();
@@ -340,12 +351,19 @@ public sealed class OmniAgentForegroundService : Service {
                     lastHealthProbe = DateTime.UtcNow;
                 }
 
-                if ((DateTime.UtcNow - lastHb).TotalSeconds >= heartbeatSec) {
+                bool hbDue = forceImmediateHeartbeat || (DateTime.UtcNow - lastHb).TotalSeconds >= heartbeatSec;
+                if (hbDue) {
                     try {
-                        await SendHeartbeatAsync(appCtx, baseUrl, devHash, agentKey, store, ct).ConfigureAwait(false);
-                        lastHb = DateTime.UtcNow;
+                        bool hbOk = await SendHeartbeatAsync(appCtx, baseUrl, devHash, agentKey, store, ct).ConfigureAwait(false);
+                        if (hbOk) {
+                            lastHb = DateTime.UtcNow;
+                            forceImmediateHeartbeat = false;
+                        } else {
+                            lastHb = DateTime.UtcNow.AddSeconds(-(heartbeatSec - 10));
+                        }
                     } catch (Exception hbEx) when (hbEx is not System.OperationCanceledException) {
                         OmniLogger.Warn("BRIDGE", $"Heartbeat failed: {hbEx.Message}");
+                        lastHb = DateTime.UtcNow.AddSeconds(-(heartbeatSec - 10));
                     }
                 }
 
@@ -411,7 +429,8 @@ public sealed class OmniAgentForegroundService : Service {
         }
     }
 
-    static async Task SendHeartbeatAsync(Context context, string baseUrl, string devHash, string agentKey, OmniSettingsStore store, CancellationToken ct) {
+    static async Task<bool> SendHeartbeatAsync(Context context, string baseUrl, string devHash, string agentKey, OmniSettingsStore store, CancellationToken ct) {
+        bool battUnrestricted = IsBatteryUnrestricted(context);
         using HttpRequestMessage req = CreateAgentReq(HttpMethod.Post, $"{baseUrl}/v1/agent/heartbeat", devHash, agentKey);
         object payload = new {
             agentVersion = AgentVersion,
@@ -419,11 +438,15 @@ public sealed class OmniAgentForegroundService : Service {
             device = $"{Build.Manufacturer} {Build.Model}".Trim(),
             securityMode = store.SecurityMode,
             repoPath = store.GitHubRepo,
+            fgsMode = OperatingSystem.IsAndroidVersionAtLeast(34) ? "remoteMessaging" : "dataSync",
+            batteryUnrestricted = battUnrestricted,
+            androidSdk = (int)Build.VERSION.SdkInt,
+            lastExitReason = lastExitReason,
             tools = new {
                 githubDirectPush = store.HasGitHubPat,
                 cloudflareDeployReady = store.HasCloudflareToken,
                 overlayPermissionGranted = OmniKnockApprovalActivity.CanDrawInstantOverlay(context),
-                batteryUnrestricted = IsBatteryUnrestricted(context),
+                batteryUnrestricted = battUnrestricted,
                 apkInstaller = true,
                 termuxInstalled = IsPackageInstalled(context, "com.termux"),
                 termuxPermissionGranted = HasTermuxPermission(context),
@@ -433,7 +456,48 @@ public sealed class OmniAgentForegroundService : Service {
             capabilities = Capabilities
         };
         req.Content = new StringContent(JsonSerializer.Serialize(payload), System.Text.Encoding.UTF8, "application/json");
-        using HttpResponseMessage _ = await http.SendAsync(req, ct).ConfigureAwait(false);
+        using HttpResponseMessage resp = await http.SendAsync(req, ct).ConfigureAwait(false);
+        if (!resp.IsSuccessStatusCode) {
+            OmniLogger.Warn("BRIDGE", $"Heartbeat HTTP {(int)resp.StatusCode}");
+            return false;
+        }
+        return true;
+    }
+
+    sealed class BridgeNetworkCallback : ConnectivityManager.NetworkCallback {
+        public override void OnAvailable(Network network) {
+            base.OnAvailable(network);
+            forceImmediateHeartbeat = true;
+        }
+    }
+
+    void RegisterNetworkRecoveryCallback() {
+        if (!OperatingSystem.IsAndroidVersionAtLeast(24) || networkCallback != null) {
+            return;
+        }
+        try {
+            if (GetSystemService(ConnectivityService) is ConnectivityManager cm) {
+                networkCallback = new BridgeNetworkCallback();
+                cm.RegisterDefaultNetworkCallback(networkCallback);
+            }
+        } catch {
+            networkCallback = null;
+        }
+    }
+
+    void UnregisterNetworkRecoveryCallback() {
+        if (networkCallback == null) {
+            return;
+        }
+        try {
+            if (GetSystemService(ConnectivityService) is ConnectivityManager cm) {
+                cm.UnregisterNetworkCallback(networkCallback);
+            }
+        } catch {
+            // Ignore
+        } finally {
+            networkCallback = null;
+        }
     }
 
     static async Task HandleSmartKnockAsync(Context context, string baseUrl, string devHash, string pairHex, JsonElement knockEl, CancellationToken ct) {
@@ -975,7 +1039,9 @@ public sealed class OmniAgentForegroundService : Service {
     }
 
     void StartForegroundCompat(int id, Notification n) {
-        if (OperatingSystem.IsAndroidVersionAtLeast(29)) {
+        if (OperatingSystem.IsAndroidVersionAtLeast(34)) {
+            StartForeground(id, n, Android.Content.PM.ForegroundService.TypeRemoteMessaging);
+        } else if (OperatingSystem.IsAndroidVersionAtLeast(29)) {
             StartForeground(id, n, Android.Content.PM.ForegroundService.TypeDataSync);
         } else {
             StartForeground(id, n);

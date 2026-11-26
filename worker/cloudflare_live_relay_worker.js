@@ -30,8 +30,10 @@ const KNOCK_RATE_WINDOW_SECONDS = 900; // 15 min anti-spam rate window
 const KNOCK_MAX_PER_WINDOW = 3; // max 3 knocks per 15 min per mailbox
 const KNOCK_DEFAULT_DENY_COOLDOWN = 900; // 15 min automatic lockout on deny
 const TELEMETRY_TTL_SECONDS = 14 * 24 * 3600; // 14 days automatic KV hygiene
-const AGENT_PRESENCE_TTL_SECONDS = 420; // 7 min presence TTL (supports economical 180s KV fallback & 60s DO heartbeats)
-const AGENT_CMD_TTL_SECONDS = 300; // 5 min command queue TTL
+const AGENT_PRESENCE_TTL_SECONDS = 420; // 7 min online window (supports 60s DO & 180s KV heartbeats)
+const AGENT_PRESENCE_HISTORY_TTL_SECONDS = 7 * 24 * 3600; // 7-day presence history retention for offline root-cause visibility
+const AGENT_STANDBY_REACHABLE_SECONDS = 1800; // 30 min standby-reachable window (covers 15-min Android watchdog cycle)
+const AGENT_CMD_TTL_SECONDS = 900; // 15 min command queue TTL (survives full Android JobScheduler watchdog window)
 const AGENT_RESULT_TTL_SECONDS = 600; // 10 min result TTL
 const BLOB_TTL_SECONDS = 1800; // 30 min chunked transfer TTL
 const SWARM_TTL_SECONDS = 24 * 3600; // 24h swarm task TTL
@@ -205,6 +207,35 @@ async function loadSwarmIndex(store, idxKey) {
 }
 
 /**
+ * Evaluates live online/standby status from stored presence history without discarding lastSeenUtc.
+ * @param {string} channel
+ * @param {string | null} rawEntry
+ * @param {number} [nowMs=Date.now()]
+ * @returns {Record<string, any>}
+ */
+function decoratePresence(channel, rawEntry, nowMs = Date.now()) {
+  if (!rawEntry) {
+    return { channel, online: false, standbyReachable: false, ageSeconds: null, lastSeenUtc: null };
+  }
+  try {
+    const rec = JSON.parse(rawEntry);
+    const parsedMs = Date.parse(rec && typeof rec.lastSeenUtc === "string" ? rec.lastSeenUtc : "");
+    const ageSeconds = Number.isFinite(parsedMs) ? Math.max(0, Math.round((nowMs - parsedMs) / 1000)) : null;
+    const online = ageSeconds !== null && ageSeconds <= AGENT_PRESENCE_TTL_SECONDS;
+    const standbyReachable = ageSeconds !== null && ageSeconds <= AGENT_STANDBY_REACHABLE_SECONDS;
+    return {
+      ...rec,
+      channel,
+      online,
+      standbyReachable,
+      ageSeconds,
+    };
+  } catch (_err) {
+    return { channel, online: false, standbyReachable: false, ageSeconds: null, lastSeenUtc: null };
+  }
+}
+
+/**
  * Strongly-consistent TTL key-value wrapper backed by Durable Object SQLite storage + hot RAM cache.
  * Zero 60s negative cache, zero KV write quota consumption.
  */
@@ -331,11 +362,15 @@ async function handleRealtimeRoutes(request, url, path, store) {
     const queueKey = `${chanPrefix}queue`;
     const resPrefix = `${chanPrefix}res:`;
 
-    // A1. Agent presence heartbeat
+    // A1. Agent presence heartbeat (stored with 7-day history TTL; online state computed dynamically from ageSeconds)
     if (request.method === "POST" && path === "/v1/agent/heartbeat") {
       const parsed = await readBoundedJson(request, 64 * 1024);
       if (parsed.error) return jsonResp({ ok: false, error: parsed.error }, parsed.status);
       const d = parsed.data || {};
+      const toolsObj = d.tools && typeof d.tools === "object" ? d.tools : {};
+      const battUnrestricted = typeof d.batteryUnrestricted === "boolean"
+        ? d.batteryUnrestricted
+        : (typeof toolsObj.batteryUnrestricted === "boolean" ? toolsObj.batteryUnrestricted : null);
       const presence = {
         channel,
         online: true,
@@ -345,15 +380,25 @@ async function handleRealtimeRoutes(request, url, path, store) {
         device: String(d.device || "").slice(0, 80),
         securityMode: String(d.securityMode || "smart").slice(0, 24),
         repoPath: String(d.repoPath || "").slice(0, 180),
-        tools: d.tools && typeof d.tools === "object" ? d.tools : {},
+        fgsMode: String(d.fgsMode || "").slice(0, 40),
+        batteryUnrestricted: battUnrestricted,
+        androidSdk: Number.isFinite(Number(d.androidSdk)) && Number(d.androidSdk) > 0 ? Number(d.androidSdk) : null,
+        lastExitReason: String(d.lastExitReason || "").slice(0, 80),
+        tools: toolsObj,
         capabilities: Array.isArray(d.capabilities) ? d.capabilities.slice(0, 64) : [],
       };
-      await store.put(presenceKey, JSON.stringify(presence), { expirationTtl: AGENT_PRESENCE_TTL_SECONDS });
-      return jsonResp({ ok: true, channel, ttlSeconds: AGENT_PRESENCE_TTL_SECONDS });
+      await store.put(presenceKey, JSON.stringify(presence), { expirationTtl: AGENT_PRESENCE_HISTORY_TTL_SECONDS });
+      return jsonResp({
+        ok: true,
+        channel,
+        ttlSeconds: AGENT_PRESENCE_TTL_SECONDS,
+        historyTtlSeconds: AGENT_PRESENCE_HISTORY_TTL_SECONDS,
+      });
     }
 
-    // A2. Query status for one channel or all known channels
+    // A2. Query status for one channel or all known channels (preserves lastSeenUtc + ageSeconds even when offline)
     if (request.method === "GET" && path === "/v1/agent/status") {
+      const nowMs = Date.now();
       if (url.searchParams.get("all") === "1") {
         const extra = (url.searchParams.get("channels") || "")
           .split(",")
@@ -364,17 +409,19 @@ async function handleRealtimeRoutes(request, url, path, store) {
         /** @type {Record<string, any>} */
         const channels = {};
         for (let i = 0; i < list.length; i++) {
-          const rawEntry = entries[i];
-          channels[list[i]] = rawEntry ? JSON.parse(rawEntry) : { channel: list[i], online: false };
+          channels[list[i]] = decoratePresence(list[i], entries[i], nowMs);
         }
         return jsonResp({ ok: true, channels });
       }
       const raw = await store.get(presenceKey);
+      const decorated = decoratePresence(channel, raw, nowMs);
       return jsonResp({
         ok: true,
         channel,
-        online: Boolean(raw),
-        presence: raw ? JSON.parse(raw) : null,
+        online: Boolean(decorated.online),
+        standbyReachable: Boolean(decorated.standbyReachable),
+        ageSeconds: decorated.ageSeconds,
+        presence: raw ? decorated : null,
       });
     }
 
@@ -1153,6 +1200,10 @@ export default {
         supportsChunkedBlobs: true,
         supportsSwarmBus: true,
         supportsHotExec: true,
+        supportsPresenceHistory: true,
+        presenceOnlineTtlSec: AGENT_PRESENCE_TTL_SECONDS,
+        presenceHistoryTtlSec: AGENT_PRESENCE_HISTORY_TTL_SECONDS,
+        cmdTtlSec: AGENT_CMD_TTL_SECONDS,
       });
     }
 

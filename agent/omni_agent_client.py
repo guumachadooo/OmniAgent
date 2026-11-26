@@ -147,7 +147,16 @@ def cmd_connect(args: argparse.Namespace) -> int:
             st_a, a_resp = proto.http_json("GET", f"{conn['relayUrl']}/v1/agent/status?all=1", headers, timeout=12)
             if st_a == 200 and a_resp.get("ok"):
                 summary["channels"] = {
-                    k: {"online": bool(v.get("online")), "device": v.get("device", ""), "mode": v.get("securityMode", "")}
+                    k: {
+                        "online": bool(v.get("online")),
+                        "standbyReachable": bool(v.get("standbyReachable")),
+                        "ageSeconds": v.get("ageSeconds"),
+                        "lastSeenUtc": v.get("lastSeenUtc"),
+                        "device": v.get("device", ""),
+                        "mode": v.get("securityMode", ""),
+                        "fgsMode": v.get("fgsMode", ""),
+                        "batteryUnrestricted": v.get("batteryUnrestricted"),
+                    }
                     for k, v in (a_resp.get("channels") or {}).items()
                 }
         caps = lcap.inspect_capabilities()
@@ -206,6 +215,55 @@ def cmd_connect(args: argparse.Namespace) -> int:
     return 0
 
 
+def wake_linux_daemon(
+    relay_url: str,
+    pair_secret_hex: str,
+    admin_key: str = "",
+    *,
+    wait_sec: float = 15.0,
+    poll_interval: float = 1.5,
+) -> dict[str, Any]:
+    """Wake sleeping Termux/Debian PRoot daemon via OmniAgent Android `launch_termux_daemon` (single-shot, bounded wait)."""
+    if _is_channel_online(relay_url, pair_secret_hex, "termux", admin_key):
+        return {"ok": True, "alreadyOnline": True, "woke": False, "channel": "termux"}
+    if not _is_channel_online(relay_url, pair_secret_hex, "android", admin_key):
+        return {"ok": False, "alreadyOnline": False, "woke": False, "error": "android channel is offline; cannot dispatch launch_termux_daemon"}
+
+    dispatch = send_agent_command(
+        relay_url,
+        pair_secret_hex,
+        "launch_termux_daemon",
+        {},
+        channel="android",
+        admin_key=admin_key,
+        timeout_sec=25,
+        auto_wake=False,
+    )
+    if not dispatch.get("ok"):
+        return {
+            "ok": False,
+            "alreadyOnline": False,
+            "woke": False,
+            "dispatch": dispatch,
+            "error": str(dispatch.get("error") or dispatch.get("message") or "launch_termux_daemon failed"),
+        }
+
+    deadline = time.time() + max(1.0, float(wait_sec))
+    while time.time() < deadline:
+        if _is_channel_online(relay_url, pair_secret_hex, "termux", admin_key):
+            return {"ok": True, "alreadyOnline": False, "woke": True, "channel": "termux", "dispatch": dispatch}
+        time.sleep(min(max(0.2, poll_interval), max(0.05, deadline - time.time())))
+    online = _is_channel_online(relay_url, pair_secret_hex, "termux", admin_key)
+    return {
+        "ok": online,
+        "alreadyOnline": False,
+        "woke": online,
+        "channel": "termux",
+        "dispatch": dispatch,
+        "error": "" if online else f"Dispatched launch_termux_daemon, but termux did not heartbeat within {wait_sec:.0f}s",
+    }
+
+
 def send_agent_command(
     relay_url: str,
     pair_secret_hex: str,
@@ -214,7 +272,15 @@ def send_agent_command(
     channel: str = "termux",
     admin_key: str = "",
     timeout_sec: int = 120,
+    auto_wake: bool = True,
 ) -> dict[str, Any]:
+    # Single-shot auto-wake if a Linux/Termux command is invoked while Termux is sleeping and Android is online
+    if auto_wake and channel in ("termux", "debian"):
+        if not _is_channel_online(relay_url, pair_secret_hex, channel, admin_key):
+            if _is_channel_online(relay_url, pair_secret_hex, "android", admin_key):
+                print(f"[omni-agent] Channel '{channel}' is asleep — auto-waking Linux/PRoot via android launch_termux_daemon...", file=sys.stderr)
+                wake_linux_daemon(relay_url, pair_secret_hex, admin_key=admin_key, wait_sec=15.0)
+
     headers = proto.derive_agent_headers(pair_secret_hex, channel=channel, admin_key=admin_key)
     req_id = f"r_{int(time.time())}_{secrets.token_hex(6)}"
     payload = {"cmd": cmd, "args": args_obj or {}, "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
@@ -260,10 +326,28 @@ def pick_channel(relay_url: str, pair_secret_hex: str, preferred: str, admin_key
     st, resp = proto.http_json("GET", f"{relay_url}/v1/agent/status?all=1", headers, timeout=15)
     if st == 200 and resp.get("ok"):
         chans = resp.get("channels") or {}
-        for c in ("termux", "debian", "android"):
+        for c in ("termux", "debian", "android", "cavernize"):
             if (chans.get(c) or {}).get("online"):
                 return c
     return "termux"
+
+
+def pick_cavernize_channel(relay_url: str, pair_secret_hex: str, preferred: str = "auto", admin_key: str = "") -> str:
+    """Select best live transport for Cavernize commands: online 'android' IPC -> direct 'cavernize' channel."""
+    if preferred in ("android", "cavernize"):
+        return preferred
+    try:
+        headers = proto.derive_agent_headers(pair_secret_hex, channel="termux", admin_key=admin_key)
+        st, resp = proto.http_json("GET", f"{relay_url}/v1/agent/status?all=1", headers, timeout=10)
+        if st == 200 and resp.get("ok"):
+            chans = resp.get("channels") or {}
+            if (chans.get("android") or {}).get("online"):
+                return "android"
+            if (chans.get("cavernize") or {}).get("online"):
+                return "cavernize"
+    except Exception:
+        pass
+    return "android"
 
 
 def cmd_push_workspace(args: argparse.Namespace) -> int:
@@ -612,14 +696,21 @@ def cmd_hot_exec(args: argparse.Namespace) -> int:
 
     via = getattr(args, "via", "auto")
     code = (args.code_session or os.environ.get("CAVERN_SESSION_CODE") or "").strip()
-    use_android_ipc = via == "android" or (via == "auto" and not code and _is_channel_online(relay, secret, "android", admin))
-    if use_android_ipc:
+    target_cav_chan = ""
+    if via in ("android", "cavernize"):
+        target_cav_chan = via
+    elif via == "auto" and not code:
+        if _is_channel_online(relay, secret, "android", admin):
+            target_cav_chan = "android"
+        elif _is_channel_online(relay, secret, "cavernize", admin):
+            target_cav_chan = "cavernize"
+    if target_cav_chan:
         res = send_agent_command(
             relay,
             secret,
             "cavernize_cmd",
             build_cavernize_cmd_payload("hot_exec", hot_args, tier=2, timeout_sec=max(90, args.timeout + 30)),
-            channel="android",
+            channel=target_cav_chan,
             admin_key=admin,
             timeout_sec=max(90, args.timeout + 30),
         )
@@ -780,6 +871,8 @@ def main() -> int:
 
     sub.add_parser("status", help="Check online status of all agent channels (termux, android, debian)")
     sub.add_parser("ping", help="Ping target agent channel and print detected tools/environment")
+    p_wl = sub.add_parser("wake-linux", help="Wake sleeping Termux/Debian PRoot daemon via OmniAgent Android `launch_termux_daemon`")
+    p_wl.add_argument("--wait", type=float, default=15.0, help="Seconds to wait for termux channel heartbeat (default 15s)")
 
     p_cmd = sub.add_parser("cmd", help="Send any arbitrary OmniAgent command + JSON args")
     p_cmd.add_argument("name")
@@ -849,7 +942,7 @@ def main() -> int:
     p_hot.add_argument("--entry-type", default="")
     p_hot.add_argument("--args-json", default="{}")
     p_hot.add_argument("--code-session", default="", help="Optional existing Live Bridge CAV-... code")
-    p_hot.add_argument("--via", choices=("auto", "android", "bridge"), default="auto", help="Transport: auto prefers online android IPC channel")
+    p_hot.add_argument("--via", choices=("auto", "android", "cavernize", "bridge"), default="auto", help="Transport: auto prefers online android IPC, then direct cavernize channel")
     p_hot.add_argument("--with-android-refs", action="store_true", help="Opt-in Android TypeCheck refs (default False; use reflection on device)")
     p_hot.add_argument("--no-android-refs", action="store_true", help="Compat flag (already default)")
     p_hot.add_argument("--compile-only", action="store_true")
@@ -893,7 +986,13 @@ def main() -> int:
     p_cav.add_argument("--tier", type=int, default=2, choices=(0, 1, 2))
 
     p_cp = sub.add_parser("checkpoint", help="Anti-Cancellation 3-tier Session Flight Recorder (forwards to flight_recorder.py)")
-    p_cp.add_argument("fr_args", nargs=argparse.REMAINDER, help="Arguments passed directly to flight_recorder.py (init|save|recover|restore|status|close)")
+    p_cp.add_argument("fr_args", nargs=argparse.REMAINDER, help="Arguments passed directly to flight_recorder.py (init|save|pin|resume|recover|restore|status|close)")
+
+    p_rsm = sub.add_parser("resume", help="1-shot zero-waste parallel session resume packet (forwards to flight_recorder.py resume)")
+    p_rsm.add_argument("fr_args", nargs=argparse.REMAINDER, help="Flags forwarded to flight_recorder.py resume (--auto-restore|--compact|--json|--skip-github)")
+
+    p_pin = sub.add_parser("pin", help="Zero-friction semantic breadcrumb write (forwards to flight_recorder.py pin)")
+    p_pin.add_argument("fr_args", nargs=argparse.REMAINDER, help="Flags forwarded to flight_recorder.py pin (-b|--goal|--done|--pending|--next)")
 
     p_ship = sub.add_parser("ship", help="1-shot quota-saving pipeline: verify + file-budget + auto [skip ci] push + Termux sync + Flight Recorder close")
     p_ship.add_argument("--commit", required=True, help="Commit message")
@@ -911,13 +1010,44 @@ def main() -> int:
     p_rep = sub.add_parser("repos", help="3-Repo Federation manager (status|hydrate|diff|push|sync-mirrors across Cavern, OmniAgent & Fractal)")
     p_rep.add_argument("fed_args", nargs=argparse.REMAINDER, help="Arguments passed to repo_federation.py")
 
+    p_hunt = sub.add_parser("hunt", help="Live Adversarial Bug-Hunter & Chaos Fuzzer against running Cavernize app (8 vectors + --mode watch)")
+    p_hunt.add_argument("--mode", choices=("quick", "standard", "deep", "watch"), default="standard")
+    p_hunt.add_argument("--vectors", default="")
+    p_hunt.add_argument("--no-mutate", action="store_true")
+    p_hunt.add_argument("--duration", type=int, default=60)
+    p_hunt.add_argument("--interval", type=float, default=3.0)
+    p_hunt.add_argument("--out-md", default="/tmp/cavern_bug_hunt_latest.md")
+    p_hunt.add_argument("--out-json", default="/tmp/cavern_bug_hunt_latest.json")
+    p_hunt.add_argument("--quiet", action="store_true")
+
     args = parser.parse_args()
+
+    if args.action == "hunt":
+        import cavern_bug_hunter as bh
+        forwarded_h: list[str] = ["--mode", args.mode, "--duration", str(args.duration), "--interval", str(args.interval), "--timeout", str(args.timeout)]
+        if args.url:
+            forwarded_h += ["--url", args.url]
+        if args.pair_secret:
+            forwarded_h += ["--pair-secret", args.pair_secret]
+        if args.admin_key:
+            forwarded_h += ["--admin-key", args.admin_key]
+        if args.vectors:
+            forwarded_h += ["--vectors", args.vectors]
+        if args.no_mutate:
+            forwarded_h.append("--no-mutate")
+        if args.out_md:
+            forwarded_h += ["--out-md", args.out_md]
+        if args.out_json:
+            forwarded_h += ["--out-json", args.out_json]
+        if args.quiet:
+            forwarded_h.append("--quiet")
+        return bh.main(forwarded_h)
 
     if args.action == "repos":
         import repo_federation as rfed
         return rfed.main(list(args.fed_args or []))
 
-    if args.action == "checkpoint":
+    if args.action in ("checkpoint", "resume", "pin"):
         import flight_recorder as fr
         forwarded: list[str] = []
         if args.url:
@@ -926,6 +1056,8 @@ def main() -> int:
             forwarded += ["--pair-secret", args.pair_secret]
         if args.admin_key:
             forwarded += ["--admin-key", args.admin_key]
+        if args.action in ("resume", "pin"):
+            forwarded.append(args.action)
         forwarded += list(args.fr_args or [])
         return fr.main(forwarded)
 
@@ -1014,6 +1146,10 @@ def main() -> int:
         return 0 if res.get("ok") else 1
 
     relay, secret, admin = _resolve_auth(args, allow_knock=True)
+    if args.action == "wake-linux":
+        res = wake_linux_daemon(relay, secret, admin_key=admin, wait_sec=float(args.wait))
+        print(json.dumps(res, indent=2, ensure_ascii=False))
+        return 0 if res.get("ok") else 1
     if args.action == "status":
         headers = proto.derive_agent_headers(secret, channel="termux", admin_key=admin)
         st, resp = proto.http_json("GET", f"{relay}/v1/agent/status?all=1", headers, timeout=15)
@@ -1022,12 +1158,13 @@ def main() -> int:
 
     if args.action == "cavernize-cmd":
         payload = build_cavernize_cmd_payload(args.name, args.args, args.tier, args.timeout)
+        cav_chan = pick_cavernize_channel(relay, secret, args.channel, admin)
         res = send_agent_command(
             relay,
             secret,
             "cavernize_cmd",
             payload,
-            channel="android",
+            channel=cav_chan,
             admin_key=admin,
             timeout_sec=max(60, args.timeout),
         )
@@ -1058,6 +1195,25 @@ def main() -> int:
             {"lines": args.lines, "filter": args.filter},
             channel=channel, admin_key=admin, timeout_sec=max(120, args.timeout),
         )
+        # Fallback to Cavernize own-UID sandbox logcat via OmniAgent Android IPC if ADB/Shizuku is unavailable
+        if not res.get("ok") or not str(res.get("output") or "").strip():
+            import cavern_bug_hunter as bh
+            bridge = bh.LiveCavernBridge(relay, secret, admin, timeout_sec=min(30, args.timeout))
+            own_out = bridge.fetch_logcat(lines=int(args.lines or 120), min_level="W" if not args.filter else "V")
+            clean_lines = [ln for ln in own_out.splitlines() if ln.strip() and not bh.is_benign_logcat_line(ln)]
+            if args.filter and clean_lines:
+                import re as _re
+                pat = _re.compile(args.filter, _re.IGNORECASE)
+                clean_lines = [ln for ln in clean_lines if pat.search(ln)]
+            own_out = "\n".join(clean_lines)
+            if own_out.strip():
+                res = {
+                    "ok": True,
+                    "cmd": "logcat_tail",
+                    "source": "cavernize_ipc_sandbox",
+                    "lines": len(clean_lines),
+                    "output": own_out,
+                }
     elif args.action == "ag-discover":
         res = send_agent_command(relay, secret, "ag_discover", {}, channel=channel, admin_key=admin, timeout_sec=max(120, args.timeout))
     elif args.action == "ag-sync":

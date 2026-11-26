@@ -119,7 +119,14 @@ public sealed class OmniWatchdogJobService : JobService {
                 }
             }
 
+            Context appCtx = ApplicationContext ?? this;
             if (OmniAgentForegroundService.IsRunning) {
+                JobFinished(@params, false);
+                return false;
+            }
+            if (OmniAgentForegroundService.IsBatteryUnrestricted(appCtx)) {
+                OmniSettingsStore.AppendActivity("WATCH", "Battery unrestricted — reviving unlimited remoteMessaging FGS.");
+                OmniAgentForegroundService.Start(appCtx);
                 JobFinished(@params, false);
                 return false;
             }
@@ -128,8 +135,7 @@ public sealed class OmniWatchdogJobService : JobService {
             jobCts?.Dispose();
             jobCts = new CancellationTokenSource();
             CancellationToken ct = jobCts.Token;
-            Context appCtx = ApplicationContext ?? this;
-            TimeSpan maxRun = isUserInitiated ? TimeSpan.FromMinutes(8) : TimeSpan.FromSeconds(45);
+            TimeSpan maxRun = isUserInitiated ? TimeSpan.FromMinutes(8) : TimeSpan.FromSeconds(75);
 
             OmniSettingsStore.AppendActivity(
                 "WATCH",

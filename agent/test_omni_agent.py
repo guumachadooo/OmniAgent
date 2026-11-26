@@ -1026,9 +1026,373 @@ class OmniAgentProtocolTests(unittest.TestCase):
             self.assertIn("ScheduleUserInitiated", src_w)
             self.assertIn("OmniAgentBinder", src_f)
 
+    def test_wake_linux_daemon_and_single_shot_auto_wake(self) -> None:
+        from unittest import mock
+
+        # 1. Already online -> zero launch_termux_daemon dispatches
+        with mock.patch.object(oac, "_is_channel_online", return_value=True), \
+             mock.patch.object(oac, "send_agent_command") as m_send:
+            res = oac.wake_linux_daemon("https://relay.test", self.KEY, wait_sec=2.0)
+        self.assertTrue(res["ok"])
+        self.assertTrue(res["alreadyOnline"])
+        self.assertFalse(res["woke"])
+        m_send.assert_not_called()
+
+        # 2. Termux offline + android offline -> clean error, no dispatch
+        with mock.patch.object(oac, "_is_channel_online", return_value=False), \
+             mock.patch.object(oac, "send_agent_command") as m_send:
+            res_off = oac.wake_linux_daemon("https://relay.test", self.KEY, wait_sec=2.0)
+        self.assertFalse(res_off["ok"])
+        self.assertIn("android channel is offline", res_off["error"])
+        m_send.assert_not_called()
+
+        # 3. Termux offline + android online -> dispatches launch_termux_daemon once & succeeds when heartbeat appears
+        checks = {"termux": 0}
+
+        def _fake_online(relay, secret, ch, admin=""):
+            if ch == "android":
+                return True
+            if ch == "termux":
+                checks["termux"] += 1
+                return checks["termux"] >= 2  # offline on initial check, online on first poll
+            return False
+
+        with mock.patch.object(oac, "_is_channel_online", side_effect=_fake_online), \
+             mock.patch.object(oac, "send_agent_command", return_value={"ok": True, "dispatched": True}) as m_send, \
+             mock.patch.object(oac.time, "sleep", return_value=None):
+            res_wake = oac.wake_linux_daemon("https://relay.test", self.KEY, wait_sec=3.0, poll_interval=0.2)
+        self.assertTrue(res_wake["ok"])
+        self.assertTrue(res_wake["woke"])
+        self.assertFalse(res_wake["alreadyOnline"])
+        m_send.assert_called_once()
+        self.assertEqual(m_send.call_args.args[2], "launch_termux_daemon")
+        self.assertEqual(m_send.call_args.kwargs["channel"], "android")
+        self.assertFalse(m_send.call_args.kwargs["auto_wake"])
+
+    def test_dual_lane_semantic_preservation_and_termux_handoff(self) -> None:
+        import base64
+        import gzip
+        import os
+        import subprocess
+        import flight_recorder as fr
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ws = root / "ws"
+            ws.mkdir()
+            (ws / "demo.txt").write_text("v1\n", encoding="utf-8")
+            local_dir = root / "fr_local"
+            phone_bridge = root / "phone_bridge"
+            phone_fr = phone_bridge / "flight_recorder"
+            phone_repo = root / "phone_repo"
+            phone_repo.mkdir()
+            (phone_repo / "demo.txt").write_text("v1\n", encoding="utf-8")
+
+            fr.init_session(workspace=ws, local_dir=local_dir, session_id="sess_dual_1", goal="Initial goal", use_remote=False)
+            pin_res = fr.pin_session(
+                workspace=ws,
+                local_dir=local_dir,
+                goal="Ship Instant Resume",
+                completed=["Blueprint 100/100"],
+                pending=["Slice R6 tests", "Ship"],
+                next_step="Run test_omni_agent.py",
+                summary="Slices R1-R5 wired",
+                use_remote=False,
+                background=False,
+            )
+            self.assertTrue(pin_res["ok"])
+            self.assertTrue((local_dir / "semantic.json").is_file())
+
+            # Simulate an auto_mirror save arriving with generic auto-mirror text
+            (ws / "demo.txt").write_text("v2\n", encoding="utf-8")
+            auto_res = fr.save_checkpoint(
+                workspace=ws,
+                local_dir=local_dir,
+                summary="Live auto-mirror (1 modified, 0 deleted): demo.txt",
+                auto_diff=True,
+                source="auto_mirror",
+                use_remote=False,
+            )
+            self.assertTrue(auto_res["ok"])
+            cp = auto_res["checkpoint"]
+            self.assertEqual(cp["goal"], "Ship Instant Resume")
+            self.assertEqual(cp["pending"], ["Slice R6 tests", "Ship"])
+            self.assertEqual(cp["nextStep"], "Run test_omni_agent.py")
+            self.assertEqual(cp["summary"], "Slices R1-R5 wired")
+            self.assertEqual(cp["source"], "auto_mirror")
+
+            # Verify semantic.json was NOT overwritten by auto_mirror
+            sem = fr.read_local_semantic(local_dir)
+            self.assertIsNotNone(sem)
+            self.assertEqual(sem["goal"], "Ship Instant Resume")
+            self.assertEqual(sem["nextStep"], "Run test_omni_agent.py")
+
+            # Verify Termux atomic sync runner preserves semantic.json & LATEST_HANDOFF.md across auto_mirror
+            script = fr.build_termux_atomic_sync_script()
+            phone_ag = root / "phone_ag"
+            phone_bridge = phone_ag / "ai_studio_bridge"
+            phone_fr = phone_bridge / "flight_recorder"
+            manual_payload = {
+                "frDir": str(phone_fr),
+                "agDir": str(phone_ag),
+                "repoDir": str(phone_repo),
+                "checkpoint": {**cp, "source": "manual"},
+                "semanticCheckpoint": sem,
+                "diaryMd": fr.render_diary_markdown(cp),
+                "applyLiveMirror": False,
+                "syncAntigravityHandoff": True,
+            }
+            for payload in (
+                manual_payload,
+                {
+                    "frDir": str(phone_fr),
+                    "agDir": str(phone_ag),
+                    "repoDir": str(phone_repo),
+                    "checkpoint": {
+                        **cp,
+                        "source": "auto_mirror",
+                        "summary": "Auto live-mirror (1 modified/added, 0 deleted)",
+                        "nextStep": "",
+                        "pending": [],
+                        "goal": "",
+                    },
+                    "diaryMd": fr.render_diary_markdown(cp),
+                    "applyLiveMirror": False,
+                    "syncAntigravityHandoff": True,
+                },
+            ):
+                b64 = base64.b64encode(gzip.compress(json.dumps(payload).encode("utf-8"))).decode("ascii")
+                env = dict(os.environ)
+                env["FR_PAYLOAD_B64"] = b64
+                proc = subprocess.run([sys.executable, "-B", "-c", script], env=env, capture_output=True, text=True, check=True)
+                out = json.loads(proc.stdout.strip().splitlines()[-1])
+                self.assertTrue(out["ok"])
+
+            handoff_md = (phone_bridge / "LATEST_HANDOFF.md").read_text(encoding="utf-8")
+            self.assertIn("Ship Instant Resume", handoff_md)
+            self.assertIn("Run test_omni_agent.py", handoff_md)
+            self.assertIn("Slices R1-R5 wired", handoff_md)
+            phone_latest = json.loads((phone_fr / "latest.json").read_text(encoding="utf-8"))
+            self.assertEqual(phone_latest["goal"], "Ship Instant Resume")
+            self.assertEqual(phone_latest["nextStep"], "Run test_omni_agent.py")
+
+    def test_live_sync_watcher_hydration_filter_and_remote_rollback_guard(self) -> None:
+        import hashlib
+        from unittest import mock
+        import flight_recorder as fr
+        import live_sync_watcher as lsw
+
+        # (a) Hydration filter silently adopts files whose content matches GitHub HEAD blob SHA-1
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ws = root / "ws"
+            ws.mkdir()
+            (ws / "hydrated.txt").write_text("old-local\n", encoding="utf-8")
+            local_dir = root / "fr_local"
+
+            watcher = lsw.LiveSyncWatcher(ws, local_dir, debounce_sec=0.0, use_remote=True, apply_live_mirror=False)
+            watcher.ensure_baseline()
+            head_bytes = b"exact-github-head-content\n"
+            (ws / "hydrated.txt").write_bytes(head_bytes)
+            head_blob = lsw._git_blob_sha1(head_bytes)
+
+            with mock.patch.object(watcher, "_get_github_head_blobs", return_value={"hydrated.txt": head_blob}), \
+                 mock.patch.object(fr, "save_checkpoint") as m_save:
+                res = watcher.sync_once(force_immediate=True)
+            self.assertFalse(res["synced"])
+            self.assertEqual(res["reason"], "hydration_filtered")
+            self.assertEqual(res["filtered"], 1)
+            m_save.assert_not_called()
+
+        # (b) Fresh container without local latest.json aborts push when remote active checkpoint shows rollback
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ws = root / "ws"
+            ws.mkdir()
+            (ws / "app.cs").write_text("older-version\n", encoding="utf-8")
+            local_dir = root / "fr_fresh"
+
+            watcher = lsw.LiveSyncWatcher(ws, local_dir, debounce_sec=0.0, use_remote=True, apply_live_mirror=False)
+            watcher.ensure_baseline()
+            (ws / "app.cs").write_text("container-rehydrated-edit\n", encoding="utf-8")
+
+            remote_active_cp = {
+                "sessionId": "prev-session-123",
+                "seq": 4,
+                "status": "active",
+                "hasBundle": True,
+                "goal": "Important previous work",
+                "fileHashes": {
+                    "app.cs": hashlib.sha256(b"newer-remote-work\n").hexdigest(),
+                },
+            }
+            with mock.patch.object(watcher, "_get_github_head_blobs", return_value={}), \
+                 mock.patch.object(fr, "_try_resolve_remote_auth", return_value=("https://relay.test", self.KEY, "")), \
+                 mock.patch.object(fr, "read_cloud_tier", return_value=(remote_active_cp, None, "")), \
+                 mock.patch.object(fr, "save_checkpoint") as m_save:
+                res = watcher.sync_once(force_immediate=True)
+            self.assertFalse(res["synced"])
+            self.assertEqual(res["reason"], "remote_rollback_protected")
+            status_obj = json.loads((local_dir / "watcher_status.json").read_text(encoding="utf-8"))
+            self.assertEqual(status_obj["note"], "paused_remote_rollback_protected")
+            m_save.assert_not_called()
+
+    def test_resume_packet_compact_and_auto_restore_in_one_call(self) -> None:
+        import flight_recorder as fr
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ws = root / "ws"
+            docs = ws / ".agents" / "docs"
+            docs.mkdir(parents=True)
+            (docs / "HANDOFF.md").write_text("# Session Handoff\nHANDOFF|host=ai-studio-cloud\nDONE|init\nNEXT|continue\n", encoding="utf-8")
+            (docs / "EXTRA_REQUESTS.md").write_text(
+                "# Extra Request Queue\n## Pending Extra Requests\n- REQ|fast-check -> verify instant resume\n## Completed Requests\n",
+                encoding="utf-8",
+            )
+            (ws / "target.txt").write_text("baseline-v1\n", encoding="utf-8")
+            local_dir = root / "fr_local"
+
+            fr.init_session(workspace=ws, local_dir=local_dir, session_id="sess_resume_1", goal="Resume Test Goal", use_remote=False)
+            fr.pin_session(
+                workspace=ws,
+                local_dir=local_dir,
+                goal="Resume Test Goal",
+                pending=["Step A", "Step B"],
+                next_step="Finish Step A",
+                summary="Edited target.txt",
+                use_remote=False,
+                background=False,
+            )
+            (ws / "target.txt").write_text("edited-v2-important\n", encoding="utf-8")
+            fr.save_checkpoint(workspace=ws, local_dir=local_dir, summary="Saved target.txt v2", auto_diff=True, use_remote=False)
+
+            # Simulate AI Studio rollback reverting target.txt back to baseline
+            (ws / "target.txt").write_text("baseline-v1\n", encoding="utf-8")
+
+            packet = fr.resume_session(
+                workspace=ws,
+                local_dir=local_dir,
+                auto_restore=True,
+                use_remote=False,
+                skip_github=True,
+                skip_termux_diff=True,
+            )
+            self.assertTrue(packet["ok"])
+            self.assertEqual(packet["verdict"], "RESTORED_AND_READY")
+            self.assertEqual((ws / "target.txt").read_text(encoding="utf-8"), "edited-v2-important\n")
+            self.assertEqual(packet["checkpoint"]["goal"], "Resume Test Goal")
+            self.assertEqual(packet["checkpoint"]["pending"], ["Step A", "Step B"])
+
+            rendered = fr.render_resume_packet(packet)
+            lines = [ln for ln in rendered.splitlines() if ln.strip()]
+            self.assertLessEqual(len(lines), 35)
+            self.assertIn("GOAL|Resume Test Goal", rendered)
+            self.assertIn("PENDING|Step A ; Step B", rendered)
+            self.assertIn("EXTRA_REQ|", rendered)
+            self.assertIn("AUTO_RESTORE|", rendered)
+
+    def test_termux_content_addressed_reconcile_ff_pull_preserves_manual_edits(self) -> None:
+        import shutil
+        import subprocess
+        import flight_recorder as fr
+
+        if not shutil.which("git"):
+            self.skipTest("git binary not available")
+
+        def _git(cwd: Path, *args: str) -> str:
+            r = subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True, check=True)
+            return r.stdout.strip()
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            bare = root / "remote.git"
+            seed = root / "seed"
+            phone = root / "phone"
+            state_path = root / "live_mirror_state.json"
+
+            _git(root, "init", "--bare", str(bare))
+            _git(root, "clone", str(bare), str(seed))
+            _git(seed, "config", "user.email", "test@example.com")
+            _git(seed, "config", "user.name", "Test User")
+            _git(seed, "checkout", "-b", "master")
+
+            (seed / "tracked.txt").write_text("base-tracked\n", encoding="utf-8")
+            (seed / "manual.txt").write_text("base-manual\n", encoding="utf-8")
+            _git(seed, "add", ".")
+            _git(seed, "commit", "-m", "init")
+            _git(seed, "push", "-u", "origin", "master")
+
+            # Clone phone repo at commit 1
+            _git(root, "clone", str(bare), str(phone))
+            _git(phone, "config", "user.email", "phone@example.com")
+            _git(phone, "config", "user.name", "Phone User")
+
+            # Advance remote by 1 commit: modify tracked.txt and add new_remote.txt
+            (seed / "tracked.txt").write_text("new-tracked-on-origin\n", encoding="utf-8")
+            (seed / "new_remote.txt").write_text("brand-new-on-origin\n", encoding="utf-8")
+            _git(seed, "add", ".")
+            _git(seed, "commit", "-m", "advance")
+            _git(seed, "push", "origin", "master")
+            expected_head = _git(seed, "rev-parse", "--short", "HEAD")
+
+            # Simulate stale phone state:
+            # (a) tracked.txt already matches origin/master (NOT listed in live_mirror_state.json)
+            (phone / "tracked.txt").write_text("new-tracked-on-origin\n", encoding="utf-8")
+            # (b) untracked new_remote.txt already matches origin/master
+            (phone / "new_remote.txt").write_text("brand-new-on-origin\n", encoding="utf-8")
+            # (c) genuine manual edit to manual.txt NOT in origin/master
+            (phone / "manual.txt").write_text("my-local-phone-edit\n", encoding="utf-8")
+            state_path.write_text(json.dumps({"mirrored": {}}), encoding="utf-8")
+
+            script = fr.build_termux_reconcile_pull_script("origin", "master", state_path=str(state_path))
+            proc = subprocess.run([sys.executable, "-B", "-c", script], cwd=str(phone), capture_output=True, text=True, check=True)
+            res = json.loads(proc.stdout.strip().splitlines()[-1])
+
+            self.assertTrue(res["ok"], res)
+            self.assertEqual(res["mode"], "ff-only")
+            self.assertEqual(res["head"], expected_head)
+            self.assertIn("tracked.txt", res["reconciled"])
+            self.assertIn("new_remote.txt", res["reconciled"])
+            self.assertIn("manual.txt", res["preservedManual"])
+            self.assertEqual((phone / "manual.txt").read_text(encoding="utf-8"), "my-local-phone-edit\n")
+            self.assertEqual((phone / "tracked.txt").read_text(encoding="utf-8"), "new-tracked-on-origin\n")
+            self.assertEqual((phone / "new_remote.txt").read_text(encoding="utf-8"), "brand-new-on-origin\n")
+
+    def test_pick_cavernize_channel_auto_fallback(self) -> None:
+        orig_http = proto.http_json
+        try:
+            proto.http_json = lambda *a, **kw: (
+                200,
+                {
+                    "ok": True,
+                    "channels": {
+                        "android": {"online": False, "standbyReachable": True},
+                        "cavernize": {"online": True},
+                    },
+                },
+            )
+            self.assertEqual(oac.pick_cavernize_channel("https://example.workers.dev", self.KEY, "auto"), "cavernize")
+            self.assertEqual(oac.pick_cavernize_channel("https://example.workers.dev", self.KEY, "android"), "android")
+
+            proto.http_json = lambda *a, **kw: (
+                200,
+                {
+                    "ok": True,
+                    "channels": {
+                        "android": {"online": True},
+                        "cavernize": {"online": True},
+                    },
+                },
+            )
+            self.assertEqual(oac.pick_cavernize_channel("https://example.workers.dev", self.KEY, "auto"), "android")
+        finally:
+            proto.http_json = orig_http
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
 
 
 

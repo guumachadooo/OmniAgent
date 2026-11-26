@@ -320,3 +320,57 @@ test("Worker v5 /v1/knock/request enforces 3-per-15-min rate limit", async () =>
   assert.equal(r4.status, 429);
 });
 
+test("Worker v6.1 preserves 7-day presence history with ageSeconds, standbyReachable & FGS diagnostics when stale", async () => {
+  const kv = makeMockKv();
+  const env = { RELAY_KV: kv };
+  const hAndroid = { "X-Device-Hash": DEV_HASH, "X-Agent-Key": AGENT_KEY, "X-Agent-Channel": "android" };
+
+  const health = await req(env, "GET", "/health");
+  assert.equal(health.json.supportsPresenceHistory, true);
+  assert.equal(health.json.presenceOnlineTtlSec, 420);
+  assert.equal(health.json.cmdTtlSec, 900);
+
+  // Send heartbeat with FGS/battery diagnostics
+  const hb = await req(env, "POST", "/v1/agent/heartbeat", hAndroid, {
+    hostEnv: "android-companion",
+    device: "Samsung SM-S938B",
+    fgsMode: "remoteMessaging",
+    batteryUnrestricted: true,
+    androidSdk: 35,
+    lastExitReason: "clean",
+  });
+  assert.equal(hb.status, 200);
+  assert.equal(hb.json.historyTtlSeconds, 7 * 24 * 3600);
+
+  // Fresh heartbeat -> online: true, standbyReachable: true
+  const fresh = await req(env, "GET", "/v1/agent/status?all=1", hAndroid);
+  assert.equal(fresh.json.channels.android.online, true);
+  assert.equal(fresh.json.channels.android.standbyReachable, true);
+  assert.equal(fresh.json.channels.android.fgsMode, "remoteMessaging");
+  assert.equal(fresh.json.channels.android.batteryUnrestricted, true);
+  assert.equal(fresh.json.channels.android.androidSdk, 35);
+
+  // Simulate heartbeat aged 12 minutes (> 420s online, <= 1800s standbyReachable)
+  const bucket = sha256(`${DEV_HASH}:${AGENT_KEY}`);
+  const key = `ag:${bucket}:android:presence`;
+  const rec = JSON.parse(await kv.get(key));
+  rec.lastSeenUtc = new Date(Date.now() - 720 * 1000).toISOString();
+  await kv.put(key, JSON.stringify(rec));
+
+  const stale = await req(env, "GET", "/v1/agent/status?all=1", hAndroid);
+  assert.equal(stale.json.channels.android.online, false);
+  assert.equal(stale.json.channels.android.standbyReachable, true);
+  assert.ok(stale.json.channels.android.ageSeconds >= 715);
+  assert.equal(stale.json.channels.android.fgsMode, "remoteMessaging");
+
+  // Simulate heartbeat aged 2 hours (> 1800s) -> still keeps lastSeenUtc & device diagnostics
+  rec.lastSeenUtc = new Date(Date.now() - 7200 * 1000).toISOString();
+  await kv.put(key, JSON.stringify(rec));
+  const old = await req(env, "GET", "/v1/agent/status?channel=android", hAndroid);
+  assert.equal(old.json.online, false);
+  assert.equal(old.json.standbyReachable, false);
+  assert.ok(old.json.ageSeconds >= 7195);
+  assert.equal(old.json.presence.device, "Samsung SM-S938B");
+});
+
+
