@@ -3,7 +3,6 @@ using System.Text.Json;
 
 using Android.App;
 using Android.Content;
-using Android.Net;
 using Android.OS;
 
 using Path = System.IO.Path;
@@ -71,7 +70,7 @@ public sealed class OmniAgentForegroundService : Service {
 
     readonly IBinder binder;
     CancellationTokenSource cts;
-    ConnectivityManager.NetworkCallback networkCallback;
+    Android.Net.ConnectivityManager.NetworkCallback networkCallback;
 
     public OmniAgentForegroundService() {
         binder = new OmniAgentBinder(this);
@@ -464,8 +463,8 @@ public sealed class OmniAgentForegroundService : Service {
         return true;
     }
 
-    sealed class BridgeNetworkCallback : ConnectivityManager.NetworkCallback {
-        public override void OnAvailable(Network network) {
+    sealed class BridgeNetworkCallback : Android.Net.ConnectivityManager.NetworkCallback {
+        public override void OnAvailable(Android.Net.Network network) {
             base.OnAvailable(network);
             forceImmediateHeartbeat = true;
         }
@@ -476,7 +475,7 @@ public sealed class OmniAgentForegroundService : Service {
             return;
         }
         try {
-            if (GetSystemService(ConnectivityService) is ConnectivityManager cm) {
+            if (GetSystemService(ConnectivityService) is Android.Net.ConnectivityManager cm) {
                 networkCallback = new BridgeNetworkCallback();
                 cm.RegisterDefaultNetworkCallback(networkCallback);
             }
@@ -490,7 +489,7 @@ public sealed class OmniAgentForegroundService : Service {
             return;
         }
         try {
-            if (GetSystemService(ConnectivityService) is ConnectivityManager cm) {
+            if (GetSystemService(ConnectivityService) is Android.Net.ConnectivityManager cm) {
                 cm.UnregisterNetworkCallback(networkCallback);
             }
         } catch {
