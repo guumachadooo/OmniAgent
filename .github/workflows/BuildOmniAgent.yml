@@ -16,6 +16,9 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v7
 
+      - name: Zero-Static Coherence Gate (--local)
+        run: python3 -B .agents/plugins/dynamic-fractal-planner/scripts/plan_tool.py coherence check --local
+
       - name: Zero-Quota Sync Cavernize One UI 9 Design Kit
         run: |
           python3 - <<'PY'

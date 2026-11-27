@@ -494,7 +494,7 @@ public static class OneUiModalDialog {
         b.Background = primary
             ? OneUiTheme.CreateRippleRoundedDrawable(ctx, OneUiTheme.Primary, OneUiTheme.PillCornerDp)
             : OneUiTheme.CreateGlassCardDrawable(ctx, OneUiTheme.SurfaceModalRow, OneUiTheme.PillCornerDp);
-        b.SetTextColor(OneUiTheme.TextPrimary);
+        b.SetTextColor(primary ? OneUiTheme.OnPrimary : OneUiTheme.TextPrimary);
         b.Typeface = primary ? OneUiTheme.GetAppleFontBold(ctx) : OneUiTheme.GetAppleFontMedium(ctx);
         OneUiTheme.AttachRecoil(b);
         b.Click += (_, _) => onClick?.Invoke();

@@ -1668,6 +1668,7 @@ class OmniAgentProtocolTests(unittest.TestCase):
         with mock.patch.object(ghdirect, "diff_workspace_against_github", return_value=fake_diff) as m_diff, \
              mock.patch.object(subprocess, "run", side_effect=_fake_sp_run), \
              mock.patch.object(oac, "_push_workspace_impl", side_effect=_fake_push_impl), \
+             mock.patch.object(rfed, "auto_sync_plugin_fleet", return_value={"ok": True, "pushedAliases": []}), \
              mock.patch.object(rfed, "sync_termux_repos_batch", return_value={"attempted": True, "ok": True, "mode": "batched_sync"}) as m_tsync, \
              mock.patch("sys.stdout", stdout_buf), \
              mock.patch("sys.stderr", stderr_buf):

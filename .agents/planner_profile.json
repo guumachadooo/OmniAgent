@@ -1,6 +1,6 @@
 {
   "schema_version": 5,
-  "plugin_version": "2.19.0",
+  "plugin_version": "2.22.0",
   "docs_format_version": 1,
   "project_name": "OmniAgent",
   "planner_mode": "auto",
@@ -327,5 +327,17 @@
       "heavy_tests",
       "git_push"
     ]
+  },
+  "blueprint": {
+    "dir": ".agents/docs/blueprints",
+    "hub_file": ".agents/docs/PLANS_HUB.md",
+    "require_by_default": false,
+    "default_min_tier": 2,
+    "require_pre_resume_hygiene": true
+  },
+  "adversarial_qa": {
+    "enabled": false,
+    "contracts_file": ".agents/qa/regression_contracts.json",
+    "strict_verify": true
   }
 }

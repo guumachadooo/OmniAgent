@@ -562,6 +562,23 @@ def inspect_federation_status(
     }
 
 
+_ROOT_ONLY_EXCLUDES = frozenset({".github", ".gitignore", "package.json", "AGENTS.md"})
+_ANYDEPTH_EXCLUDES = frozenset({
+    ".git", ".workspaces.json", ".last_good_backup", "__pycache__",
+    ".metrics.jsonl", ".model_modes.json", ".hook_state.json", ".diagnostics",
+})
+_NON_EXEC_EXTS = (".md", ".json", ".jsonl", ".txt", ".yml", ".yaml", ".toml", ".ini", ".cfg", ".csv", ".png", ".svg")
+
+
+def _desired_mirror_mode(rel_posix: str, src_path: Path) -> int:
+    low = rel_posix.lower()
+    if low.endswith(_NON_EXEC_EXTS) or any(part in ("docs", "rules", "skills", "fixtures") for part in low.split("/")[:-1]):
+        return 0o644
+    if (low.endswith(".sh") or low.startswith(("hooks/", "scripts/", "tests/"))) and os.access(src_path, os.X_OK):
+        return 0o755
+    return 0o644
+
+
 def _is_excluded(rel_posix: str, patterns: list[str]) -> bool:
     rel = rel_posix.replace("\\", "/").strip("/")
     if not rel:
@@ -573,12 +590,74 @@ def _is_excluded(rel_posix: str, patterns: list[str]) -> bool:
             continue
         if rel == p or rel.startswith(p + "/"):
             return True
+        if p in _ROOT_ONLY_EXCLUDES or "/" in p:
+            if fnmatch.fnmatch(rel, p):
+                return True
+            continue
+        if any(ch in p for ch in "*?["):
+            if fnmatch.fnmatch(rel, p) or any(fnmatch.fnmatch(seg, p) for seg in parts):
+                return True
+            continue
+        if p in _ANYDEPTH_EXCLUDES:
+            if p in parts:
+                return True
+            continue
         for seg in parts:
             if fnmatch.fnmatch(seg, p):
                 return True
         if fnmatch.fnmatch(rel, p):
             return True
     return False
+
+
+def compute_plugin_tree_sha256(
+    plugin_root: Path,
+    excludes: list[str] | tuple[str, ...] | set[str] | None = None,
+) -> tuple[str, str]:
+    """Return deterministic `(semver, tree_sha256)` over relative path + exec bit + file sha256."""
+    root = Path(plugin_root).expanduser().resolve()
+    try:
+        plug_scripts = root / "scripts"
+        if not (plug_scripts / "self_evolve.py").is_file():
+            plug_scripts = AGENT_DIR.parent / "plugins" / "dynamic-fractal-planner" / "scripts"
+        if plug_scripts.is_dir() and str(plug_scripts) not in sys.path:
+            sys.path.insert(0, str(plug_scripts))
+        import self_evolve  # noqa: E402
+
+        return self_evolve.compute_plugin_tree_sha256(root, excludes=excludes)
+    except Exception:
+        pass
+    semver = _read_plugin_version(root)
+    if not root.is_dir():
+        return (semver, "")
+    pats = list(excludes) if excludes is not None else [
+        ".git", ".github", ".gitignore", "package.json", "AGENTS.md",
+        ".agents/preview", ".agents/federation.json", ".agents/bridge_profile.json",
+        ".agents/env_manifest.json", ".agents/host_matrix.json", ".agents/planner_profile.json",
+        ".workspaces.json", ".last_good_backup", "__pycache__", "*.pyc", "*.pyo",
+        ".metrics.jsonl", ".model_modes.json", ".hook_state.json", ".diagnostics",
+    ]
+    files: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        cur = Path(dirpath)
+        rel_dir = "" if cur == root else cur.relative_to(root).as_posix()
+        dirnames[:] = sorted(d for d in dirnames if not _is_excluded(f"{rel_dir}/{d}" if rel_dir else d, pats))
+        for fn in sorted(filenames):
+            f_rel = f"{rel_dir}/{fn}" if rel_dir else fn
+            if _is_excluded(f_rel, pats):
+                continue
+            p = cur / fn
+            if p.is_file() and not p.is_symlink():
+                files.append(p)
+    if not files:
+        return (semver, "")
+    h = hashlib.sha256()
+    for p in sorted(files, key=lambda x: x.relative_to(root).as_posix()):
+        rel = p.relative_to(root).as_posix()
+        file_sha = hashlib.sha256(p.read_bytes()).hexdigest()
+        exec_bit = "1" if os.access(p, os.X_OK) else "0"
+        h.update(f"{rel}\0{exec_bit}\0{file_sha}\n".encode("utf-8"))
+    return (semver, h.hexdigest())
 
 
 def sync_mirrors(
@@ -661,11 +740,10 @@ def sync_mirrors(
                             if apply:
                                 df.parent.mkdir(parents=True, exist_ok=True)
                                 df.write_bytes(s_bytes)
-                                if os.access(sf, os.X_OK):
-                                    try:
-                                        os.chmod(df, 0o755)
-                                    except OSError:
-                                        pass
+                                try:
+                                    os.chmod(df, _desired_mirror_mode(rel_f, sf))
+                                except OSError:
+                                    pass
                             copied.append(f"{dst_alias}:{raw_dst.rstrip('/')}/{rel_f}" if raw_dst != "." else f"{dst_alias}:{rel_f}")
                         else:
                             unchanged += 1
@@ -747,10 +825,11 @@ def push_federated_repo(
                 res["termuxSync"] = _try_sync_termux_repo(spec, branch, timeout_sec=termux_timeout_sec)
             return res
         except RuntimeError as exc:
-            if "HTTP 403" not in str(exc) and "Resource not accessible" not in str(exc):
+            msg_exc = str(exc)
+            if not any(k in msg_exc for k in ("HTTP 401", "HTTP 403", "Bad credentials", "Resource not accessible")):
                 raise
             print(
-                f"WARN: Local GITHUB_TOKEN lacks Contents:Write for {owner_repo} ({exc}). Falling back to OmniAgent phone git push...",
+                f"WARN: Local GITHUB_TOKEN rejected/lacks write for {owner_repo} ({exc}). Falling back to OmniAgent phone git push...",
                 file=sys.stderr,
                 flush=True,
             )
@@ -774,7 +853,9 @@ import concurrent.futures, hashlib, json, os, shutil, subprocess
 from pathlib import Path
 
 ENTRIES = json.loads({json.dumps(payload_json)})
-GLOBAL_EXCLUDES = {{".git", ".github", ".gitignore", "package.json", "AGENTS.md", ".workspaces.json", ".last_good_backup", "__pycache__", ".metrics.jsonl", ".model_modes.json", ".hook_state.json", ".diagnostics"}}
+GLOBAL_ROOT_EXCLUDES = {{".github", ".gitignore", "package.json", "AGENTS.md"}}
+GLOBAL_ANYDEPTH_EXCLUDES = {{".git", ".workspaces.json", ".last_good_backup", "__pycache__", ".metrics.jsonl", ".model_modes.json", ".hook_state.json", ".diagnostics"}}
+GLOBAL_EXCLUDES = GLOBAL_ROOT_EXCLUDES | GLOBAL_ANYDEPTH_EXCLUDES
 
 def git_blob_sha1(raw: bytes) -> str:
     return hashlib.sha1(f"blob {{len(raw)}}\\x00".encode("ascii") + raw).hexdigest()
@@ -786,9 +867,14 @@ def sync_global_plugin(src_dir: Path, dst_dir: Path) -> dict:
     for dirpath, dirnames, filenames in os.walk(src_dir):
         cur = Path(dirpath)
         rel_dir = cur.relative_to(src_dir).as_posix()
-        dirnames[:] = [d for d in sorted(dirnames) if d not in GLOBAL_EXCLUDES and (rel_dir != ".agents" or d != "preview")]
+        dirnames[:] = [
+            d for d in sorted(dirnames)
+            if d not in GLOBAL_ANYDEPTH_EXCLUDES
+            and not (rel_dir == "." and d in GLOBAL_ROOT_EXCLUDES)
+            and (rel_dir != ".agents" or d != "preview")
+        ]
         for fn in sorted(filenames):
-            if fn in GLOBAL_EXCLUDES or fn.endswith((".pyc", ".pyo")):
+            if fn in GLOBAL_ANYDEPTH_EXCLUDES or (rel_dir == "." and fn in GLOBAL_ROOT_EXCLUDES) or fn.endswith((".pyc", ".pyo")):
                 continue
             rel_f = fn if rel_dir == "." else f"{{rel_dir}}/{{fn}}"
             if rel_f.startswith((".agents/preview/", ".agents/federation.json", ".agents/bridge_profile.json", ".agents/env_manifest.json", ".agents/host_matrix.json", ".agents/planner_profile.json")):
@@ -799,11 +885,13 @@ def sync_global_plugin(src_dir: Path, dst_dir: Path) -> dict:
             if not df.is_file() or df.read_bytes() != sb:
                 df.parent.mkdir(parents=True, exist_ok=True)
                 df.write_bytes(sb)
-                if os.access(sf, os.X_OK):
-                    try:
-                        os.chmod(df, 0o755)
-                    except OSError:
-                        pass
+                low = rel_f.lower()
+                is_doc = low.endswith((".md", ".json", ".jsonl", ".txt", ".yml", ".yaml", ".toml", ".ini", ".cfg", ".csv", ".png", ".svg")) or any(pt in ("docs", "rules", "skills", "fixtures") for pt in low.split("/")[:-1])
+                mode = 0o755 if (not is_doc and (low.endswith(".sh") or low.startswith(("hooks/", "scripts/", "tests/"))) and os.access(sf, os.X_OK)) else 0o644
+                try:
+                    os.chmod(df, mode)
+                except OSError:
+                    pass
                 copied += 1
     return {{"ok": True, "copied": copied}}
 

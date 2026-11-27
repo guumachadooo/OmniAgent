@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "strict_coverage": false,
+  "strict_coverage": true,
   "note": "Declarative multi-host tool & integration matrix (`antigravity-termux` <-> `antigravity-local` <-> `ai-studio-cloud` <-> `ci-runner` <-> `local-ide`). Audited by `verify_universal.py` & `plan_tool.py host-audit`.",
   "hosts": {
     "antigravity-termux": {
@@ -23,7 +23,7 @@
       "label": "Google AI Studio Cloud Container",
       "ignore_cloud_env_alerts": false,
       "boot_steps": [
-        "python3 -B agent/flight_recorder.py recover",
+        "python3 -B agent/flight_recorder.py resume",
         "python3 -B .agents/plugins/dynamic-fractal-planner/scripts/plan_tool.py host-boot"
       ]
     },
@@ -125,7 +125,7 @@
       "per_host": {
         "ai-studio-cloud": {
           "mode": "active",
-          "how": "run recover at boot, save -b at milestones, close on ship"
+          "how": "run resume at boot, save -b at milestones, close on ship"
         },
         "antigravity-termux": {
           "mode": "skip_preserve",
@@ -329,6 +329,32 @@
         "local-ide": {
           "mode": "active",
           "how": "checked by verify_universal.py"
+        }
+      }
+    },
+    {
+      "id": "cavern-bug-hunter",
+      "category": "universal",
+      "paths": [
+        "agent/cavern_bug_hunter.py"
+      ],
+      "purpose": "universal tool (agent/cavern_bug_hunter.py)",
+      "per_host": {
+        "ai-studio-cloud": {
+          "mode": "active",
+          "how": "runs identically"
+        },
+        "antigravity-termux": {
+          "mode": "active",
+          "how": "runs identically"
+        },
+        "ci-runner": {
+          "mode": "active",
+          "how": "runs in CI parity checks"
+        },
+        "local-ide": {
+          "mode": "active",
+          "how": "runs identically"
         }
       }
     }

@@ -1035,7 +1035,8 @@ public static class OneUiPillFactory {
             : OneUiTheme.CreateGlassCardDrawable(ctx, OneUiTheme.SurfaceSubTile, OneUiTheme.PillCornerDp);
         OneUiTheme.AttachRecoil(pill, 0.95f);
 
-        OneUiIconView iv = new(ctx, icon, OneUiTheme.TextPrimary);
+        Color ink = primary ? OneUiTheme.OnPrimary : OneUiTheme.TextPrimary;
+        OneUiIconView iv = new(ctx, icon, ink);
         pill.AddView(iv, new LinearLayout.LayoutParams(dp1 * 16, dp1 * 16) { RightMargin = string.IsNullOrEmpty(text) ? 0 : dp1 * 7 });
 
         if (!string.IsNullOrEmpty(text)) {
@@ -1044,7 +1045,7 @@ public static class OneUiPillFactory {
                 TextSize = 12.5f
             };
             tv.SetIncludeFontPadding(false);
-            tv.SetTextColor(OneUiTheme.TextPrimary);
+            tv.SetTextColor(ink);
             OneUiTheme.ApplyHeadlineFont(ctx, tv, bold: primary);
             pill.AddView(tv);
         }

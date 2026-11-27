@@ -1,0 +1,26 @@
+# Ecosystem Coherence Hub (`COHERENCE_HUB.md`)
+
+> STYLE|lossless symbolic telegraphic EN ONLY (`!articles/copulas/filler`, ops `-> | && || ! w/ w/o`). Auto-synced by `plan_tool.py coherence sync`.
+
+## 1. SSOT_MAP (Authoritative Source -> Consumers)
+| Domain | Authoritative SSOT | Consumers |
+| :--- | :--- | :--- |
+| Domains & Checklists | `.agents/plugins/dynamic-fractal-planner/scripts/domains.json` | `complexity_triage.py`, `plan_tool.py`, `blueprint_engine.py`, `planner_pre_invocation.py` |
+| Verify Registry | `verify_universal.py:@verify_check` (`VERIFY_CHECKS`) | `verify_universal.py:run_static_checks`, `planner_stop.py`, CI |
+| Multi-Host Matrix | `.agents/host_matrix.json` (`strict_coverage=true`) | `host_context.py`, `verify_universal.py`, `plan_tool.py host-*` |
+| Triad Federation | `.agents/federation.json` | `repo_federation.py`, `self_evolve.py`, `verify_universal.py`, `coherence_engine.py` |
+| Profile Schema | `scripts/schema_migrations.py:migrate_profile` | `planner_state.py`, `blueprint_hub.py`, `complexity_triage.py` |
+| Living Docs Parity | `<!--AUTO:START:<id>:sha256=...-->` | `skills/*/SKILL.md`, `.agents/docs/EXTERNAL_AI_ONBOARDING.md` |
+
+## 2. DEPRECATED_REGISTRY (`WARN -> GRACE -> TOMBSTONE`)
+<!-- Format: DEP|<id>|<stage>|<path_or_surface>|<replacement>|owner=<owner>|expires_ver=<semver> -->
+DEP|legacy-live-phone-bridge|TOMBSTONE|.agents/scripts/live_phone_bridge.py|omni_agent.py cavernize-cmd|owner=cavern|expires_ver=2.22.0
+DEP|flight-recorder-recover-alias|GRACE|cli:flight_recorder.py recover|flight_recorder.py resume|owner=cavern|expires_ver=2.24.0
+DEP|legacy-error-learner-wrapper|WARN|.agents/scripts/error_learner.py|plan_tool.py learn|owner=dfp|expires_ver=2.24.0
+
+## 3. COVERAGE_MATRIX
+COV|plugin=v2.22.0|triage_domains=8|bp_domains=8|verify_checks=19|hooks=9(unwired=0)
+COV|host_matrix_strict=true|host_entries=11|auto_blocks=2(drifted=0)|deprecated=3
+
+## 4. CROSS_REPO_PARITY
+PARITY|SKIP|local_only

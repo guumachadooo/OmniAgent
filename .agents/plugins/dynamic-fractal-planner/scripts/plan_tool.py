@@ -33,67 +33,23 @@ from complexity_triage import (  # noqa: E402
 from planner_state import auto_upgrade_workspace, bootstrap_workspace, mark_docs_migrated  # noqa: E402
 from schema_migrations import CURRENT_DOCS_FORMAT_VERSION, CURRENT_SCHEMA_VERSION, migrate_profile  # noqa: E402
 
-UNIVERSAL_CHECKLISTS: dict[str, list[str]] = {
-    "discovery": [
-        "grep/git grep first -> <=150L slices (`research` subagent if >=3 subsystems).",
-        "Check `AGENTS.md`, `GEMINI.md`, `.agents/docs/PROJECT_HISTORY.md`, README -> local invariants.",
-    ],
-    "contract": [
-        "Lock affected files, interfaces/signatures, state ownership && failure modes pre-edit.",
-    ],
-    "ui-frontend": [
-        "Guard responsive layout, !overflow/clipping, a11y && locale/i18n parity.",
-    ],
-    "api-backend": [
-        "Validate inputs, auth/perm boundaries, error responses && schema/contract backward-compat.",
-    ],
-    "core-logic": [
-        "Guard boundary cases (empty/null/EOF/overflow), state invariants && determinism.",
-    ],
-    "runtime-infra": [
-        "Audit concurrency/races, resource disposal/cleanup, exit codes && error logging.",
-    ],
-    "tests-qa": [
-        "Run real tests post-final-edit -> verify happy-path && edge/failure cases.",
-    ],
-    "build-ci": [
-        "Clear `.agents/docs/EXTRA_REQUESTS.md` first && pass build/packaging/CI checks.",
-    ],
-    "agent-infra": [
-        "Write agent docs in symbolic telegraphic EN; verify JSON/script syntax && run hook sim tests.",
-    ],
-    "plugin-self": [
-        "!break older `schema_version` -> add deterministic migrator in `scripts/schema_migrations.py`.",
-        "Preserve frozen `tests/fixtures/` && run `tests/run_plugin_tests.py` post-final-edit.",
-    ],
-    "harden": [
-        "Audit null/empty inputs, error msgs, cleanup && zero regression.",
-    ],
-    "audit": [
-        "Run `verify_universal.py` (`--build` on compiled code) && inspect `git diff` post-final-edit.",
-        "Verify `REQ-01..REQ-N` item-by-item vs observed files/outputs -> mark via `req-verify`.",
-    ],
-    "general": [
-        "Match repo coding style, naming && modular structure.",
-    ],
-}
+def _load_plan_domain_tables() -> tuple[dict[str, list[str]], dict[str, list[str]]]:
+    raw = json.loads((SCRIPTS_DIR / "domains.json").read_text(encoding="utf-8"))
+    checklists: dict[str, list[str]] = {}
+    for k, v in (raw.get("universal_checklists_extra") or {}).items():
+        if k in ("discovery", "contract"):
+            checklists[str(k)] = list(v or [])
+    for k, spec in (raw.get("triage_domains") or {}).items():
+        if isinstance(spec, dict) and spec.get("checklist"):
+            checklists[str(k)] = list(spec["checklist"])
+    for k, v in (raw.get("universal_checklists_extra") or {}).items():
+        if str(k) not in checklists:
+            checklists[str(k)] = list(v or [])
+    steps = {str(k): list(v or []) for k, v in (raw.get("default_module_steps") or {}).items()}
+    return checklists, steps
 
-DEFAULT_MODULE_STEPS: dict[str, list[str]] = {
-    "discovery": [
-        "Map affected files, symbols && call sites via grep/scoped slices (or `research` subagent).",
-        "Check conventions, pitfalls (`PROJECT_HISTORY.md`) && touched-area constraints.",
-    ],
-    "contract": [
-        "Specify exact file list, interfaces, state flow && failure/fallback behavior.",
-    ],
-    "harden": [
-        "Audit edge cases, error handling, cleanup && backward-compat.",
-    ],
-    "audit": [
-        "Run `verify_universal.py` (+ build/tests if applicable) && inspect `git diff --stat`.",
-        "Verify every `REQ-XX` vs observed files/outputs -> record `req-verify` evidence.",
-    ],
-}
+
+UNIVERSAL_CHECKLISTS, DEFAULT_MODULE_STEPS = _load_plan_domain_tables()
 
 TIER_NAMES = {0: "DIRECT", 1: "STANDARD", 2: "META_MODULES", 3: "FRACTAL_DEEP"}
 STATUS_ICON = {
@@ -1062,11 +1018,23 @@ def cmd_live_diag(args: argparse.Namespace, ws_root: Path) -> int:
 
 
 def cmd_blueprint(args: argparse.Namespace, ws_root: Path) -> int:
-    """Delegate to Universal SOTA Blueprint Engine (`blueprint_engine.py`)."""
+    """Delegate to Universal SOTA Blueprint Engine (`blueprint_engine.py`) or `wave_scheduler.py`."""
+    extra = list(args.extra_args or [])
+    if extra and extra[0] in ("schedule", "epoch-begin", "epoch-barrier", "lease", "checkpoint"):
+        import wave_scheduler  # noqa: E402
+
+        return wave_scheduler.main(["--workspace", str(ws_root), *extra])
     import blueprint_engine  # noqa: E402
 
-    sub_argv = ["--workspace", str(ws_root), *(args.extra_args or [])]
+    sub_argv = ["--workspace", str(ws_root), *extra]
     return blueprint_engine.main(sub_argv)
+
+
+def cmd_wave(args: argparse.Namespace, ws_root: Path) -> int:
+    """Delegate directly to `wave_scheduler.py` (`schedule|epoch-begin|epoch-barrier|lease|checkpoint`)."""
+    import wave_scheduler  # noqa: E402
+
+    return wave_scheduler.main(["--workspace", str(ws_root), *(args.extra_args or [])])
 
 
 def cmd_qa(args: argparse.Namespace, ws_root: Path) -> int:
@@ -1075,6 +1043,14 @@ def cmd_qa(args: argparse.Namespace, ws_root: Path) -> int:
 
     sub_argv = ["--workspace", str(ws_root), *(args.extra_args or [])]
     return qa_gate.main(sub_argv)
+
+
+def cmd_coherence(args: argparse.Namespace, ws_root: Path) -> int:
+    """Delegate to Zero-Static Ecosystem Coherence Engine (`coherence_engine.py`)."""
+    import coherence_engine  # noqa: E402
+
+    sub_argv = ["--workspace", str(ws_root), *(args.extra_args or [])]
+    return coherence_engine.main(sub_argv)
 
 
 def cmd_host(args: argparse.Namespace, ws_root: Path) -> int:
@@ -1247,15 +1223,27 @@ def main() -> None:
 
     p_bp = sub.add_parser(
         "blueprint",
-        help="Universal SOTA Blueprint Engine (classify|init|lint|score|status|list|handoff|hygiene|hub|compact|match|transition).",
+        help="Universal SOTA Blueprint Engine (classify|init|lint|score|status|list|handoff|hygiene|hub|compact|match|transition|schedule).",
     )
     p_bp.add_argument("extra_args", nargs=argparse.REMAINDER)
+
+    p_wave = sub.add_parser(
+        "wave",
+        help="Deterministic Multi-Wave DAG Epoch Scheduler & Lease Guard (schedule|epoch-begin|epoch-barrier|lease|checkpoint).",
+    )
+    p_wave.add_argument("extra_args", nargs=argparse.REMAINDER)
 
     p_qa = sub.add_parser(
         "qa",
         help="Universal Adversarial QA Gate & Frozen Regression Contracts (status|verify-contracts|gate|prompt|add-contract).",
     )
     p_qa.add_argument("extra_args", nargs=argparse.REMAINDER)
+
+    p_coh = sub.add_parser(
+        "coherence",
+        help="Zero-Static Ecosystem Coherence Engine (check|sync|audit|deprecate|fleet|prompt).",
+    )
+    p_coh.add_argument("extra_args", nargs=argparse.REMAINDER)
 
     for h_cmd, h_help in (
         ("host-boot", "Run unified host-aware session boot (Antigravity local vs AI Studio cloud)."),
@@ -1308,8 +1296,12 @@ def main() -> None:
         raise SystemExit(cmd_live_diag(args, ws_root))
     if args.cmd == "blueprint":
         raise SystemExit(cmd_blueprint(args, ws_root))
+    if args.cmd == "wave":
+        raise SystemExit(cmd_wave(args, ws_root))
     if args.cmd == "qa":
         raise SystemExit(cmd_qa(args, ws_root))
+    if args.cmd == "coherence":
+        raise SystemExit(cmd_coherence(args, ws_root))
     if args.cmd in ("host-boot", "host-status", "host-audit", "host-classify"):
         raise SystemExit(cmd_host(args, ws_root))
 

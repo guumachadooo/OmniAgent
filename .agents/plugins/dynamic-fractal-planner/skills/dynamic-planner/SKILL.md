@@ -6,9 +6,14 @@ description: >-
   turn snapshots (`undo-turn`), and 1-turn audit sign-off (`finish`).
 ---
 
-# Dynamic Fractal Planner (`dynamic-planner` v3 / Plugin v2.17.0)
+# Dynamic Fractal Planner (`dynamic-planner` v3 / Plugin v2.22.0)
 
-Scripts (`~/.gemini/config/plugins/dynamic-fractal-planner/scripts/`): `plan_tool.py` | `blueprint_engine.py` | `verify_universal.py` | `log_digest.py` | `repo_map.py`
+Scripts (`~/.gemini/config/plugins/dynamic-fractal-planner/scripts/`): `plan_tool.py` | `coherence_engine.py` | `blueprint_engine.py` | `wave_scheduler.py` | `verify_universal.py` | `log_digest.py` | `repo_map.py`
+
+<!--AUTO:START:dfp-cli-domains:sha256=bdc4170332ac-->
+AUTO_SSOT|plugin=v2.22.0|triage_domains=agent-infra,api-backend,build-ci,core-logic,plugin-self,runtime-infra,tests-qa,ui-frontend|verify_checks=19
+AUTO_CLI|`plan_tool.py`: `triage|bootstrap|migrate|docs-migrated|init|add-module|expand-step|start|done|req-verify|pause|status|next|audit|finish|handoff|recon|undo-turn|stats|diagnostics|model-mode|evolve|learn|live-diag|blueprint|wave|qa|coherence|host-classify|host-boot|host-status|host-audit`
+<!--AUTO:END:dfp-cli-domains-->
 
 ## Modes
 | Mode | Activation | Flow |
@@ -26,7 +31,7 @@ Scripts (`~/.gemini/config/plugins/dynamic-fractal-planner/scripts/`): `plan_too
 - Token Diet: `repo_map.py --workspace .` (`/tmp` cache) | `read_file` `<=250L` slice | archive docs `>150L` -> explicit `StartLine&EndLine <=120L` | `log_digest.py <log> [--errors-only]`.
 - Doc/Plan Style: ALL `plan_tool.py` args (`--goal`, `--req`, `--evidence`, `--summary`, `--next`) && agent memory docs -> lossless symbolic telegraphic EN (`!articles/copulas/filler`, ops `-> | && || ! w/ w/o`, verbatim `path:sym`, invariants).
 - External API Docs (MCP): Unknown external APIs/SDKs/flags -> consult `Context7` (`resolve-library-id`->`query-docs`) \|\| `Google Developer Knowledge` (`search_documents`/`answer_query`) BEFORE guessing.
-- Key CLI ops: `triage --prompt "..."` | `bootstrap [--embed-plugin]` | `evolve {classify|sync|sync-plugin|sync-all --apply --push}` | `blueprint {classify|init|lint|score|status|list|handoff}` (playbook: `skills/sota-blueprint/SKILL.md`) | `init` | `start` | `expand-step` | `add-module` | `done` | `req-verify` | `finish --evidence "..."` | `recon {start|stop|status}` | `model-mode {set|get|list|clear}` | `docs-migrated` | `diag [--clear]` | `undo-turn [--dry-run]` | `handoff [--roadmap --wave --archive] --summary "..." --next "..."` | `stats`.
+- Key CLI ops: `triage --prompt "..."` | `bootstrap [--embed-plugin]` | `evolve {classify|sync|sync-plugin|sync-all --apply --push}` | `blueprint {classify|init|lint|score|status|list|handoff|schedule}` | `wave {schedule|epoch-begin|epoch-barrier|lease|checkpoint}` (playbook: `skills/sota-blueprint/SKILL.md`) | `init` | `start` | `expand-step` | `add-module` | `done` | `req-verify` | `finish --evidence "..."` | `recon {start|stop|status}` | `model-mode {set|get|list|clear}` | `docs-migrated` | `diag [--clear]` | `undo-turn [--dry-run]` | `handoff [--roadmap --wave --archive] --summary "..." --next "..."` | `stats`.
 - Verify pre-stop: `verify_universal.py [--build] [--full] --git-stat` (static `wiring_gate` + `key_parity_rules.ref_regex` + `diff_rules.path_prefixes` + multi-layer `build_rules` shadow cascade w/ global diag dedup; `Stop` runs silent static checks on `needs_verify && !needs_build`).
 
 ## Thin-Coordinator Delegation & Model Routing (v5)
