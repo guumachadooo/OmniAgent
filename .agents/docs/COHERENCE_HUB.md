@@ -19,8 +19,11 @@ DEP|flight-recorder-recover-alias|GRACE|cli:flight_recorder.py recover|flight_re
 DEP|legacy-error-learner-wrapper|WARN|.agents/scripts/error_learner.py|plan_tool.py learn|owner=dfp|expires_ver=2.24.0
 
 ## 3. COVERAGE_MATRIX
-COV|plugin=v2.22.0|triage_domains=8|bp_domains=8|verify_checks=19|hooks=9(unwired=0)
+COV|plugin=v2.22.5|triage_domains=8|bp_domains=8|verify_checks=20|hooks=9(unwired=0)
 COV|host_matrix_strict=true|host_entries=11|auto_blocks=2(drifted=0)|deprecated=3
 
 ## 4. CROSS_REPO_PARITY
 PARITY|SKIP|local_only
+
+## 5. CONSTITUTION_AND_META_GOV
+CONSTITUTION|T0=immutable_canary|T1=ssot_parity|T2=observe_telemetry|anchors=0(drifted=0)|plane2_cap=4/wk
