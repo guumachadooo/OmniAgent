@@ -1389,6 +1389,52 @@ class OmniAgentProtocolTests(unittest.TestCase):
         finally:
             proto.http_json = orig_http
 
+    def test_q2_cavernize_watchdog_native_and_timed_ping_fallback(self) -> None:
+        from unittest import mock
+
+        payload = oac.build_cavernize_watchdog_payload(timeout_sec=1, reset_baseline=True)
+        self.assertEqual(payload, {"timeoutSec": 2, "resetBaseline": True})
+
+        # 1. Native OmniAgent `cavernize_watchdog` command succeeds directly when advertised
+        native_resp = {
+            "ok": True,
+            "state": "ALIVE",
+            "alive": True,
+            "pid": 14200,
+            "sessionId": "sid-a",
+            "elapsedMs": 14,
+        }
+        st_with_cap = (200, {"ok": True, "channels": {"android": {"capabilities": ["ping", "cavernize_cmd", "cavernize_watchdog"]}}})
+        with mock.patch.object(proto, "http_json", return_value=st_with_cap), \
+             mock.patch.object(oac, "send_agent_command", return_value=native_resp) as m_send:
+            w1 = oac.probe_cavernize_watchdog("https://example.workers.dev", self.KEY, timeout_sec=6)
+        self.assertTrue(w1["ok"])
+        self.assertEqual(w1["state"], "ALIVE")
+        self.assertEqual(w1["pid"], 14200)
+        self.assertEqual(w1["mode"], "external_omniagent")
+        self.assertEqual(m_send.call_args.args[2], "cavernize_watchdog")
+
+        # 2. Older OmniAgent APK without `cavernize_watchdog` capability skips straight to externally timed `cavernize_cmd ping`
+        ping_body = json.dumps({"status": "online", "pid": 14201, "sessionId": "sid-b", "uiHostAttached": True, "appVersion": "2.9.83"})
+        st_no_cap = (200, {"ok": True, "channels": {"android": {"capabilities": ["ping", "cavernize_cmd"]}}})
+        with mock.patch.object(proto, "http_json", return_value=st_no_cap), \
+             mock.patch.object(oac, "send_agent_command", return_value={"ok": True, "elapsedMs": 9, "body": ping_body}) as m_fb:
+            w2 = oac.probe_cavernize_watchdog("https://example.workers.dev", self.KEY, timeout_sec=6)
+        self.assertTrue(w2["ok"])
+        self.assertTrue(w2["alive"])
+        self.assertEqual(w2["state"], "ALIVE")
+        self.assertEqual(w2["pid"], 14201)
+        self.assertEqual(w2["mode"], "external_timed_ping_fallback")
+        m_fb.assert_called_once()
+        self.assertEqual(m_fb.call_args.args[2], "cavernize_cmd")
+
+        # 3. Fallback timed ping times out -> classified as UNRESPONSIVE_ANR
+        with mock.patch.object(proto, "http_json", return_value=st_no_cap), \
+             mock.patch.object(oac, "send_agent_command", return_value={"ok": False, "error": "Timeout waiting for android response"}):
+            w3 = oac.probe_cavernize_watchdog("https://example.workers.dev", self.KEY, timeout_sec=5)
+        self.assertFalse(w3["alive"])
+        self.assertEqual(w3["state"], "UNRESPONSIVE_ANR")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

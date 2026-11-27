@@ -135,6 +135,35 @@ def compute_diff_fingerprint(
     return h.hexdigest()
 
 
+def _git_blob_sha1(raw: bytes) -> str:
+    return hashlib.sha1(f"blob {len(raw)}\x00".encode("ascii") + raw).hexdigest()
+
+
+def _quick_stat_signature(workspace: Path) -> dict[str, tuple[int, int]]:
+    """Ultra-fast stat-only signature (no file reads) used to detect container hydration quiescence."""
+    root = workspace.resolve()
+    sig: dict[str, tuple[int, int]] = {}
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(d for d in dirnames if d not in proto.SKIP_SYNC_DIRS)
+        dpath = Path(dirpath)
+        for fname in sorted(filenames):
+            if fname in proto.SKIP_SYNC_FILES:
+                continue
+            full = dpath / fname
+            try:
+                rel = full.relative_to(root).as_posix()
+            except ValueError:
+                continue
+            if not proto.should_include_workspace_path(rel):
+                continue
+            try:
+                st = full.stat()
+            except OSError:
+                continue
+            sig[rel] = (st.st_mtime_ns, st.st_size)
+    return sig
+
+
 class LiveSyncWatcher:
     def __init__(
         self,
@@ -143,15 +172,21 @@ class LiveSyncWatcher:
         *,
         poll_sec: float = DEFAULT_POLL_SEC,
         debounce_sec: float = DEFAULT_DEBOUNCE_SEC,
+        startup_settle_sec: float = 0.0,
         use_remote: bool = True,
         apply_live_mirror: bool = True,
+        enable_github_head_filter: bool = True,
+        enable_remote_rollback_guard: bool = True,
     ) -> None:
         self.workspace = workspace.resolve()
         self.local_dir = local_dir.resolve()
         self.poll_sec = max(0.3, float(poll_sec))
         self.debounce_sec = max(0.0, float(debounce_sec))
+        self.startup_settle_sec = max(0.0, float(startup_settle_sec))
         self.use_remote = use_remote
         self.apply_live_mirror = apply_live_mirror
+        self.enable_github_head_filter = enable_github_head_filter
+        self.enable_remote_rollback_guard = enable_remote_rollback_guard
 
         self.running = True
         self.stat_cache: dict[str, tuple[int, int, str]] = {}
@@ -166,9 +201,127 @@ class LiveSyncWatcher:
         self.last_result: dict[str, Any] = {}
         self.mirrored_files: list[str] = []
         self.skipped_conflicts: list[str] = []
+        self._gh_tree_cache: dict[str, str] | None = None
+        self._gh_tree_fetched_at: float = 0.0
+        self._remote_guard_cleared: bool = False
 
         self.pid_path = self.local_dir / "watcher.pid"
         self.status_path = self.local_dir / "watcher_status.json"
+
+    def _wait_for_workspace_quiescence(self, max_wait_sec: float = 12.0) -> None:
+        """Wait for 2 identical stat scans separated by startup_settle_sec so container hydration finishes before baseline."""
+        if self.startup_settle_sec <= 0.0:
+            return
+        deadline = time.monotonic() + max_wait_sec
+        prev_sig = _quick_stat_signature(self.workspace)
+        while self.running and time.monotonic() < deadline:
+            time.sleep(min(self.startup_settle_sec, max(0.1, deadline - time.monotonic())))
+            cur_sig = _quick_stat_signature(self.workspace)
+            if cur_sig == prev_sig:
+                return
+            prev_sig = cur_sig
+
+    def _get_github_head_blobs(self) -> dict[str, str] | None:
+        if not self.enable_github_head_filter or not self.use_remote:
+            return None
+        now = time.monotonic()
+        if self._gh_tree_cache is not None and (now - self._gh_tree_fetched_at) < 60.0:
+            return self._gh_tree_cache
+        try:
+            import github_direct as ghdirect
+            import local_capabilities as lcap
+
+            tok = lcap.get_secret("GITHUB_TOKEN", aliases=("GH_TOKEN",))
+            if not tok:
+                return None
+            _, tree = ghdirect.fetch_remote_tree("guumachadooo/Cavern", "master", tok)
+            if isinstance(tree, dict) and tree:
+                self._gh_tree_cache = tree
+                self._gh_tree_fetched_at = now
+                return tree
+        except Exception:
+            pass
+        return self._gh_tree_cache
+
+    def _filter_github_head_hydration(
+        self,
+        changed: list[str],
+        deleted: list[str],
+        current: dict[str, dict[str, Any]],
+    ) -> tuple[list[str], list[str], int]:
+        """Exclude files whose content matches GitHub HEAD (container hydration artifacts, NOT user edits)."""
+        if not changed or not self.enable_github_head_filter:
+            return changed, deleted, 0
+        gh_blobs = self._get_github_head_blobs()
+        if not gh_blobs:
+            return changed, deleted, 0
+
+        kept: list[str] = []
+        filtered_count = 0
+        for rel in changed:
+            gh_sha = gh_blobs.get(rel)
+            if gh_sha:
+                full = self.workspace / rel
+                try:
+                    if full.is_file() and _git_blob_sha1(full.read_bytes()) == gh_sha:
+                        # Hydration artifact identical to GitHub HEAD -> adopt silently into baseline
+                        if rel in current:
+                            self.baseline[rel] = current[rel]
+                        filtered_count += 1
+                        continue
+                except OSError:
+                    pass
+            kept.append(rel)
+
+        if filtered_count > 0:
+            try:
+                bp = self._baseline_path()
+                if bp.is_file():
+                    payload = {
+                        "schema": fr.SCHEMA_VERSION,
+                        "workspace": str(self.workspace),
+                        "capturedUtc": _utc_now(),
+                        "fileCount": len(self.baseline),
+                        "manifest": self.baseline,
+                    }
+                    _atomic_write_json(bp, payload)
+                    self.baseline_mtime_ns = bp.stat().st_mtime_ns
+            except OSError:
+                pass
+        return kept, deleted, filtered_count
+
+    def _is_remote_rollback_protected(self) -> tuple[bool, str]:
+        """Before first remote push in a fresh container, ensure we NEVER clobber an active un-restored remote snapshot."""
+        if not self.enable_remote_rollback_guard or not self.use_remote or self._remote_guard_cleared:
+            return False, ""
+        # If local latest.json already exists, this container already has local session state or restored cleanly.
+        if fr.read_local_tier(self.local_dir) is not None:
+            self._remote_guard_cleared = True
+            return False, ""
+        auth = fr._try_resolve_remote_auth()
+        if not auth:
+            self._remote_guard_cleared = True
+            return False, ""
+        relay, secret, admin = auth
+        try:
+            remote_cp, _, _ = fr.read_cloud_tier(relay, secret, admin_key=admin, timeout=4)
+            if (
+                remote_cp
+                and remote_cp.get("status") == "active"
+                and remote_cp.get("hasBundle")
+                and (remote_cp.get("fileHashes") or remote_cp.get("deletedFiles"))
+            ):
+                rb = fr.detect_workspace_rollback(
+                    self.workspace,
+                    remote_cp.get("fileHashes") or {},
+                    remote_cp.get("deletedFiles") or [],
+                )
+                if rb.get("rollbackDetected"):
+                    return True, f"Remote active session {remote_cp.get('sessionId')}#{remote_cp.get('seq')} has un-restored edits"
+        except Exception:
+            pass
+        self._remote_guard_cleared = True
+        return False, ""
 
     def _baseline_path(self) -> Path:
         return self.local_dir / "baseline_manifest.json"
@@ -247,12 +400,34 @@ class LiveSyncWatcher:
             if now - self.pending_since < self.debounce_sec:
                 return {"ok": True, "synced": False, "reason": "debouncing", "changed": changed, "deleted": deleted}
 
-        # Settled! Pack and push to Tier 1 + Tier 3 (Cloudflare DO) + Tier 2 (Phone Antigravity live mirror)
+        # Settled! Filter GitHub-HEAD hydration artifacts before pushing remotely
+        changed, deleted, filtered_cnt = self._filter_github_head_hydration(changed, deleted, current)
+        if not changed and not deleted:
+            self.last_synced_fingerprint = ""
+            self.pending_fingerprint = ""
+            self.pending_since = 0.0
+            self.write_status(running=self.running, note=f"hydration_filtered:{filtered_cnt}")
+            return {"ok": True, "synced": False, "reason": "hydration_filtered", "filtered": filtered_cnt, "changed": [], "deleted": []}
+
+        # Fresh-container safety guard: NEVER overwrite an active remote checkpoint with un-restored rollback edits!
+        protected, protect_reason = self._is_remote_rollback_protected()
+        if protected:
+            self.write_status(running=self.running, note="paused_remote_rollback_protected")
+            return {
+                "ok": True,
+                "synced": False,
+                "reason": "remote_rollback_protected",
+                "detail": protect_reason,
+                "changed": changed,
+                "deleted": deleted,
+            }
+
+        # Settled & verified! Pack and push to Tier 1 + Tier 3 (fr_latest ONLY, never fr_semantic) + Tier 2 (Phone Antigravity live mirror)
         prev = fr.read_local_tier(self.local_dir)
         active_session = prev.get("sessionId") if (prev and prev.get("status") == "active") else ""
         summary_note = (
             prev.get("summary")
-            if (prev and prev.get("status") == "active" and prev.get("summary"))
+            if (prev and prev.get("status") == "active" and prev.get("summary") and not fr.is_auto_mirror_summary(prev.get("summary")))
             else f"Auto live-mirror ({len(changed)} modified/added, {len(deleted)} deleted)"
         )
         res = fr.save_checkpoint(
@@ -265,6 +440,7 @@ class LiveSyncWatcher:
             deleted=deleted,
             auto_diff=False,
             apply_live_mirror=self.apply_live_mirror,
+            source="auto_mirror",
             use_remote=self.use_remote,
             background=False,
         )
@@ -325,6 +501,7 @@ class LiveSyncWatcher:
     def run_forever(self) -> int:
         if not self.acquire_pid_lock():
             return 0
+        self._wait_for_workspace_quiescence()
         self.ensure_baseline()
         # Prime stat cache once without triggering remote push on clean startup
         scan_workspace_fast(self.workspace, self.stat_cache)
@@ -402,6 +579,7 @@ def main(argv: list[str] | None = None) -> int:
         local_dir=local_dir,
         poll_sec=args.poll,
         debounce_sec=args.debounce,
+        startup_settle_sec=1.5 if args.daemon else 0.0,
         use_remote=not args.no_remote,
         apply_live_mirror=not args.no_mirror,
     )

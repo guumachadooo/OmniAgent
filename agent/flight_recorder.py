@@ -42,20 +42,103 @@ if str(AGENT_DIR) not in sys.path:
 import bridge_auth as bauth
 import omni_protocol as proto
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 DEFAULT_LOCAL_DIR = Path(os.environ.get("CAVERN_FLIGHT_RECORDER_DIR", "/tmp/cavern-flight-recorder"))
 PHONE_AG_DIR = "/root/.gemini/antigravity"
 PHONE_FR_DIR = f"{PHONE_AG_DIR}/ai_studio_bridge/flight_recorder"
 PHONE_REPO_DIR = f"{PHONE_AG_DIR}/scratch/Cavern"
 CLOUD_TASK_ID = "fr_latest"
 CLOUD_ENVELOPE_CTX = "fr:latest"
+CLOUD_SEMANTIC_TASK_ID = "fr_semantic"
+CLOUD_SEMANTIC_CTX = "fr:semantic"
 CLOUD_INLINE_BUNDLE_MAX_BYTES = 140 * 1024  # comfortably under Worker's 256 KB /v1/swarm/enqueue cap
 TERMUX_INLINE_PAYLOAD_MAX_BYTES = 96 * 1024  # safe under shell ARG_MAX & Worker cmd body cap
 MAX_LOCAL_HISTORY = 25
+SEMANTIC_SCALAR_FIELDS = ("wave", "phase", "goal", "summary", "nextStep")
+SEMANTIC_LIST_FIELDS = ("requests", "findings", "decisions", "completed", "pending")
 
 
 def _utc_now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def is_auto_mirror_summary(text: Any) -> bool:
+    s = str(text or "").strip()
+    return not s or s.startswith("Auto live-mirror") or s in ("(live sync)", "Session initialized")
+
+
+def extract_semantic_record(cp: dict[str, Any]) -> dict[str, Any]:
+    """Extract lightweight semantic-only lane record (zero file blobs, <4 KB)."""
+    return {
+        "schema": SCHEMA_VERSION,
+        "sessionId": str(cp.get("sessionId") or ""),
+        "seq": int(cp.get("seq") or 0),
+        "status": str(cp.get("status") or "active"),
+        "source": str(cp.get("source") or "manual"),
+        "timestampUnix": float(cp.get("timestampUnix") or 0.0),
+        "updatedUtc": str(cp.get("updatedUtc") or ""),
+        "wave": str(cp.get("wave") or ""),
+        "phase": str(cp.get("phase") or ""),
+        "goal": str(cp.get("goal") or ""),
+        "summary": str(cp.get("summary") or ""),
+        "nextStep": str(cp.get("nextStep") or ""),
+        "commit": str(cp.get("commit") or ""),
+        "requests": list(cp.get("requests") or []),
+        "findings": list(cp.get("findings") or []),
+        "decisions": list(cp.get("decisions") or []),
+        "completed": list(cp.get("completed") or []),
+        "pending": list(cp.get("pending") or []),
+    }
+
+
+def _has_semantic_content(rec: dict[str, Any] | None) -> bool:
+    if not isinstance(rec, dict):
+        return False
+    if any(str(rec.get(k) or "").strip() for k in ("wave", "goal", "nextStep")):
+        return True
+    if not is_auto_mirror_summary(rec.get("summary")):
+        return True
+    return any(bool(rec.get(k)) for k in SEMANTIC_LIST_FIELDS)
+
+
+def merge_semantic_into_checkpoint(
+    cp: dict[str, Any],
+    sem: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Merge durable semantic-lane fields into a checkpoint without letting auto_mirror clobber intent."""
+    out = dict(cp)
+    if not isinstance(sem, dict) or not _has_semantic_content(sem):
+        return out
+
+    cp_is_mirror = str(out.get("source") or "") == "auto_mirror" or is_auto_mirror_summary(out.get("summary"))
+    cp_closed = str(out.get("status") or "") == "closed"
+    sem_ts = float(sem.get("timestampUnix") or 0.0)
+    cp_ts = float(out.get("timestampUnix") or 0.0)
+
+    # Never reopen a cleanly closed session from an older semantic snapshot
+    if cp_closed and sem_ts <= cp_ts:
+        for k in ("wave", "goal", "nextStep"):
+            if not str(out.get(k) or "").strip() and str(sem.get(k) or "").strip():
+                out[k] = sem[k]
+        return out
+
+    for k in ("wave", "goal", "nextStep"):
+        if (not str(out.get(k) or "").strip() or cp_is_mirror) and str(sem.get(k) or "").strip():
+            out[k] = sem[k]
+
+    if (not str(out.get("phase") or "").strip() or out.get("phase") == "live-auto-mirror") and str(sem.get("phase") or "").strip():
+        out["phase"] = sem["phase"]
+
+    if (is_auto_mirror_summary(out.get("summary")) or cp_is_mirror) and not is_auto_mirror_summary(sem.get("summary")):
+        out["summary"] = sem["summary"]
+
+    for k in SEMANTIC_LIST_FIELDS:
+        if not out.get(k) and sem.get(k):
+            out[k] = list(sem[k])
+        elif cp_is_mirror and sem.get(k):
+            out[k] = _dedupe_append(list(sem[k]), list(out.get(k) or []))
+
+    return out
 
 
 def _safe_json_loads(raw: str) -> dict[str, Any] | None:
@@ -298,6 +381,21 @@ def write_local_tier(
     }
 
 
+def write_local_semantic(local_dir: Path, sem: dict[str, Any]) -> None:
+    _ensure_local_dir(local_dir)
+    p = local_dir / "semantic.json"
+    tmp = p.with_name(f"{p.name}.tmp.{os.getpid()}")
+    tmp.write_text(json.dumps(sem, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    os.replace(tmp, p)
+
+
+def read_local_semantic(local_dir: Path) -> dict[str, Any] | None:
+    p = local_dir / "semantic.json"
+    if not p.is_file():
+        return None
+    return _safe_json_loads(p.read_text(encoding="utf-8"))
+
+
 def read_local_tier(local_dir: Path) -> dict[str, Any] | None:
     p = local_dir / "latest.json"
     if not p.is_file():
@@ -347,6 +445,9 @@ def write_cloud_tier(
     bundle_gz_b64: str | None,
     *,
     admin_key: str = "",
+    task_id: str = CLOUD_TASK_ID,
+    env_ctx: str = CLOUD_ENVELOPE_CTX,
+    timeout: int = 12,
 ) -> dict[str, Any]:
     """Store E2E-encrypted checkpoint in Cloudflare Hub v6 SQLite DO via /v1/swarm/enqueue."""
     headers = proto.derive_agent_headers(pair_secret, channel="termux", admin_key=admin_key)
@@ -356,27 +457,27 @@ def write_cloud_tier(
         payload["bundleGzB64"] = bundle_gz_b64
         inline_included = True
 
-    env = proto.encrypt_envelope(pair_secret, CLOUD_ENVELOPE_CTX, payload)
+    env = proto.encrypt_envelope(pair_secret, env_ctx, payload)
     # Double-check body size stays comfortably below Worker's 256 KB cap
     body = {
-        "taskId": CLOUD_TASK_ID,
+        "taskId": task_id,
         "role": "flight_recorder",
         "title": f"FR:{cp.get('sessionId', 'session')}#{cp.get('seq', 0)}:{cp.get('wave', '')}"[:120],
         "createdBy": "aistudio-flight-recorder",
-        "instructions": "E2E-encrypted Flight Recorder checkpoint (decrypt with pairSecret ctx fr:latest)",
+        "instructions": f"E2E-encrypted Flight Recorder checkpoint (decrypt with pairSecret ctx {env_ctx})",
         "envelope": env,
     }
     if len(json.dumps(body, separators=(",", ":"))) > 235 * 1024 and inline_included:
         payload.pop("bundleGzB64", None)
         inline_included = False
-        body["envelope"] = proto.encrypt_envelope(pair_secret, CLOUD_ENVELOPE_CTX, payload)
+        body["envelope"] = proto.encrypt_envelope(pair_secret, env_ctx, payload)
 
-    st, resp = proto.http_json("POST", f"{relay_url}/v1/swarm/enqueue", headers, body, timeout=20)
+    st, resp = proto.http_json("POST", f"{relay_url}/v1/swarm/enqueue", headers, body, timeout=timeout)
     ok = st < 400 and bool(resp.get("ok"))
     return {
         "ok": ok,
         "status": st,
-        "taskId": CLOUD_TASK_ID,
+        "taskId": task_id,
         "inlineBundle": inline_included,
         "error": "" if ok else str(resp.get("error") or resp),
     }
@@ -387,14 +488,17 @@ def read_cloud_tier(
     pair_secret: str,
     *,
     admin_key: str = "",
+    task_id: str = CLOUD_TASK_ID,
+    env_ctx: str = CLOUD_ENVELOPE_CTX,
+    timeout: int = 6,
 ) -> tuple[dict[str, Any] | None, str | None, str]:
     """Return (checkpoint_dict, inline_bundle_gz_b64, error_string)."""
     headers = proto.derive_agent_headers(pair_secret, channel="termux", admin_key=admin_key)
     st, resp = proto.http_json(
         "GET",
-        f"{relay_url}/v1/swarm/task?taskId={urllib.parse.quote(CLOUD_TASK_ID)}",
+        f"{relay_url}/v1/swarm/task?taskId={urllib.parse.quote(task_id)}",
         headers,
-        timeout=15,
+        timeout=timeout,
     )
     if st == 404 or not resp.get("ok"):
         return None, None, "" if st == 404 else str(resp.get("error") or f"HTTP {st}")
@@ -403,7 +507,7 @@ def read_cloud_tier(
     if not isinstance(env, dict):
         return None, None, "Cloud task has no E2E envelope"
     try:
-        dec = proto.decrypt_envelope(pair_secret, CLOUD_ENVELOPE_CTX, env)
+        dec = proto.decrypt_envelope(pair_secret, env_ctx, env)
     except Exception as exc:
         return None, None, f"Decrypt failed: {exc}"
     cp = dec.get("checkpoint") if isinstance(dec, dict) else None
@@ -414,6 +518,25 @@ def read_cloud_tier(
 # ==================== TIER 2: PHONE TERMUX PERMANENT STORAGE ====================
 
 
+def _check_termux_online_fast(
+    relay_url: str,
+    pair_secret: str,
+    *,
+    admin_key: str = "",
+    timeout: int = 4,
+) -> bool:
+    """Fast ~180ms Cloudflare DO check so read-only probes never stall waiting on a sleeping Termux daemon."""
+    try:
+        headers = proto.derive_agent_headers(pair_secret, channel="termux", admin_key=admin_key)
+        st, resp = proto.http_json("GET", f"{relay_url}/v1/agent/status?all=1", headers, timeout=timeout)
+        if st == 200 and resp.get("ok"):
+            chans = resp.get("channels") or {}
+            return bool((chans.get("termux") or {}).get("online"))
+    except Exception:
+        pass
+    return False
+
+
 def _send_termux_cmd(
     relay_url: str,
     pair_secret: str,
@@ -422,6 +545,7 @@ def _send_termux_cmd(
     *,
     admin_key: str = "",
     timeout_sec: int = 25,
+    auto_wake: bool = True,
 ) -> dict[str, Any]:
     import omni_agent_client as oac
 
@@ -433,6 +557,7 @@ def _send_termux_cmd(
         channel="termux",
         admin_key=admin_key,
         timeout_sec=timeout_sec,
+        auto_wake=auto_wake,
     )
 
 
@@ -506,7 +631,38 @@ def run_payload(payload: dict) -> dict:
     ts = int(cp.get("timestampUnix") or 0)
 
     (fr_dir / "history").mkdir(parents=True, exist_ok=True)
-    cp_text = json.dumps(cp, indent=2, ensure_ascii=False) + "\n"
+    sem_path = fr_dir / "semantic.json"
+    is_auto = str(cp.get("source") or "") == "auto_mirror" or str(cp.get("summary") or "").startswith("Auto live-mirror")
+
+    if isinstance(payload.get("semanticCheckpoint"), dict):
+        atomic_write_text(sem_path, json.dumps(payload["semanticCheckpoint"], indent=2, ensure_ascii=False) + "\n")
+
+    # Preserve durable semantic lane when an auto_mirror tick writes latest.json / LATEST_HANDOFF.md
+    effective_cp = dict(cp)
+    if is_auto and sem_path.is_file():
+        try:
+            sem = json.loads(sem_path.read_text(encoding="utf-8"))
+            if isinstance(sem, dict):
+                sem_closed = str(sem.get("status") or "") == "closed"
+                if not sem_closed:
+                    for k in ("wave", "goal", "nextStep"):
+                        if str(sem.get(k) or "").strip() and not str(effective_cp.get(k) or "").strip():
+                            effective_cp[k] = sem[k]
+                    if str(sem.get("phase") or "").strip() and effective_cp.get("phase") in ("", "live-auto-mirror"):
+                        effective_cp["phase"] = sem["phase"]
+                    s_sum = str(sem.get("summary") or "").strip()
+                    if s_sum and not s_sum.startswith("Auto live-mirror") and (
+                        not str(effective_cp.get("summary") or "").strip()
+                        or str(effective_cp.get("summary") or "").startswith("Auto live-mirror")
+                    ):
+                        effective_cp["summary"] = s_sum
+                    for lk in ("requests", "findings", "decisions", "completed", "pending"):
+                        if sem.get(lk) and not effective_cp.get(lk):
+                            effective_cp[lk] = list(sem[lk])
+        except Exception:
+            pass
+
+    cp_text = json.dumps(effective_cp, indent=2, ensure_ascii=False) + "\n"
     atomic_write_text(fr_dir / "latest.json", cp_text)
     atomic_write_text(fr_dir / "LATEST_DIARY.md", diary_md)
     atomic_write_text(fr_dir / "history" / f"cp_{seq:04d}_{ts}.json", cp_text)
@@ -538,26 +694,32 @@ def run_payload(payload: dict) -> dict:
         bridge_dir = ag_dir / "ai_studio_bridge"
         sessions_dir = bridge_dir / "sessions"
         sessions_dir.mkdir(parents=True, exist_ok=True)
-        sid_raw = str(cp.get("sessionId") or "aistudio_live")
+        sid_raw = str(effective_cp.get("sessionId") or "aistudio_live")
         safe_id = "".join(c for c in sid_raw if c.isalnum() or c in ("_", "-"))[:64] or "session"
-        title = f"{cp.get('wave') or 'AI Studio'} — {cp.get('phase') or cp.get('status') or 'live'}"
-        files_list = sorted((cp.get("fileHashes") or {}).keys())[:64]
+        title = f"{effective_cp.get('wave') or 'AI Studio'} — {effective_cp.get('phase') or effective_cp.get('status') or 'live'}"
+        files_list = sorted((effective_cp.get("fileHashes") or {}).keys())[:64]
         lines = [
             f"# {title}",
-            f"- **UTC**: `{cp.get('updatedUtc', '')}` | **Session**: `{safe_id}` (seq `#{seq}`) | **Status**: `{cp.get('status', 'active')}` | **Commit**: `{cp.get('commit') or 'live-mirror'}`",
+            f"- **UTC**: `{effective_cp.get('updatedUtc', '')}` | **Session**: `{safe_id}` (seq `#{seq}`) | **Status**: `{effective_cp.get('status', 'active')}` | **Commit**: `{effective_cp.get('commit') or 'live-mirror'}`",
             f"- **Repo**: `{repo_dir}`",
             "",
             "## Compact Summary (Token-Diet)",
-            str(cp.get("summary") or cp.get("goal") or "(live sync)"),
+            str(effective_cp.get("summary") or effective_cp.get("goal") or "(live sync)"),
             "",
         ]
+        if effective_cp.get("goal") and effective_cp.get("goal") != effective_cp.get("summary"):
+            lines.append(f"- **Goal**: {effective_cp['goal']}")
+        if effective_cp.get("pending"):
+            lines.append("## Pending")
+            lines.extend(f"- {p}" for p in list(effective_cp["pending"])[:12])
+            lines.append("")
         if files_list:
             lines.append("## Live Mirrored / Tracked Files")
             lines.extend(f"- `{f}`" for f in files_list)
             lines.append("")
-        if cp.get("nextStep"):
+        if effective_cp.get("nextStep"):
             lines.append("## Next")
-            lines.append(str(cp["nextStep"]))
+            lines.append(str(effective_cp["nextStep"]))
             lines.append("")
         handoff_text = "\n".join(lines)
         atomic_write_text(sessions_dir / f"{safe_id}.md", handoff_text)
@@ -574,13 +736,13 @@ def run_payload(payload: dict) -> dict:
                 index = []
         entry = {
             "sessionId": safe_id,
-            "utc": cp.get("updatedUtc", ""),
+            "utc": effective_cp.get("updatedUtc", ""),
             "repo": str(repo_dir),
             "title": title[:160],
-            "commit": str(cp.get("commit") or "")[:64],
+            "commit": str(effective_cp.get("commit") or "")[:64],
             "files": files_list,
-            "summary": str(cp.get("summary") or cp.get("goal") or "")[:4000],
-            "next": str(cp.get("nextStep") or "")[:1000],
+            "summary": str(effective_cp.get("summary") or effective_cp.get("goal") or "")[:4000],
+            "next": str(effective_cp.get("nextStep") or "")[:1000],
         }
         index = [x for x in index if x.get("sessionId") != safe_id]
         index.insert(0, entry)
@@ -692,70 +854,187 @@ def build_termux_atomic_sync_script() -> str:
     return _TERMUX_ATOMIC_SYNC_RUNNER.strip()
 
 
-def build_termux_reconcile_pull_script(remote: str = "origin", branch: str = "master") -> str:
-    """Return a single-RPC script that safely reverts ONLY unmodified live-mirrored files before git pull --rebase."""
+def build_termux_reconcile_pull_script(
+    remote: str = "origin",
+    branch: str = "master",
+    state_path: str = "",
+) -> str:
+    """Return a single-RPC content-addressed reconcile + FF-only pull script.
+
+    1. Fetches `<remote> <branch>` FIRST.
+    2. Builds `<remote>/<branch>` git blob SHA-1 map (`git ls-tree -r`).
+    3. Reconciles tracked/untracked dirty files that match `live_mirror_state.json`
+       OR are byte-for-byte identical to `<remote>/<branch>` (already pushed!).
+    4. Preserves any genuine manual local phone edits via `git stash push -u` + `git stash pop`.
+    5. Pulls via `git pull --ff-only` (falling back to `--rebase` ONLY if local commits exist ahead).
+    """
     safe_remote = json.dumps(remote or "origin")
     safe_branch = json.dumps(branch or "master")
-    safe_state = json.dumps(f"{PHONE_FR_DIR}/live_mirror_state.json")
+    safe_state = json.dumps(state_path or f"{PHONE_FR_DIR}/live_mirror_state.json")
     return f"""
 import hashlib, json, os, subprocess
 from pathlib import Path
 
 repo = Path.cwd().resolve()
+remote = {safe_remote}
+branch = {safe_branch}
 state_path = Path({safe_state}).expanduser()
 reconciled = []
 preserved_manual = []
 
+def git_blob_sha1(raw: bytes) -> str:
+    return hashlib.sha1(f"blob {{len(raw)}}\\x00".encode("ascii") + raw).hexdigest()
+
+r_fetch = subprocess.run(["git", "fetch", remote, branch], cwd=str(repo), capture_output=True, text=True, timeout=60, check=False)
+
+remote_ref = f"{{remote}}/{{branch}}"
+remote_blobs = {{}}
+r_tree = subprocess.run(["git", "ls-tree", "-r", "-z", remote_ref], cwd=str(repo), capture_output=True, timeout=30, check=False)
+if r_tree.returncode == 0:
+    for entry in r_tree.stdout.split(b"\\x00"):
+        if not entry or b"\\t" not in entry:
+            continue
+        meta_b, path_b = entry.split(b"\\t", 1)
+        parts = meta_b.decode("utf-8", errors="ignore").split()
+        if len(parts) >= 3 and parts[1] == "blob":
+            remote_blobs[path_b.decode("utf-8", errors="replace").replace("\\\\", "/")] = parts[2]
+
+mirrored = {{}}
 if state_path.is_file():
     try:
-        state = json.loads(state_path.read_text(encoding="utf-8"))
+        loaded = json.loads(state_path.read_text(encoding="utf-8"))
+        if isinstance(loaded, dict) and isinstance(loaded.get("mirrored"), dict):
+            mirrored = loaded["mirrored"]
     except Exception:
-        state = {{}}
-    mirrored = state.get("mirrored") if isinstance(state, dict) else {{}}
-    if isinstance(mirrored, dict) and mirrored:
-        remaining = {{}}
-        to_checkout = []
-        for rel, rec in mirrored.items():
-            norm = str(rel).replace("\\\\", "/").lstrip("/")
-            if not norm or ".." in Path(norm).parts:
-                continue
-            full = (repo / norm).resolve()
-            try:
-                full.relative_to(repo)
-            except ValueError:
-                continue
-            expected_sha = str((rec or {{}}).get("sha256") or "")
-            existed_before = bool((rec or {{}}).get("existedBefore", True))
-            if not full.is_file():
-                reconciled.append(norm)
-                continue
-            actual_sha = hashlib.sha256(full.read_bytes()).hexdigest()
-            if expected_sha and actual_sha == expected_sha:
-                if existed_before:
-                    to_checkout.append(norm)
-                else:
-                    try:
-                        full.unlink()
-                    except OSError:
-                        pass
-                reconciled.append(norm)
-            else:
-                preserved_manual.append(norm)
-                remaining[norm] = rec
-        if to_checkout:
-            subprocess.run(["git", "checkout", "--", *to_checkout], cwd=str(repo), capture_output=True, timeout=30, check=False)
-        tmp = state_path.with_name(state_path.name + f".tmp.{{os.getpid()}}")
-        tmp.write_text(json.dumps({{"mirrored": remaining}}, indent=2) + "\\n", encoding="utf-8")
-        os.replace(tmp, state_path)
+        mirrored = {{}}
 
-r_fetch = subprocess.run(["git", "fetch", {safe_remote}], cwd=str(repo), capture_output=True, text=True, timeout=60, check=False)
-r_pull = subprocess.run(["git", "pull", "--rebase", {safe_remote}, {safe_branch}], cwd=str(repo), capture_output=True, text=True, timeout=90, check=False)
+remaining_mirrored = dict(mirrored)
+to_checkout = []
+stash_targets = []
+ignore_prefixes = (".tmp_", "__pycache__/", ".agents/.bridge_vault.json", ".agents/.metrics.jsonl", ".agents/.model_modes.json", "public/assets/aistudio/")
+
+r_st = subprocess.run(["git", "status", "--porcelain", "-z", "-uall"], cwd=str(repo), capture_output=True, timeout=20, check=False)
+entries = []
+if r_st.returncode == 0:
+    parts = r_st.stdout.split(b"\\x00")
+    i = 0
+    while i < len(parts):
+        ent = parts[i]
+        if len(ent) >= 4:
+            code = ent[:2].decode("utf-8", errors="ignore")
+            rel = ent[3:].decode("utf-8", errors="replace").replace("\\\\", "/").lstrip("/")
+            if rel and ".." not in Path(rel).parts:
+                entries.append((code, rel))
+            if "R" in code or "C" in code:
+                i += 1
+        i += 1
+
+for code, norm in entries:
+    if any(norm.startswith(pfx) or f"/{{pfx}}" in norm for pfx in ignore_prefixes):
+        continue
+    full = (repo / norm).resolve()
+    try:
+        full.relative_to(repo)
+    except ValueError:
+        continue
+    rec = mirrored.get(norm)
+    expected_sha256 = str((rec or {{}}).get("sha256") or "")
+    is_untracked = code == "??"
+
+    if not full.is_file():
+        # Deleted locally: reconcile if also absent on remote or tracked as mirrored
+        if (norm not in remote_blobs) or (rec is not None):
+            if not is_untracked:
+                to_checkout.append(norm)
+            reconciled.append(norm)
+            remaining_mirrored.pop(norm, None)
+        else:
+            preserved_manual.append(norm)
+            stash_targets.append(norm)
+        continue
+
+    raw = full.read_bytes()
+    actual_sha256 = hashlib.sha256(raw).hexdigest()
+    actual_blob = git_blob_sha1(raw)
+    matches_mirror = bool(expected_sha256 and actual_sha256 == expected_sha256)
+    matches_remote = bool(norm in remote_blobs and remote_blobs[norm] == actual_blob)
+
+    if is_untracked:
+        if matches_mirror or matches_remote:
+            try:
+                full.unlink()
+            except OSError:
+                pass
+            reconciled.append(norm)
+            remaining_mirrored.pop(norm, None)
+        elif norm in remote_blobs:
+            # Untracked local file colliding with a new remote file -> preserve via stash
+            preserved_manual.append(norm)
+            stash_targets.append(norm)
+        # Non-colliding untracked scratch files do not block git pull --ff-only
+    else:
+        if matches_mirror or matches_remote:
+            to_checkout.append(norm)
+            reconciled.append(norm)
+            remaining_mirrored.pop(norm, None)
+        else:
+            preserved_manual.append(norm)
+            stash_targets.append(norm)
+
+if to_checkout:
+    subprocess.run(["git", "checkout", "--", *to_checkout], cwd=str(repo), capture_output=True, timeout=30, check=False)
+
+if state_path.is_file() or remaining_mirrored != mirrored:
+    try:
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = state_path.with_name(state_path.name + f".tmp.{{os.getpid()}}")
+        tmp.write_text(json.dumps({{"mirrored": remaining_mirrored}}, indent=2) + "\\n", encoding="utf-8")
+        os.replace(tmp, state_path)
+    except OSError:
+        pass
+
+stashed = False
+stash_err = ""
+if stash_targets:
+    r_stash = subprocess.run(
+        ["git", "stash", "push", "-u", "-m", "omni-auto-preserve", "--", *stash_targets],
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    if r_stash.returncode == 0 and "No local changes" not in (r_stash.stdout or ""):
+        stashed = True
+    elif r_stash.returncode != 0:
+        stash_err = (r_stash.stderr or r_stash.stdout or "").strip()[:300]
+
+ahead = 0
+r_cnt = subprocess.run(["git", "rev-list", "--count", f"{{remote_ref}}..HEAD"], cwd=str(repo), capture_output=True, text=True, timeout=15, check=False)
+if r_cnt.returncode == 0:
+    try:
+        ahead = int((r_cnt.stdout or "0").strip())
+    except ValueError:
+        ahead = 0
+
+pull_cmd = ["git", "pull", "--rebase", remote, branch] if ahead > 0 else ["git", "pull", "--ff-only", remote, branch]
+r_pull = subprocess.run(pull_cmd, cwd=str(repo), capture_output=True, text=True, timeout=90, check=False)
+
+stash_pop_err = ""
+if stashed:
+    r_pop = subprocess.run(["git", "stash", "pop"], cwd=str(repo), capture_output=True, text=True, timeout=30, check=False)
+    if r_pop.returncode != 0:
+        stash_pop_err = (r_pop.stderr or r_pop.stdout or "").strip()[:300]
+
 r_head = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=str(repo), capture_output=True, text=True, timeout=15, check=False)
 print(json.dumps({{
     "ok": r_pull.returncode == 0,
     "head": r_head.stdout.strip(),
+    "mode": "rebase" if ahead > 0 else "ff-only",
     "reconciled": reconciled,
     "preservedManual": preserved_manual,
+    "stashed": stashed,
+    "stashPopError": stash_pop_err or stash_err,
     "stderr": (r_pull.stderr or r_fetch.stderr or "").strip()[:1000],
 }}, separators=(",", ":")))
 """.strip()
@@ -802,6 +1081,7 @@ def write_termux_tier(
     bundle_gz_b64: str | None,
     *,
     bundle: dict[str, Any] | None = None,
+    semantic_cp: dict[str, Any] | None = None,
     apply_live_mirror: bool = False,
     clear_mirror_state: bool = False,
     sync_antigravity_handoff: bool = True,
@@ -809,11 +1089,14 @@ def write_termux_tier(
 ) -> dict[str, Any]:
     """Persist checkpoint + diary + bundle + Antigravity handoff (+ optional live repo mirror) in ONE atomic Termux RPC."""
     try:
+        if not _check_termux_online_fast(relay_url, pair_secret, admin_key=admin_key):
+            return {"ok": False, "skippedOffline": True, "error": "Termux channel is offline (fast check)"}
         inline_payload: dict[str, Any] = {
             "frDir": PHONE_FR_DIR,
             "agDir": PHONE_AG_DIR,
             "repoDir": PHONE_REPO_DIR,
             "checkpoint": cp,
+            "semanticCheckpoint": semantic_cp,
             "diaryMd": diary_md,
             "bundleGzB64": bundle_gz_b64 if (bundle_gz_b64 and len(bundle_gz_b64) <= TERMUX_INLINE_PAYLOAD_MAX_BYTES) else None,
             "bundle": bundle if apply_live_mirror else None,
@@ -857,6 +1140,7 @@ def write_termux_tier(
             "agDir": PHONE_AG_DIR,
             "repoDir": PHONE_REPO_DIR,
             "checkpoint": cp,
+            "semanticCheckpoint": semantic_cp,
             "diaryMd": diary_md,
             "bundleGzB64": None,
             "bundleBlob": {"blobId": blob["blobId"], "sha256": cp.get("bundleSha256", "")},
@@ -887,6 +1171,8 @@ def read_termux_tier(
     pair_secret: str,
     *,
     admin_key: str = "",
+    timeout_sec: int = 6,
+    auto_wake: bool = False,
 ) -> tuple[dict[str, Any] | None, str]:
     try:
         res = _send_termux_cmd(
@@ -895,7 +1181,8 @@ def read_termux_tier(
             "file_read",
             {"path": f"{PHONE_FR_DIR}/latest.json", "maxBytes": 256 * 1024},
             admin_key=admin_key,
-            timeout_sec=20,
+            timeout_sec=timeout_sec,
+            auto_wake=auto_wake,
         )
         if not res.get("ok"):
             return None, str(res.get("error") or "not found")
@@ -905,12 +1192,129 @@ def read_termux_tier(
         return None, str(exc)
 
 
+def _build_termux_probe_script(include_dirty: bool = True, branch: str = "master") -> str:
+    safe_fr = json.dumps(PHONE_FR_DIR)
+    safe_repo = json.dumps(PHONE_REPO_DIR)
+    safe_branch = json.dumps(branch or "master")
+    return f"""
+import hashlib, json, subprocess
+from pathlib import Path
+
+fr_dir = Path({safe_fr}).expanduser()
+repo = Path({safe_repo}).expanduser()
+out = {{"latest": None, "semantic": None, "dirty": None}}
+
+for key, fname in (("latest", "latest.json"), ("semantic", "semantic.json")):
+    p = fr_dir / fname
+    if p.is_file():
+        try:
+            d = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(d, dict):
+                out[key] = d
+        except Exception:
+            pass
+
+if {bool(include_dirty)!r} and (repo / ".git").exists():
+    def git_blob_sha1(raw: bytes) -> str:
+        return hashlib.sha1(f"blob {{len(raw)}}\\x00".encode("ascii") + raw).hexdigest()
+
+    remote_ref = f"origin/{{{safe_branch}}}"
+    r_head = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=str(repo), capture_output=True, text=True, timeout=5, check=False)
+    r_beh = subprocess.run(["git", "rev-list", "--count", f"HEAD..{{remote_ref}}"], cwd=str(repo), capture_output=True, text=True, timeout=5, check=False)
+    remote_blobs = {{}}
+    r_tree = subprocess.run(["git", "ls-tree", "-r", "-z", remote_ref], cwd=str(repo), capture_output=True, timeout=8, check=False)
+    if r_tree.returncode == 0:
+        for ent in r_tree.stdout.split(b"\\x00"):
+            if not ent or b"\\t" not in ent:
+                continue
+            m, pb = ent.split(b"\\t", 1)
+            ps = m.decode("utf-8", errors="ignore").split()
+            if len(ps) >= 3 and ps[1] == "blob":
+                remote_blobs[pb.decode("utf-8", errors="replace").replace("\\\\", "/")] = ps[2]
+    uncommitted = []
+    ignore_pfx = (".tmp_", "__pycache__/", ".agents/.bridge_vault.json", ".agents/.metrics.jsonl", ".agents/.model_modes.json", "public/assets/aistudio/")
+    r_st = subprocess.run(["git", "status", "--porcelain", "-z", "-uall"], cwd=str(repo), capture_output=True, timeout=8, check=False)
+    if r_st.returncode == 0:
+        parts = r_st.stdout.split(b"\\x00")
+        i = 0
+        while i < len(parts):
+            ent = parts[i]
+            if len(ent) >= 4:
+                code = ent[:2].decode("utf-8", errors="ignore")
+                rel = ent[3:].decode("utf-8", errors="replace").replace("\\\\", "/").lstrip("/")
+                if "R" in code or "C" in code:
+                    i += 1
+                if rel and ".." not in Path(rel).parts and not any(rel.startswith(p) or f"/{{p}}" in rel for p in ignore_pfx):
+                    full = (repo / rel).resolve()
+                    if full.is_file():
+                        try:
+                            st = full.stat()
+                            if st.st_size <= 2 * 1024 * 1024:
+                                raw = full.read_bytes()
+                                if remote_blobs.get(rel) != git_blob_sha1(raw):
+                                    uncommitted.append({{
+                                        "path": rel,
+                                        "sha256": hashlib.sha256(raw).hexdigest(),
+                                        "size": st.st_size,
+                                        "mtimeUnix": round(st.st_mtime, 1),
+                                    }})
+                        except OSError:
+                            pass
+            i += 1
+    out["dirty"] = {{
+        "head": (r_head.stdout or "").strip(),
+        "behindOrigin": int((r_beh.stdout or "0").strip() or 0) if (r_beh.stdout or "").strip().isdigit() else 0,
+        "uncommittedVsOrigin": uncommitted[:40],
+        "uncommittedCount": len(uncommitted),
+    }}
+
+print(json.dumps(out, separators=(",", ":")))
+""".strip()
+
+
+def probe_termux_snapshot_and_dirty(
+    relay_url: str,
+    pair_secret: str,
+    *,
+    admin_key: str = "",
+    timeout_sec: int = 6,
+    include_dirty: bool = True,
+    branch: str = "master",
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None, dict[str, Any] | None, str]:
+    """Single fast Termux RPC returning (latest_cp, semantic_cp, dirty_info, err)."""
+    try:
+        script_b64 = base64.b64encode(_build_termux_probe_script(include_dirty=include_dirty, branch=branch).encode("utf-8")).decode("ascii")
+        cmd = f"python3 -B -c \"import base64; exec(base64.b64decode('{script_b64}').decode('utf-8'))\""
+        res = _send_termux_cmd(
+            relay_url,
+            pair_secret,
+            "shell_exec",
+            {"command": cmd, "timeoutSec": min(15, max(5, timeout_sec))},
+            admin_key=admin_key,
+            timeout_sec=timeout_sec,
+            auto_wake=False,
+        )
+        if not res.get("ok"):
+            return None, None, None, str(res.get("error") or res.get("stderr") or "termux probe failed")
+        lines = [ln.strip() for ln in str(res.get("stdout") or "").splitlines() if ln.strip()]
+        parsed = _safe_json_loads(lines[-1]) if lines else None
+        if not parsed:
+            return None, None, None, "invalid termux probe output"
+        latest = parsed.get("latest") if isinstance(parsed.get("latest"), dict) else None
+        sem = parsed.get("semantic") if isinstance(parsed.get("semantic"), dict) else None
+        dirty = parsed.get("dirty") if isinstance(parsed.get("dirty"), dict) else None
+        return latest, sem, dirty, ""
+    except Exception as exc:
+        return None, None, None, str(exc)
+
+
 def read_termux_bundle(
     relay_url: str,
     pair_secret: str,
     expected_sha256: str = "",
     *,
     admin_key: str = "",
+    timeout_sec: int = 15,
 ) -> dict[str, Any] | None:
     try:
         res = _send_termux_cmd(
@@ -919,7 +1323,8 @@ def read_termux_bundle(
             "file_read",
             {"path": f"{PHONE_FR_DIR}/latest_bundle.json.gz.b64", "maxBytes": 300 * 1024},
             admin_key=admin_key,
-            timeout_sec=25,
+            timeout_sec=timeout_sec,
+            auto_wake=False,
         )
         if res.get("ok") and res.get("content"):
             return decode_bundle_gz_b64(str(res["content"]).strip(), expected_sha256=expected_sha256)
@@ -929,7 +1334,8 @@ def read_termux_bundle(
             "file_read",
             {"path": f"{PHONE_FR_DIR}/latest_bundle_blob.json", "maxBytes": 16 * 1024},
             admin_key=admin_key,
-            timeout_sec=15,
+            timeout_sec=min(12, timeout_sec),
+            auto_wake=False,
         )
         if ptr.get("ok") and ptr.get("content"):
             meta = _safe_json_loads(str(ptr["content"]))
@@ -947,6 +1353,68 @@ def read_termux_bundle(
     return None
 
 
+def restore_from_termux_repo(
+    workspace: Path,
+    local_dir: Path,
+    auth: tuple[str, str, str],
+    *,
+    paths: list[str] | None = None,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Forensic fallback restore: export uncommitted files differing from origin/master directly from Termux repo."""
+    relay, secret, admin = auth
+    target_paths = list(paths or [])
+    if not target_paths:
+        _, _, dirty, err = probe_termux_snapshot_and_dirty(relay, secret, admin_key=admin, timeout_sec=8, include_dirty=True)
+        if err and not dirty:
+            return {"ok": False, "error": f"Termux repo probe failed: {err}"}
+        uncommitted = (dirty or {}).get("uncommittedVsOrigin") or []
+        # Filter to paths that actually differ from current local workspace disk
+        root = workspace.resolve()
+        for item in uncommitted:
+            rel = str(item.get("path") or "")
+            t_sha = str(item.get("sha256") or "")
+            if not rel:
+                continue
+            full = (root / rel).resolve()
+            if not full.is_file() or hashlib.sha256(full.read_bytes()).hexdigest() != t_sha:
+                target_paths.append(rel)
+
+    if not target_paths:
+        return {"ok": True, "dryRun": dry_run, "bundleSource": "termux-repo", "applied": {"written": [], "deleted": []}, "message": "Workspace already matches Termux uncommitted files."}
+
+    if dry_run:
+        return {
+            "ok": True,
+            "dryRun": True,
+            "checkpointTier": "termux-repo",
+            "bundleSource": "termux-repo",
+            "wouldWrite": target_paths,
+            "wouldDelete": [],
+        }
+
+    exp_res = _send_termux_cmd(
+        relay,
+        secret,
+        "file_export_bundle",
+        {"repo": PHONE_REPO_DIR, "paths": target_paths},
+        admin_key=admin,
+        timeout_sec=35,
+        auto_wake=False,
+    )
+    if not exp_res.get("ok") or not exp_res.get("blobId"):
+        return {"ok": False, "error": f"Termux file_export_bundle failed: {exp_res.get('error') or exp_res}"}
+    bundle = proto.download_encrypted_blob(relay, secret, str(exp_res["blobId"]), admin_key=admin)
+    applied = proto.apply_delta_bundle(workspace, bundle, allow_delete=False)
+    return {
+        "ok": True,
+        "dryRun": False,
+        "checkpointTier": "termux-repo",
+        "bundleSource": "termux-repo",
+        "applied": applied,
+    }
+
+
 # ==================== HIGH-LEVEL OPERATIONS ====================
 
 
@@ -957,41 +1425,94 @@ def _collect_tier_checkpoints(
     url_arg: str = "",
     pair_secret_arg: str = "",
     admin_key_arg: str = "",
+    cloud_timeout: int = 6,
+    termux_timeout: int = 6,
+    include_termux_dirty: bool = False,
 ) -> dict[str, Any]:
     candidates: dict[str, dict[str, Any]] = {}
+    semantic_candidates: dict[str, dict[str, Any]] = {}
     tier_errors: dict[str, str] = {}
     cloud_inline_b64: str | None = None
+    termux_dirty: dict[str, Any] | None = None
+    termux_online: bool | None = None
 
     local_cp = read_local_tier(local_dir)
     if local_cp:
         candidates["local"] = local_cp
+    local_sem = read_local_semantic(local_dir)
+    if local_sem:
+        semantic_candidates["local"] = local_sem
 
     auth = _try_resolve_remote_auth(url_arg, pair_secret_arg, admin_key_arg) if use_remote else None
     if use_remote and auth:
         relay, secret, admin = auth
-        try:
-            c_cp, c_b64, c_err = read_cloud_tier(relay, secret, admin_key=admin)
+
+        def _probe_cloud_latest() -> tuple[dict[str, Any] | None, str | None, str]:
+            try:
+                return read_cloud_tier(relay, secret, admin_key=admin, timeout=cloud_timeout)
+            except Exception as exc:
+                return None, None, str(exc)
+
+        def _probe_cloud_semantic() -> tuple[dict[str, Any] | None, str]:
+            try:
+                scp, _, serr = read_cloud_tier(
+                    relay,
+                    secret,
+                    admin_key=admin,
+                    task_id=CLOUD_SEMANTIC_TASK_ID,
+                    env_ctx=CLOUD_SEMANTIC_CTX,
+                    timeout=cloud_timeout,
+                )
+                return scp, serr
+            except Exception as exc:
+                return None, str(exc)
+
+        def _probe_termux() -> tuple[bool, dict[str, Any] | None, dict[str, Any] | None, dict[str, Any] | None, str]:
+            online = _check_termux_online_fast(relay, secret, admin_key=admin, timeout=min(4, termux_timeout))
+            if not online:
+                return False, None, None, None, "termux offline (skipped fast)"
+            t_cp, t_sem, t_dirty, t_err = probe_termux_snapshot_and_dirty(
+                relay,
+                secret,
+                admin_key=admin,
+                timeout_sec=termux_timeout,
+                include_dirty=include_termux_dirty,
+            )
+            return True, t_cp, t_sem, t_dirty, t_err
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+            f_c = pool.submit(_probe_cloud_latest)
+            f_s = pool.submit(_probe_cloud_semantic)
+            f_t = pool.submit(_probe_termux)
+
+            c_cp, c_b64, c_err = f_c.result()
             if c_cp:
                 candidates["cloud"] = c_cp
                 cloud_inline_b64 = c_b64
             elif c_err:
                 tier_errors["cloud"] = c_err
-        except Exception as exc:
-            tier_errors["cloud"] = str(exc)
 
-        try:
-            t_cp, t_err = read_termux_tier(relay, secret, admin_key=admin)
+            s_cp, _ = f_s.result()
+            if s_cp:
+                semantic_candidates["cloud"] = s_cp
+
+            termux_online, t_cp, t_sem, termux_dirty, t_err = f_t.result()
             if t_cp:
                 candidates["termux"] = t_cp
             elif t_err:
                 tier_errors["termux"] = t_err
-        except Exception as exc:
-            tier_errors["termux"] = str(exc)
+            if t_sem:
+                semantic_candidates["termux"] = t_sem
     elif use_remote:
         tier_errors["remote"] = "No pairSecret cached yet (local tier only)"
 
+    _, freshest_semantic = pick_freshest_checkpoint(semantic_candidates)
     return {
         "candidates": candidates,
+        "semanticCandidates": semantic_candidates,
+        "freshestSemantic": freshest_semantic,
+        "termuxDirty": termux_dirty,
+        "termuxOnline": termux_online,
         "errors": tier_errors,
         "cloudInlineB64": cloud_inline_b64,
         "auth": auth,
@@ -1049,6 +1570,7 @@ def _persist_remote_tiers(
     bundle: dict[str, Any] | None,
     bundle_gz_b64: str | None,
     *,
+    semantic_cp: dict[str, Any] | None = None,
     apply_live_mirror: bool = False,
     clear_mirror_state: bool = False,
     url_arg: str = "",
@@ -1063,10 +1585,27 @@ def _persist_remote_tiers(
         return tiers
 
     relay, secret, admin = auth
+    write_semantic = semantic_cp is not None and str(cp.get("source") or "manual") != "auto_mirror"
 
     def _do_cloud() -> dict[str, Any]:
         try:
             return write_cloud_tier(relay, secret, cp, bundle_gz_b64, admin_key=admin)
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def _do_cloud_semantic() -> dict[str, Any]:
+        if not write_semantic or semantic_cp is None:
+            return {"ok": True, "skipped": True}
+        try:
+            return write_cloud_tier(
+                relay,
+                secret,
+                semantic_cp,
+                None,
+                admin_key=admin,
+                task_id=CLOUD_SEMANTIC_TASK_ID,
+                env_ctx=CLOUD_SEMANTIC_CTX,
+            )
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
@@ -1079,6 +1618,7 @@ def _persist_remote_tiers(
                 diary_md,
                 bundle_gz_b64,
                 bundle=bundle,
+                semantic_cp=semantic_cp if write_semantic else None,
                 apply_live_mirror=apply_live_mirror,
                 clear_mirror_state=clear_mirror_state,
                 sync_antigravity_handoff=True,
@@ -1087,10 +1627,13 @@ def _persist_remote_tiers(
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
         f_cloud = pool.submit(_do_cloud)
+        f_sem = pool.submit(_do_cloud_semantic)
         f_termux = pool.submit(_do_termux)
         tiers["cloud"] = f_cloud.result()
+        if write_semantic:
+            tiers["cloudSemantic"] = f_sem.result()
         tiers["termux"] = f_termux.result()
     return tiers
 
@@ -1120,9 +1663,14 @@ def _persist_to_all_tiers(
         cp["bundleGzBytes"] = 0
         cp["hasBundle"] = False
 
+    is_manual = str(cp.get("source") or "manual") != "auto_mirror"
+    semantic_cp = extract_semantic_record(cp) if is_manual else None
+
     diary_md = render_diary_markdown(cp)
     tiers: dict[str, Any] = {}
     tiers["local"] = write_local_tier(local_dir, cp, diary_md, bundle_gz)
+    if semantic_cp is not None:
+        write_local_semantic(local_dir, semantic_cp)
 
     if use_remote:
         if background:
@@ -1141,6 +1689,7 @@ def _persist_to_all_tiers(
                     diary_md,
                     bundle,
                     bundle_gz_b64,
+                    semantic_cp=semantic_cp,
                     apply_live_mirror=apply_live_mirror,
                     clear_mirror_state=clear_mirror_state,
                     url_arg=url_arg,
@@ -1168,12 +1717,14 @@ def flush_local_to_remote(
     bundle_gz_b64: str | None = None
     if bundle and (bundle.get("files") or bundle.get("deleted")):
         _, bundle_gz_b64, _ = encode_bundle_gz_b64(bundle)
+    semantic_cp = read_local_semantic(local_dir) if str(cp.get("source") or "manual") != "auto_mirror" else None
     diary_md = render_diary_markdown(cp)
     tiers = _persist_remote_tiers(
         cp,
         diary_md,
         bundle,
         bundle_gz_b64,
+        semantic_cp=semantic_cp,
         apply_live_mirror=apply_live_mirror,
         clear_mirror_state=clear_mirror_state,
         url_arg=url_arg,
@@ -1204,6 +1755,7 @@ def init_session(
         "sessionId": session_id or f"sess_{int(now)}_{secrets.token_hex(3)}",
         "seq": 1,
         "status": "active",
+        "source": "manual",
         "timestampUnix": round(now, 3),
         "updatedUtc": _utc_now(),
         "wave": wave,
@@ -1254,6 +1806,7 @@ def save_checkpoint(
     deleted: list[str] | None = None,
     auto_diff: bool = False,
     apply_live_mirror: bool = True,
+    source: str = "manual",
     use_remote: bool = True,
     background: bool = False,
     url_arg: str = "",
@@ -1261,7 +1814,10 @@ def save_checkpoint(
     admin_key_arg: str = "",
 ) -> dict[str, Any]:
     prev = read_local_tier(local_dir)
+    prev_sem = read_local_semantic(local_dir)
     now = time.time()
+    is_auto = source == "auto_mirror"
+
     if prev and prev.get("status") == "active" and (not session_id or prev.get("sessionId") == session_id):
         cp = dict(prev)
         cp["seq"] = int(prev.get("seq") or 0) + 1
@@ -1270,9 +1826,10 @@ def save_checkpoint(
             save_local_baseline(local_dir, workspace)
         cp = {
             "schema": SCHEMA_VERSION,
-            "sessionId": session_id or f"sess_{int(now)}_{secrets.token_hex(3)}",
-            "seq": 1,
+            "sessionId": session_id or (prev_sem.get("sessionId") if (is_auto and prev_sem and prev_sem.get("status") == "active") else "") or f"sess_{int(now)}_{secrets.token_hex(3)}",
+            "seq": (int(prev.get("seq") or 0) + 1) if prev else 1,
             "status": "active",
+            "source": source,
             "wave": "",
             "phase": "",
             "goal": "",
@@ -1288,19 +1845,37 @@ def save_checkpoint(
             "deletedFiles": [],
         }
 
+    # Dual-lane monotonic preservation: auto_mirror NEVER clobbers semantic intent!
+    if is_auto and prev_sem and prev_sem.get("status") == "active":
+        cp = merge_semantic_into_checkpoint(cp, prev_sem)
+
     cp["status"] = "active"
+    cp["source"] = source
     cp["timestampUnix"] = round(now, 3)
     cp["updatedUtc"] = _utc_now()
-    if wave:
-        cp["wave"] = wave
-    if phase:
-        cp["phase"] = phase
-    if goal:
-        cp["goal"] = goal
-    if summary:
-        cp["summary"] = summary
-    if next_step:
-        cp["nextStep"] = next_step
+
+    if is_auto:
+        if wave and not cp.get("wave"):
+            cp["wave"] = wave
+        if phase and not cp.get("phase"):
+            cp["phase"] = phase
+        if goal and not cp.get("goal"):
+            cp["goal"] = goal
+        if summary and is_auto_mirror_summary(cp.get("summary")):
+            cp["summary"] = summary
+        if next_step and not cp.get("nextStep"):
+            cp["nextStep"] = next_step
+    else:
+        if wave:
+            cp["wave"] = wave
+        if phase:
+            cp["phase"] = phase
+        if goal:
+            cp["goal"] = goal
+        if summary:
+            cp["summary"] = summary
+        if next_step:
+            cp["nextStep"] = next_step
 
     cp["requests"] = _dedupe_append(cp.get("requests") or [], requests or [])
     cp["findings"] = _dedupe_append(cp.get("findings") or [], findings or [])
@@ -1349,6 +1924,51 @@ def save_checkpoint(
     return {"ok": True, "checkpoint": cp, "tiers": tiers}
 
 
+def pin_session(
+    *,
+    workspace: Path,
+    local_dir: Path,
+    goal: str = "",
+    wave: str = "",
+    phase: str = "",
+    summary: str = "",
+    next_step: str = "",
+    findings: list[str] | None = None,
+    decisions: list[str] | None = None,
+    completed: list[str] | None = None,
+    pending: list[str] | None = None,
+    replace_pending: bool = False,
+    use_remote: bool = True,
+    background: bool = True,
+    url_arg: str = "",
+    pair_secret_arg: str = "",
+    admin_key_arg: str = "",
+) -> dict[str, Any]:
+    """Zero-friction semantic breadcrumb write (<15ms in -b mode; never triggers heavy file mirroring)."""
+    return save_checkpoint(
+        workspace=workspace,
+        local_dir=local_dir,
+        wave=wave,
+        phase=phase,
+        goal=goal,
+        summary=summary or goal,
+        next_step=next_step,
+        findings=findings,
+        decisions=decisions,
+        completed=completed,
+        pending=pending,
+        replace_pending=replace_pending,
+        auto_diff=False,
+        apply_live_mirror=False,
+        source="manual",
+        use_remote=use_remote,
+        background=background,
+        url_arg=url_arg,
+        pair_secret_arg=pair_secret_arg,
+        admin_key_arg=admin_key_arg,
+    )
+
+
 def recover_session(
     *,
     workspace: Path,
@@ -1357,6 +1977,7 @@ def recover_session(
     url_arg: str = "",
     pair_secret_arg: str = "",
     admin_key_arg: str = "",
+    include_termux_dirty: bool = False,
 ) -> dict[str, Any]:
     probe = _collect_tier_checkpoints(
         local_dir,
@@ -1364,14 +1985,20 @@ def recover_session(
         url_arg=url_arg,
         pair_secret_arg=pair_secret_arg,
         admin_key_arg=admin_key_arg,
+        include_termux_dirty=include_termux_dirty,
     )
     candidates = probe["candidates"]
     tier, cp = pick_freshest_checkpoint(candidates)
+    freshest_sem = probe.get("freshestSemantic")
+    if cp and freshest_sem:
+        cp = merge_semantic_into_checkpoint(cp, freshest_sem)
+
     tier_summary = {
         t: {
             "sessionId": c.get("sessionId"),
             "seq": c.get("seq"),
             "status": c.get("status"),
+            "source": c.get("source", "manual"),
             "updatedUtc": c.get("updatedUtc"),
             "hasBundle": bool(c.get("hasBundle")),
         }
@@ -1382,6 +2009,8 @@ def recover_session(
             "ok": True,
             "found": False,
             "tiers": tier_summary,
+            "termuxDirty": probe.get("termuxDirty"),
+            "termuxOnline": probe.get("termuxOnline"),
             "errors": probe["errors"],
         }
 
@@ -1397,6 +2026,9 @@ def recover_session(
         "tiers": tier_summary,
         "errors": probe["errors"],
         "checkpoint": cp,
+        "freshestSemantic": freshest_sem,
+        "termuxDirty": probe.get("termuxDirty"),
+        "termuxOnline": probe.get("termuxOnline"),
         "rollback": rollback,
         "diaryMarkdown": render_diary_markdown(cp),
         "restoreCommand": (
@@ -1404,6 +2036,271 @@ def recover_session(
             if rollback.get("rollbackDetected") and cp.get("hasBundle")
             else ""
         ),
+    }
+
+
+def _read_compact_handoff(workspace: Path) -> dict[str, str]:
+    p = workspace / ".agents" / "docs" / "HANDOFF.md"
+    if not p.is_file():
+        return {}
+    out: dict[str, str] = {}
+    try:
+        for raw in p.read_text(encoding="utf-8", errors="replace").splitlines()[:40]:
+            line = raw.strip()
+            if line.startswith("HANDOFF|"):
+                out["header"] = line
+            elif line.startswith("DONE|"):
+                out["done"] = line[5:].strip()
+            elif line.startswith("NEXT|"):
+                out["next"] = line[5:].strip()
+            elif line.startswith("WAVE|"):
+                out["wave"] = line[5:].strip()
+    except OSError:
+        pass
+    return out
+
+
+def _read_pending_extra_requests(workspace: Path) -> list[str]:
+    p = workspace / ".agents" / "docs" / "EXTRA_REQUESTS.md"
+    if not p.is_file():
+        return []
+    pending: list[str] = []
+    in_pending = False
+    try:
+        for raw in p.read_text(encoding="utf-8", errors="replace").splitlines():
+            s = raw.strip()
+            if s.startswith("## "):
+                low = s.lower()
+                in_pending = "pending" in low or "active" in low or "open" in low
+                continue
+            if in_pending and s.startswith(("- ", "* ")):
+                body = s[2:].strip()
+                if body and "(none" not in body.lower() and not body.startswith("[x]"):
+                    pending.append(body[:160])
+    except OSError:
+        pass
+    return pending[:8]
+
+
+def _clip_line(text: Any, limit: int = 180) -> str:
+    s = " ".join(str(text or "").split())
+    return s if len(s) <= limit else s[: max(1, limit - 3)] + "..."
+
+
+def render_resume_packet(data: dict[str, Any], *, compact: bool = False) -> str:
+    """Render ultra-compact (<35L, <450 tokens) telegraphic Resume Packet."""
+    verdict = str(data.get("verdict") or "CLEAN")
+    cp = data.get("checkpoint") or {}
+    rb = data.get("rollback") or {}
+    elapsed = data.get("elapsedSec", 0.0)
+    tiers_ok = ",".join(sorted((data.get("tiers") or {}).keys())) or "none"
+
+    if compact:
+        sess = f"{cp.get('sessionId', '-')}#{cp.get('seq', 0)}:{cp.get('status', '-')}" if cp else "none"
+        nxt = _clip_line(cp.get("nextStep") or (data.get("handoff") or {}).get("next") or "", 90)
+        act = _clip_line(data.get("action") or "READY_TO_RESUME", 90)
+        return f"RESUME|{verdict}|sess={sess}|tiers={tiers_ok}|t={elapsed:.2f}s|next={nxt or '-'}|act={act}"
+
+    lines = [
+        f"RESUME_VERDICT|{verdict}|tiers={tiers_ok}|termux_online={int(bool(data.get('termuxOnline')))}|elapsed={elapsed:.2f}s",
+    ]
+    if cp:
+        lines.append(
+            f"SESSION|id={cp.get('sessionId', '?')}|seq=#{cp.get('seq', 0)}|status={cp.get('status', '?')}|tier={data.get('freshestTier', '?')}|src={cp.get('source', 'manual')}|utc={cp.get('updatedUtc', '')}"
+        )
+        if cp.get("wave") or cp.get("phase"):
+            lines.append(f"SCOPE|wave={cp.get('wave') or '-'}|phase={cp.get('phase') or '-'}")
+        if cp.get("goal"):
+            lines.append(f"GOAL|{_clip_line(cp['goal'], 180)}")
+        if cp.get("summary") and cp.get("summary") != cp.get("goal") and not is_auto_mirror_summary(cp.get("summary")):
+            lines.append(f"SUMMARY|{_clip_line(cp['summary'], 180)}")
+        if cp.get("completed"):
+            lines.append(f"DONE|{' ; '.join(_clip_line(x, 70) for x in list(cp['completed'])[-5:])}")
+        if cp.get("pending"):
+            lines.append(f"PENDING|{' ; '.join(_clip_line(x, 75) for x in list(cp['pending'])[:6])}")
+        if cp.get("nextStep"):
+            lines.append(f"NEXT|{_clip_line(cp['nextStep'], 180)}")
+
+    if rb.get("rollbackDetected"):
+        rev_paths = [r["path"] for r in rb.get("reverted") or []]
+        mis_paths = list(rb.get("missing") or [])
+        reapp = list(rb.get("reappeared") or [])
+        lines.append(
+            f"ROLLBACK|reverted={len(rev_paths)}|missing={len(mis_paths)}|reappeared={len(reapp)}|files={','.join((rev_paths + mis_paths)[:10])}"
+        )
+
+    if data.get("autoRestored"):
+        ar = data["autoRestored"]
+        lines.append(
+            f"AUTO_RESTORE|ok={bool(ar.get('ok'))}|src={ar.get('bundleSource', '?')}|written={len(((ar.get('applied') or {}).get('written')) or [])}"
+        )
+
+    td_paths = data.get("termuxUncommittedDiffs") or []
+    if td_paths:
+        lines.append(f"TERMUX_UNCOMMITTED|count={len(td_paths)}|files={','.join(td_paths[:10])}")
+
+    gh_dirty = data.get("localDirtyVsGithub") or {}
+    if gh_dirty.get("changed") or gh_dirty.get("deleted"):
+        ch = list(gh_dirty.get("changed") or [])
+        dl = list(gh_dirty.get("deleted") or [])
+        lines.append(f"LOCAL_DIRTY|changed={len(ch)}|deleted={len(dl)}|files={','.join((ch + dl)[:10])}")
+
+    ho = data.get("handoff") or {}
+    if ho.get("next") and ho.get("next") != cp.get("nextStep"):
+        lines.append(f"HANDOFF_NEXT|{_clip_line(ho['next'], 160)}")
+    if ho.get("done") and not cp.get("completed"):
+        lines.append(f"HANDOFF_DONE|{_clip_line(ho['done'], 160)}")
+
+    ex = data.get("pendingExtraRequests") or []
+    if ex:
+        lines.append(f"EXTRA_REQ|{' ; '.join(_clip_line(x, 80) for x in ex[:4])}")
+
+    if data.get("envAlert"):
+        lines.append(f"ENV_ALERT|{_clip_line(data['envAlert'], 160)}")
+
+    lines.append(f"ACTION|{data.get('action') or 'READY_TO_RESUME'}")
+    return "\n".join(lines[:35])
+
+
+def resume_session(
+    *,
+    workspace: Path,
+    local_dir: Path,
+    use_remote: bool = True,
+    auto_restore: bool = False,
+    skip_github: bool = False,
+    skip_termux_diff: bool = False,
+    url_arg: str = "",
+    pair_secret_arg: str = "",
+    admin_key_arg: str = "",
+) -> dict[str, Any]:
+    """1-shot zero-waste parallel session recovery packet (<=2.5s, <=35 lines)."""
+    t0 = time.monotonic()
+
+    def _probe_github_dirty() -> dict[str, Any]:
+        if skip_github or not use_remote:
+            return {}
+        try:
+            import github_direct as ghdirect
+            import local_capabilities as lcap
+
+            tok = lcap.get_secret("GITHUB_TOKEN", aliases=("GH_TOKEN",))
+            if not tok:
+                return {}
+            diff = ghdirect.diff_workspace_against_github(workspace, token=tok, sync_deletes=False)
+            return {"changed": diff.get("changed") or [], "deleted": diff.get("deleted") or [], "headSha": diff.get("headSha", "")}
+        except Exception as exc:
+            return {"error": str(exc)[:120]}
+
+    def _probe_env_alert() -> str:
+        try:
+            import local_capabilities as lcap
+
+            caps = lcap.inspect_capabilities()
+            return str(caps.get("alert") or "")
+        except Exception:
+            return ""
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+        f_rec = pool.submit(
+            recover_session,
+            workspace=workspace,
+            local_dir=local_dir,
+            use_remote=use_remote,
+            url_arg=url_arg,
+            pair_secret_arg=pair_secret_arg,
+            admin_key_arg=admin_key_arg,
+            include_termux_dirty=not skip_termux_diff,
+        )
+        f_gh = pool.submit(_probe_github_dirty)
+        f_env = pool.submit(_probe_env_alert)
+
+        rec = f_rec.result()
+        gh_dirty = f_gh.result()
+        env_alert = f_env.result()
+
+    handoff = _read_compact_handoff(workspace)
+    extra_req = _read_pending_extra_requests(workspace)
+
+    cp = rec.get("checkpoint") or {}
+    rb = rec.get("rollback") or {}
+    tier = rec.get("freshestTier") or ""
+
+    # Identify Termux uncommitted files that differ from current workspace disk
+    termux_uncommitted_diffs: list[str] = []
+    td = rec.get("termuxDirty") or {}
+    root = workspace.resolve()
+    for item in td.get("uncommittedVsOrigin") or []:
+        rel = str(item.get("path") or "")
+        t_sha = str(item.get("sha256") or "")
+        if not rel:
+            continue
+        full = (root / rel).resolve()
+        try:
+            full.relative_to(root)
+        except ValueError:
+            continue
+        if not full.is_file() or hashlib.sha256(full.read_bytes()).hexdigest() != t_sha:
+            termux_uncommitted_diffs.append(rel)
+
+    verdict = "CLEAN"
+    action = "READY_TO_RESUME"
+    auto_restored = None
+
+    if rb.get("rollbackDetected") and cp.get("hasBundle"):
+        verdict = f"ROLLBACK_{tier.upper() or 'REMOTE'}"
+        action = f"python3 -B .agents/scripts/flight_recorder.py restore --source {tier or 'auto'}"
+        if auto_restore:
+            auto_restored = restore_session(
+                workspace=workspace,
+                local_dir=local_dir,
+                source=tier or "auto",
+                use_remote=use_remote,
+                url_arg=url_arg,
+                pair_secret_arg=pair_secret_arg,
+                admin_key_arg=admin_key_arg,
+            )
+            if auto_restored.get("ok"):
+                verdict = "RESTORED_AND_READY"
+                action = "READY_TO_RESUME"
+    elif termux_uncommitted_diffs and (not cp or cp.get("status") != "closed"):
+        verdict = "ROLLBACK_TERMUX"
+        action = "python3 -B .agents/scripts/flight_recorder.py restore --source termux-repo"
+        if auto_restore:
+            auto_restored = restore_session(
+                workspace=workspace,
+                local_dir=local_dir,
+                source="termux-repo",
+                use_remote=use_remote,
+                url_arg=url_arg,
+                pair_secret_arg=pair_secret_arg,
+                admin_key_arg=admin_key_arg,
+            )
+            if auto_restored.get("ok"):
+                verdict = "RESTORED_AND_READY"
+                action = "READY_TO_RESUME"
+    elif gh_dirty.get("changed") or gh_dirty.get("deleted"):
+        verdict = "DIRTY_LOCAL"
+        action = "READY_TO_RESUME"
+
+    return {
+        "ok": True,
+        "verdict": verdict,
+        "found": bool(rec.get("found")),
+        "freshestTier": tier,
+        "tiers": rec.get("tiers") or {},
+        "termuxOnline": rec.get("termuxOnline"),
+        "checkpoint": cp,
+        "rollback": rb,
+        "autoRestored": auto_restored,
+        "termuxUncommittedDiffs": termux_uncommitted_diffs,
+        "localDirtyVsGithub": gh_dirty,
+        "handoff": handoff,
+        "pendingExtraRequests": extra_req,
+        "envAlert": env_alert,
+        "errors": rec.get("errors") or {},
+        "action": action,
+        "elapsedSec": round(time.monotonic() - t0, 3),
     }
 
 
@@ -1419,6 +2316,12 @@ def restore_session(
     pair_secret_arg: str = "",
     admin_key_arg: str = "",
 ) -> dict[str, Any]:
+    if source == "termux-repo":
+        auth = _try_resolve_remote_auth(url_arg, pair_secret_arg, admin_key_arg) if use_remote else None
+        if not auth:
+            return {"ok": False, "error": "No pairSecret configured for source='termux-repo'."}
+        return restore_from_termux_repo(workspace, local_dir, auth, dry_run=dry_run)
+
     probe = _collect_tier_checkpoints(
         local_dir,
         use_remote=use_remote,
@@ -1433,7 +2336,12 @@ def restore_session(
         tier = source if source in candidates else None
         cp = candidates.get(source)
     if not cp or not tier:
+        if source == "auto" and probe.get("auth") and probe.get("termuxOnline"):
+            return restore_from_termux_repo(workspace, local_dir, probe["auth"], dry_run=dry_run)
         return {"ok": False, "error": f"No checkpoint found for source='{source}'.", "errors": probe["errors"]}
+
+    if probe.get("freshestSemantic"):
+        cp = merge_semantic_into_checkpoint(cp, probe["freshestSemantic"])
 
     expected_sha = str(cp.get("bundleSha256") or "")
     bundle: dict[str, Any] | None = None
@@ -1455,7 +2363,7 @@ def restore_session(
                 break
             except Exception:
                 pass
-        elif cand_tier == "termux" and auth:
+        elif cand_tier == "termux" and auth and probe.get("termuxOnline", True):
             relay, secret, admin = auth
             b = read_termux_bundle(relay, secret, expected_sha256=expected_sha, admin_key=admin)
             if b:
@@ -1464,6 +2372,9 @@ def restore_session(
                 break
 
     if not bundle:
+        # Forensic fallback: if bundle missing/clobbered in auto mode, check Termux repo uncommitted edits!
+        if source == "auto" and auth and probe.get("termuxOnline"):
+            return restore_from_termux_repo(workspace, local_dir, auth, dry_run=dry_run)
         return {
             "ok": False,
             "error": "Checkpoint found, but no file snapshot bundle is attached or reachable.",
@@ -1485,6 +2396,8 @@ def restore_session(
     applied = proto.apply_delta_bundle(workspace, bundle, allow_delete=allow_delete)
     # Refresh local copy too so subsequent local commands see it immediately
     write_local_tier(local_dir, cp, render_diary_markdown(cp), encode_bundle_gz_b64(bundle)[0])
+    if _has_semantic_content(cp):
+        write_local_semantic(local_dir, extract_semantic_record(cp))
     return {
         "ok": True,
         "dryRun": False,
@@ -1522,6 +2435,7 @@ def close_session(
     }
     cp["seq"] = int(cp.get("seq") or 0) + 1
     cp["status"] = "closed"
+    cp["source"] = "manual"
     cp["timestampUnix"] = round(now, 3)
     cp["updatedUtc"] = _utc_now()
     if commit:
@@ -1555,9 +2469,23 @@ def close_session(
 # ==================== CLI ====================
 
 
+def _format_compact_write_line(verb: str, res: dict[str, Any]) -> str:
+    cp = res.get("checkpoint") or {}
+    tiers = res.get("tiers") or {}
+    t1 = "ok" if (tiers.get("local") or {}).get("ok") else "err"
+    rem = tiers.get("remote")
+    if isinstance(rem, dict) and rem.get("mode") == "background":
+        rem_s = f"bg={rem.get('pid', '?')}"
+    else:
+        c_ok = int(bool((tiers.get("cloud") or {}).get("ok")))
+        t_ok = int(bool((tiers.get("termux") or {}).get("ok")))
+        rem_s = f"cloud={c_ok},termux={t_ok}"
+    return f"FR_{verb.upper()}|sess={cp.get('sessionId', '?')}|seq=#{cp.get('seq', 0)}|status={cp.get('status', '?')}|t1={t1}|{rem_s}"
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Cavern Anti-Cancellation 3-Tier Flight Recorder (/tmp + Phone Termux + Cloudflare Hub v6)."
+        description="Cavern Anti-Cancellation Dual-Lane 3-Tier Flight Recorder (/tmp + Phone Termux + Cloudflare Hub v6)."
     )
     p.add_argument("--workspace", default=str(REPO_ROOT))
     p.add_argument("--local-dir", default=str(DEFAULT_LOCAL_DIR))
@@ -1574,6 +2502,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_init.add_argument("--goal", default="")
     p_init.add_argument("--request", action="append", default=[])
     p_init.add_argument("-b", "--background", action="store_true", help="Write Tier 1 local (<10ms) and flush Termux+Cloud in background")
+    p_init.add_argument("--compact", action="store_true", help="Emit 1-line telegraphic summary instead of full JSON")
 
     p_save = sub.add_parser("save", help="Save incremental diary checkpoint + optional workspace snapshot to all 3 tiers")
     p_save.add_argument("--session", default="")
@@ -1593,12 +2522,34 @@ def build_parser() -> argparse.ArgumentParser:
     p_save.add_argument("--auto-diff", action="store_true", help="Auto-detect all modified/added/deleted workspace files vs baseline")
     p_save.add_argument("--no-mirror", action="store_true", help="Do not live-mirror changed files into local Antigravity repo")
     p_save.add_argument("-b", "--background", action="store_true", help="Write Tier 1 local (<10ms) and flush Termux+Cloud in background")
+    p_save.add_argument("--compact", action="store_true", help="Emit 1-line telegraphic summary instead of full JSON")
+
+    p_pin = sub.add_parser("pin", help="Zero-friction semantic breadcrumb (<15ms in -b mode; writes durable semantic lane)")
+    p_pin.add_argument("--wave", default="")
+    p_pin.add_argument("--phase", default="")
+    p_pin.add_argument("--goal", default="")
+    p_pin.add_argument("--summary", default="")
+    p_pin.add_argument("--next", default="")
+    p_pin.add_argument("--finding", action="append", default=[])
+    p_pin.add_argument("--decision", action="append", default=[])
+    p_pin.add_argument("--done", action="append", default=[])
+    p_pin.add_argument("--pending", action="append", default=[])
+    p_pin.add_argument("--replace-pending", action="store_true")
+    p_pin.add_argument("-b", "--background", action="store_true", help="Write local (<10ms) and flush remote in background")
+    p_pin.add_argument("--json", action="store_true", help="Output full JSON instead of 1-line compact summary")
+
+    p_rsm = sub.add_parser("resume", help="1-shot parallel instant resume packet (<=2.5s, <=35 lines, optional --auto-restore)")
+    p_rsm.add_argument("--auto-restore", action="store_true", help="Immediately restore rolled-back files if rollback is detected")
+    p_rsm.add_argument("--compact", action="store_true", help="Emit single-line RESUME| summary (for host-boot)")
+    p_rsm.add_argument("--json", action="store_true", help="Output machine-readable JSON")
+    p_rsm.add_argument("--skip-github", action="store_true", help="Skip GitHub HEAD diff probe")
+    p_rsm.add_argument("--skip-termux-diff", action="store_true", help="Skip Termux uncommitted-vs-origin diff probe")
 
     p_rec = sub.add_parser("recover", help="Probe all 3 tiers, detect workspace rollback, and print recovery brief")
     p_rec.add_argument("--json", action="store_true", help="Output machine-readable JSON instead of compact brief")
 
-    p_res = sub.add_parser("restore", help="Restore rolled-back workspace edits from verified omni-delta-v1 snapshot")
-    p_res.add_argument("--source", choices=("auto", "local", "cloud", "termux"), default="auto")
+    p_res = sub.add_parser("restore", help="Restore rolled-back workspace edits from verified omni-delta-v1 snapshot or Termux repo")
+    p_res.add_argument("--source", choices=("auto", "local", "cloud", "termux", "termux-repo"), default="auto")
     p_res.add_argument("--dry-run", action="store_true")
     p_res.add_argument("--allow-delete", action="store_true")
 
@@ -1610,6 +2561,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_cls.add_argument("--next", default="")
     p_cls.add_argument("--keep-pending", action="store_true")
     p_cls.add_argument("-b", "--background", action="store_true", help="Write Tier 1 local (<10ms) and flush Termux+Cloud in background")
+    p_cls.add_argument("--compact", action="store_true", help="Emit 1-line telegraphic summary instead of full JSON")
 
     p_fl = sub.add_parser("flush-remote", help="Internal/manual command: flush Tier 1 checkpoint to Termux + Cloudflare")
     p_fl.add_argument("--mirror", action="store_true")
@@ -1638,7 +2590,7 @@ def main(argv: list[str] | None = None) -> int:
             pair_secret_arg=args.pair_secret,
             admin_key_arg=args.admin_key,
         )
-        print(json.dumps(res, indent=2, ensure_ascii=False))
+        print(_format_compact_write_line("init", res) if args.compact else json.dumps(res, indent=2, ensure_ascii=False))
         return 0 if res.get("ok") else 1
 
     if args.action == "save":
@@ -1667,7 +2619,48 @@ def main(argv: list[str] | None = None) -> int:
             pair_secret_arg=args.pair_secret,
             admin_key_arg=args.admin_key,
         )
-        print(json.dumps(res, indent=2, ensure_ascii=False))
+        print(_format_compact_write_line("save", res) if args.compact else json.dumps(res, indent=2, ensure_ascii=False))
+        return 0 if res.get("ok") else 1
+
+    if args.action == "pin":
+        res = pin_session(
+            workspace=workspace,
+            local_dir=local_dir,
+            wave=args.wave,
+            phase=args.phase,
+            goal=args.goal,
+            summary=args.summary,
+            next_step=args.next,
+            findings=args.finding,
+            decisions=args.decision,
+            completed=args.done,
+            pending=args.pending,
+            replace_pending=args.replace_pending,
+            use_remote=use_remote,
+            background=bool(args.background),
+            url_arg=args.url,
+            pair_secret_arg=args.pair_secret,
+            admin_key_arg=args.admin_key,
+        )
+        print(json.dumps(res, indent=2, ensure_ascii=False) if args.json else _format_compact_write_line("pin", res))
+        return 0 if res.get("ok") else 1
+
+    if args.action == "resume":
+        res = resume_session(
+            workspace=workspace,
+            local_dir=local_dir,
+            use_remote=use_remote,
+            auto_restore=bool(args.auto_restore),
+            skip_github=bool(args.skip_github),
+            skip_termux_diff=bool(args.skip_termux_diff),
+            url_arg=args.url,
+            pair_secret_arg=args.pair_secret,
+            admin_key_arg=args.admin_key,
+        )
+        if args.json:
+            print(json.dumps(res, indent=2, ensure_ascii=False))
+        else:
+            print(render_resume_packet(res, compact=bool(args.compact)))
         return 0 if res.get("ok") else 1
 
     if args.action == "recover":
@@ -1755,7 +2748,7 @@ def main(argv: list[str] | None = None) -> int:
             pair_secret_arg=args.pair_secret,
             admin_key_arg=args.admin_key,
         )
-        print(json.dumps(res, indent=2, ensure_ascii=False))
+        print(_format_compact_write_line("close", res) if args.compact else json.dumps(res, indent=2, ensure_ascii=False))
         return 0 if res.get("ok") else 1
 
     if args.action == "flush-remote":

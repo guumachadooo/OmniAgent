@@ -301,7 +301,9 @@ def inspect_capabilities(
 
     dotnet_cached = Path("/root/.cache/cavern-android-ref/dotnet-11/dotnet").is_file() or bool(shutil.which("dotnet"))
     gh_hosts_file = Path.home() / ".config" / "gh" / "hosts.yml"
-    has_native_git = (REPO_ROOT / ".git").exists()
+    has_native_git = (REPO_ROOT / ".git").exists() or (
+        bool(host_override.strip()) and host_id.startswith("antigravity-")
+    )
     has_gh_cli = (gh_hosts_file.is_file() and gh_hosts_file.stat().st_size > 0) or has_gh
     has_local_dotnet = Path("/root/.dotnet/dotnet").is_file() or dotnet_cached
     has_sdcard = Path("/sdcard").is_dir()

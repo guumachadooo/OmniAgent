@@ -750,6 +750,7 @@ def push_federated_repo(
 def _try_sync_termux_repo(spec: dict[str, Any], branch: str) -> dict[str, Any]:
     termux_path = str(spec.get("termuxPath") or "").strip()
     owner_repo = str(spec.get("ownerRepo") or "").strip()
+    global_plugin_path = str(spec.get("termuxGlobalPluginPath") or "").strip()
     if not termux_path:
         return {"attempted": False}
     try:
@@ -762,9 +763,16 @@ def _try_sync_termux_repo(spec: dict[str, Any], branch: str) -> dict[str, Any]:
         if not oac._is_channel_online(conn["relayUrl"], conn["pairSecret"], "termux", conn["adminKey"]):
             return {"attempted": False, "reason": "termux_offline"}
         # Pull if repo already cloned on Termux (fast & safe; never fails the GitHub push)
+        global_sync_snippet = ""
+        if global_plugin_path:
+            global_sync_snippet = (
+                f" && if [ -f {termux_path}/scripts/plan_tool.py ]; then "
+                f"python3 -B {termux_path}/scripts/plan_tool.py evolve sync-all --apply >/dev/null 2>&1 || true; fi"
+            )
         cmd = (
             f"if [ -d {termux_path}/.git ]; then "
-            f"git -C {termux_path} fetch origin && git -C {termux_path} pull --rebase origin {branch} && git -C {termux_path} rev-parse --short HEAD; "
+            f"git -C {termux_path} fetch origin && git -C {termux_path} pull --rebase origin {branch} "
+            f"&& git -C {termux_path} rev-parse --short HEAD{global_sync_snippet}; "
             f"else echo NOT_CLONED:{owner_repo}; fi"
         )
         r = oac.send_agent_command(
@@ -780,6 +788,96 @@ def _try_sync_termux_repo(spec: dict[str, Any], branch: str) -> dict[str, Any]:
         return {"attempted": True, "ok": bool(r.get("ok")), "output": out[-240:]}
     except Exception as exc:
         return {"attempted": True, "ok": False, "error": str(exc)}
+
+
+def _read_plugin_version(plugin_dir: Path) -> str:
+    pj = plugin_dir / "plugin.json"
+    if not pj.is_file():
+        return ""
+    try:
+        return str(json.loads(pj.read_text(encoding="utf-8")).get("version") or "").strip()
+    except Exception:
+        return ""
+
+
+def _semver_tuple(ver: str) -> tuple[int, int, int]:
+    parts = [p for p in str(ver or "").strip().lstrip("v").split(".") if p.isdigit()]
+    nums = [int(p) for p in parts[:3]]
+    while len(nums) < 3:
+        nums.append(0)
+    return (nums[0], nums[1], nums[2])
+
+
+def auto_sync_plugin_fleet(
+    workspace_root: Path,
+    *,
+    force: bool = False,
+    no_sync_termux: bool = False,
+    manifest_path: Path | None = None,
+    mount_root: Path | None = None,
+) -> dict[str, Any]:
+    """Automatically mirror newer embedded plugin from active Cavern workspace -> fractal & omniagent and push."""
+    ws = Path(workspace_root).resolve()
+    manifest = load_manifest(ws, manifest_path)
+    mroot = get_mount_root(manifest, mount_root)
+    cavern_plugin = ws / ".agents" / "plugins" / "dynamic-fractal-planner"
+    fractal_dir = get_repo_path("fractal", ws, manifest, mroot)
+    omni_dir = get_repo_path("omniagent", ws, manifest, mroot)
+    if not cavern_plugin.is_dir() or not fractal_dir.is_dir():
+        return {"attempted": False, "ok": True, "reason": "federation_not_hydrated"}
+
+    cav_ver = _read_plugin_version(cavern_plugin)
+    frac_ver = _read_plugin_version(fractal_dir)
+    omni_ver = _read_plugin_version(omni_dir / ".agents" / "plugins" / "dynamic-fractal-planner") if omni_dir.is_dir() else ""
+
+    if not force and _semver_tuple(cav_ver) < _semver_tuple(frac_ver):
+        return {"attempted": False, "ok": True, "reason": f"fractal_newer({frac_ver}>{cav_ver})"}
+
+    out: dict[str, Any] = {
+        "attempted": True,
+        "ok": True,
+        "version": cav_ver,
+        "before": {"cavern": cav_ver, "fractal": frac_ver, "omniagent": omni_ver},
+        "pushes": {},
+    }
+
+    # 1. Mirror Cavern embedded plugin -> standalone fractal repo
+    m1 = sync_mirrors(ws, from_repo="cavern", mirror_name="fractal-embedded-plugin", apply=True, manifest_path=manifest_path, mount_root=mroot)
+    c1 = sum(int(r.get("changedCount") or 0) for r in (m1.get("mirrors") or []))
+    if c1 > 0 or force:
+        # Push fractal WITHOUT [skip ci] so ReleasePlugin.yml tests & publishes GitHub Release v<ver>
+        p_frac = push_federated_repo(
+            "fractal",
+            f"chore(plugin): sync dynamic-fractal-planner v{cav_ver}",
+            ws,
+            manifest_path=manifest_path,
+            mount_root=mount_root,
+            sync_deletes=False,
+            no_sync_termux=no_sync_termux,
+        )
+        out["pushes"]["fractal"] = p_frac
+        if not p_frac.get("ok"):
+            out["ok"] = False
+
+    # 2. Mirror standalone fractal repo -> OmniAgent embedded copy (skip ci to avoid pointless APK build)
+    if omni_dir.is_dir():
+        m2 = sync_mirrors(ws, from_repo="fractal", mirror_name="fractal-embedded-plugin-omniagent", apply=True, manifest_path=manifest_path, mount_root=mroot)
+        c2 = sum(int(r.get("changedCount") or 0) for r in (m2.get("mirrors") or []))
+        if c2 > 0 or (force and _semver_tuple(omni_ver) < _semver_tuple(cav_ver)):
+            p_oa = push_federated_repo(
+                "omniagent",
+                f"chore(plugin): sync dynamic-fractal-planner v{cav_ver} [skip ci]",
+                ws,
+                manifest_path=manifest_path,
+                mount_root=mount_root,
+                sync_deletes=False,
+                no_sync_termux=no_sync_termux,
+            )
+            out["pushes"]["omniagent"] = p_oa
+            if not p_oa.get("ok"):
+                out["ok"] = False
+
+    return out
 
 
 def _push_via_omniagent_phone(

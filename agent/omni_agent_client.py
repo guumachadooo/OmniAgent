@@ -643,6 +643,138 @@ def build_cavernize_cmd_payload(
     }
 
 
+def build_cavernize_watchdog_payload(
+    timeout_sec: int = 6,
+    reset_baseline: bool = False,
+) -> dict[str, Any]:
+    """Build payload for OmniAgentForegroundService `cavernize_watchdog` command."""
+    return {
+        "timeoutSec": max(2, min(15, int(timeout_sec))),
+        "resetBaseline": bool(reset_baseline),
+    }
+
+
+def probe_cavernize_watchdog(
+    relay: str,
+    secret: str,
+    admin: str = "",
+    *,
+    timeout_sec: int = 6,
+    reset_baseline: bool = False,
+) -> dict[str, Any]:
+    """Run external Cavernize PID/heartbeat/ANR watchdog via OmniAgent Android.
+
+    Uses native `cavernize_watchdog` when OmniAgent advertises it in channel
+    capabilities, and falls back seamlessly to an externally bounded
+    `cavernize_cmd ping` on older OmniAgent APKs.
+    """
+    clamped = max(2, min(15, int(timeout_sec)))
+    payload = build_cavernize_watchdog_payload(clamped, reset_baseline=reset_baseline)
+
+    # Fast capability check (~100ms) avoids wasting a round-trip on OmniAgent APKs prior to Q2
+    supports_native_watchdog = True
+    try:
+        headers = proto.derive_agent_headers(secret, channel="termux", admin_key=admin)
+        st, st_resp = proto.http_json("GET", f"{relay}/v1/agent/status?all=1", headers, timeout=6)
+        if st == 200 and isinstance(st_resp, dict) and st_resp.get("ok"):
+            ach = (st_resp.get("channels") or {}).get("android") or {}
+            caps = ach.get("capabilities")
+            if isinstance(caps, list) and caps:
+                supports_native_watchdog = "cavernize_watchdog" in caps
+    except Exception:
+        pass
+
+    res: dict[str, Any] = {}
+    if supports_native_watchdog:
+        t0 = time.monotonic()
+        try:
+            res = send_agent_command(
+                relay,
+                secret,
+                "cavernize_watchdog",
+                payload,
+                channel="android",
+                admin_key=admin,
+                timeout_sec=max(18, clamped + 12),
+                auto_wake=False,
+            )
+        except Exception as exc:
+            return {
+                "ok": False,
+                "state": "WATCHDOG_TRANSPORT_ERROR",
+                "alive": False,
+                "pid": 0,
+                "sessionId": "",
+                "pidRestarted": False,
+                "elapsedMs": int((time.monotonic() - t0) * 1000),
+                "detail": f"{type(exc).__name__}: {exc}",
+                "mode": "external_omniagent",
+            }
+
+        if res.get("state") in ("ALIVE", "UNRESPONSIVE_ANR", "PID_RESTARTED_CRASH", "NOT_INSTALLED", "SIGNATURE_MISMATCH"):
+            out = dict(res)
+            out["mode"] = "external_omniagent"
+            return out
+
+    err_txt = str(res.get("error") or res.get("body") or "")
+    # Seamless fallback when phone runs OmniAgent APK prior to native `cavernize_watchdog`
+    if (not supports_native_watchdog) or "unknown command" in err_txt.lower() or "not supported" in err_txt.lower() or not res.get("state"):
+        t1 = time.monotonic()
+        try:
+            ping_res = send_agent_command(
+                relay,
+                secret,
+                "cavernize_cmd",
+                {"cmd": "ping", "args": {}, "tier": 0, "timeoutSec": clamped},
+                channel="android",
+                admin_key=admin,
+                timeout_sec=max(16, clamped + 10),
+                auto_wake=False,
+            )
+        except Exception as exc2:
+            return {
+                "ok": False,
+                "state": "UNRESPONSIVE_ANR",
+                "alive": False,
+                "pid": 0,
+                "sessionId": "",
+                "pidRestarted": False,
+                "elapsedMs": int((time.monotonic() - t1) * 1000),
+                "detail": f"External ping timeout/error: {type(exc2).__name__}: {exc2}",
+                "mode": "external_timed_ping_fallback",
+            }
+        body = str(ping_res.get("body") or "")
+        pj: dict[str, Any] = {}
+        if body.strip().startswith("{"):
+            try:
+                pj = json.loads(body)
+            except Exception:
+                pj = {}
+        alive = bool(ping_res.get("ok")) and (pj.get("status") == "online" or bool(pj.get("sessionId")))
+        return {
+            "ok": alive,
+            "state": "ALIVE" if alive else "UNRESPONSIVE_ANR",
+            "alive": alive,
+            "pid": int(pj.get("pid") or 0),
+            "prevPid": 0,
+            "sessionId": str(pj.get("sessionId") or ""),
+            "prevSessionId": "",
+            "pidRestarted": False,
+            "consecutiveTimeouts": 0 if alive else 1,
+            "pidChanges": 0,
+            "uiHostAttached": bool(pj.get("uiHostAttached")),
+            "appVersion": str(pj.get("appVersion") or ""),
+            "elapsedMs": int(ping_res.get("elapsedMs") or ((time.monotonic() - t1) * 1000)),
+            "detail": (
+                f"Cavernize alive via external timed ping (sid={pj.get('sessionId', '')})"
+                if alive
+                else (str(ping_res.get("error") or body[:240] or f"Cavernize did not reply within {clamped}s"))
+            ),
+            "mode": "external_timed_ping_fallback",
+        }
+    return dict(res)
+
+
 def _is_channel_online(relay: str, secret: str, channel: str, admin: str = "") -> bool:
     try:
         headers = proto.derive_agent_headers(secret, channel="termux", admin_key=admin)
@@ -848,6 +980,25 @@ def cmd_ship(args: argparse.Namespace) -> int:
     if rc != 0:
         return rc
 
+    # Keep dynamic-fractal-planner automatically synchronized across fractal + omniagent + Termux global
+    plugin_touched = any(p.replace("\\", "/").startswith(".agents/plugins/dynamic-fractal-planner/") for p in touched)
+    try:
+        import repo_federation as rfed
+
+        cav_ver = rfed._read_plugin_version(ws / ".agents" / "plugins" / "dynamic-fractal-planner")
+        manifest = rfed.load_manifest(ws)
+        mroot = rfed.get_mount_root(manifest)
+        frac_ver = rfed._read_plugin_version(rfed.get_repo_path("fractal", ws, manifest, mroot))
+        if plugin_touched or (cav_ver and frac_ver and rfed._semver_tuple(cav_ver) > rfed._semver_tuple(frac_ver)):
+            sync_res = rfed.auto_sync_plugin_fleet(
+                ws,
+                force=plugin_touched,
+                no_sync_termux=bool(args.no_sync_termux),
+            )
+            print(json.dumps({"pluginFleetAutoSync": sync_res}, indent=2, ensure_ascii=False))
+    except Exception as exc:
+        print(json.dumps({"pluginFleetAutoSync": {"ok": False, "error": str(exc)}}, indent=2, ensure_ascii=False))
+
     if not args.no_close_fr:
         fr_script = ws / ".agents/scripts/flight_recorder.py"
         if fr_script.is_file():
@@ -985,6 +1136,10 @@ def main() -> int:
     p_cav.add_argument("--args", default="{}", help="JSON object of arguments")
     p_cav.add_argument("--tier", type=int, default=2, choices=(0, 1, 2))
 
+    p_wd = sub.add_parser("cavernize-watchdog", help="Run Q2 external OmniAgent PID/heartbeat/ANR timeout watchdog on Cavernize")
+    p_wd.add_argument("--probe-timeout", type=int, default=6, help="External IPC ANR timeout seconds (2..15)")
+    p_wd.add_argument("--reset-baseline", action="store_true", help="Reset OmniAgent stored PID/session baseline")
+
     p_cp = sub.add_parser("checkpoint", help="Anti-Cancellation 3-tier Session Flight Recorder (forwards to flight_recorder.py)")
     p_cp.add_argument("fr_args", nargs=argparse.REMAINDER, help="Arguments passed directly to flight_recorder.py (init|save|pin|resume|recover|restore|status|close)")
 
@@ -1010,10 +1165,18 @@ def main() -> int:
     p_rep = sub.add_parser("repos", help="3-Repo Federation manager (status|hydrate|diff|push|sync-mirrors across Cavern, OmniAgent & Fractal)")
     p_rep.add_argument("fed_args", nargs=argparse.REMAINDER, help="Arguments passed to repo_federation.py")
 
-    p_hunt = sub.add_parser("hunt", help="Live Adversarial Bug-Hunter & Chaos Fuzzer against running Cavernize app (8 vectors + --mode watch)")
+    p_hunt = sub.add_parser("hunt", help="Live Adversarial Bug-Hunter & Chaos Fuzzer against running Cavernize app (Q1-Q4 gates + --mode watch)")
     p_hunt.add_argument("--mode", choices=("quick", "standard", "deep", "watch"), default="standard")
     p_hunt.add_argument("--vectors", default="")
     p_hunt.add_argument("--no-mutate", action="store_true")
+    p_hunt.add_argument("--strict-mode", action="store_true")
+    p_hunt.add_argument("--golden-dir", default="")
+    p_hunt.add_argument("--update-goldens", action="store_true")
+    p_hunt.add_argument("--q2-p95-ms", type=float, default=12.0)
+    p_hunt.add_argument("--q2-touch-ms", type=float, default=50.0)
+    p_hunt.add_argument("--soak-cycles", type=int, default=16)
+    p_hunt.add_argument("--contracts-file", default="")
+    p_hunt.add_argument("--gate", action="store_true")
     p_hunt.add_argument("--duration", type=int, default=60)
     p_hunt.add_argument("--interval", type=float, default=3.0)
     p_hunt.add_argument("--out-md", default="/tmp/cavern_bug_hunt_latest.md")
@@ -1021,6 +1184,18 @@ def main() -> int:
     p_hunt.add_argument("--quiet", action="store_true")
 
     args = parser.parse_args()
+
+    if args.action == "cavernize-watchdog":
+        relay, secret, admin = _resolve_auth(args, allow_knock=True)
+        res = probe_cavernize_watchdog(
+            relay,
+            secret,
+            admin,
+            timeout_sec=args.probe_timeout,
+            reset_baseline=args.reset_baseline,
+        )
+        print(json.dumps(res, indent=2, ensure_ascii=False))
+        return 0 if res.get("ok") else 1
 
     if args.action == "hunt":
         import cavern_bug_hunter as bh
@@ -1035,6 +1210,17 @@ def main() -> int:
             forwarded_h += ["--vectors", args.vectors]
         if args.no_mutate:
             forwarded_h.append("--no-mutate")
+        if args.strict_mode:
+            forwarded_h.append("--strict-mode")
+        if args.golden_dir:
+            forwarded_h += ["--golden-dir", args.golden_dir]
+        if args.update_goldens:
+            forwarded_h.append("--update-goldens")
+        forwarded_h += ["--q2-p95-ms", str(args.q2_p95_ms), "--q2-touch-ms", str(args.q2_touch_ms), "--soak-cycles", str(args.soak_cycles)]
+        if args.contracts_file:
+            forwarded_h += ["--contracts-file", args.contracts_file]
+        if args.gate:
+            forwarded_h.append("--gate")
         if args.out_md:
             forwarded_h += ["--out-md", args.out_md]
         if args.out_json:
