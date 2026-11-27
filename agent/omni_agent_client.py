@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import concurrent.futures
 import hashlib
 import json
 import os
@@ -24,7 +25,13 @@ import time
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(line_buffering=True)
+    except Exception:
+        pass
 
 AGENT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = AGENT_DIR.parents[1] if AGENT_DIR.parent.name == ".agents" else AGENT_DIR.parent
@@ -39,6 +46,11 @@ import bridge_auth as bauth
 import github_direct as ghdirect
 import local_capabilities as lcap
 import omni_protocol as proto
+
+
+def _ship_log(msg: str, t0: float | None = None) -> None:
+    prefix = f"[ship +{time.monotonic() - t0:.1f}s]" if t0 is not None else "[ship]"
+    print(f"{prefix} {msg}", file=sys.stderr, flush=True)
 
 
 def _resolve_auth(args: argparse.Namespace, *, allow_knock: bool = False) -> tuple[str, str, str]:
@@ -264,6 +276,31 @@ def wake_linux_daemon(
     }
 
 
+def enqueue_agent_command(
+    relay_url: str,
+    pair_secret_hex: str,
+    cmd: str,
+    args_obj: dict[str, Any] | None = None,
+    channel: str = "termux",
+    admin_key: str = "",
+) -> str:
+    """Queue an encrypted command on Cloudflare Hub v6 without waiting for result (fire-and-forget)."""
+    headers = proto.derive_agent_headers(pair_secret_hex, channel=channel, admin_key=admin_key)
+    req_id = f"r_{int(time.time())}_{secrets.token_hex(6)}"
+    payload = {"cmd": cmd, "args": args_obj or {}, "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    envelope = proto.encrypt_envelope(pair_secret_hex, f"cmd:{req_id}", payload)
+    st, resp = proto.http_json(
+        "POST",
+        f"{relay_url}/v1/agent/cmd",
+        headers,
+        {"requestId": req_id, "envelope": envelope},
+        timeout=30,
+    )
+    if st >= 400 or not resp.get("ok"):
+        raise RuntimeError(f"Failed queueing agent command '{cmd}' on channel '{channel}' (HTTP {st}): {resp}")
+    return req_id
+
+
 def send_agent_command(
     relay_url: str,
     pair_secret_hex: str,
@@ -278,22 +315,22 @@ def send_agent_command(
     if auto_wake and channel in ("termux", "debian"):
         if not _is_channel_online(relay_url, pair_secret_hex, channel, admin_key):
             if _is_channel_online(relay_url, pair_secret_hex, "android", admin_key):
-                print(f"[omni-agent] Channel '{channel}' is asleep — auto-waking Linux/PRoot via android launch_termux_daemon...", file=sys.stderr)
+                print(
+                    f"[omni-agent] Channel '{channel}' is asleep — auto-waking Linux/PRoot via android launch_termux_daemon...",
+                    file=sys.stderr,
+                    flush=True,
+                )
                 wake_linux_daemon(relay_url, pair_secret_hex, admin_key=admin_key, wait_sec=15.0)
 
     headers = proto.derive_agent_headers(pair_secret_hex, channel=channel, admin_key=admin_key)
-    req_id = f"r_{int(time.time())}_{secrets.token_hex(6)}"
-    payload = {"cmd": cmd, "args": args_obj or {}, "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
-    envelope = proto.encrypt_envelope(pair_secret_hex, f"cmd:{req_id}", payload)
-    st, resp = proto.http_json(
-        "POST",
-        f"{relay_url}/v1/agent/cmd",
-        headers,
-        {"requestId": req_id, "envelope": envelope},
-        timeout=30,
+    req_id = enqueue_agent_command(
+        relay_url,
+        pair_secret_hex,
+        cmd,
+        args_obj=args_obj,
+        channel=channel,
+        admin_key=admin_key,
     )
-    if st >= 400 or not resp.get("ok"):
-        raise RuntimeError(f"Failed queueing agent command '{cmd}' on channel '{channel}' (HTTP {st}): {resp}")
 
     deadline = time.time() + max(5, timeout_sec)
     # Cloudflare Hub v6 uses SQLite Durable Objects (<50ms strong consistency, zero KV negative cache);
@@ -350,7 +387,13 @@ def pick_cavernize_channel(relay_url: str, pair_secret_hex: str, preferred: str 
     return "android"
 
 
-def cmd_push_workspace(args: argparse.Namespace) -> int:
+def _push_workspace_impl(
+    args: argparse.Namespace,
+    *,
+    precomputed_diff: dict[str, Any] | None = None,
+    progress_cb: Callable[[str], None] | None = None,
+    emit_json: bool = True,
+) -> tuple[int, dict[str, Any]]:
     repo_root = Path(args.workspace or REPO_ROOT).resolve()
     explicit_files: list[str] = list(args.files or [])
     deleted_files: list[str] = list(args.delete or [])
@@ -363,7 +406,14 @@ def cmd_push_workspace(args: argparse.Namespace) -> int:
     )
     if use_direct_github:
         owner_repo = (getattr(args, "owner_repo", "") or "guumachadooo/Cavern").strip()
-        print(f"Pushing directly to GitHub ({owner_repo}@{args.branch}) via local GITHUB_TOKEN...", file=sys.stderr)
+        if progress_cb:
+            progress_cb(f"pushing {owner_repo}@{args.branch} via local GITHUB_TOKEN...")
+        else:
+            print(
+                f"Pushing directly to GitHub ({owner_repo}@{args.branch}) via local GITHUB_TOKEN...",
+                file=sys.stderr,
+                flush=True,
+            )
         try:
             res = ghdirect.push_workspace_direct(
                 repo_root,
@@ -374,6 +424,8 @@ def cmd_push_workspace(args: argparse.Namespace) -> int:
                 explicit_files=explicit_files or None,
                 explicit_deletes=deleted_files or None,
                 sync_deletes=bool(args.sync_deletes),
+                precomputed_diff=precomputed_diff,
+                progress_cb=progress_cb,
             )
             # Refresh local Flight Recorder / live-sync watcher baseline immediately so pushed files aren't re-mirrored.
             try:
@@ -381,70 +433,33 @@ def cmd_push_workspace(args: argparse.Namespace) -> int:
                 fr.save_local_baseline(fr.DEFAULT_LOCAL_DIR, repo_root)
             except Exception:
                 pass
-            # Keep Antigravity / Termux repo on phone 100% synced whenever online!
-            # Safely reconciles any unmodified live-mirrored files before git pull --rebase (never clobbers manual phone edits).
-            if not getattr(args, "no_sync_termux", False):
-                termux_sync: dict[str, Any] = {"attempted": False}
+            # Keep Antigravity / Termux repo on phone synced via bounded-timeout single batched RPC (never hangs).
+            if not getattr(args, "no_sync_termux", False) and (int(res.get("changedCount") or 0) > 0 or int(res.get("deletedCount") or 0) > 0):
                 try:
-                    conn = bauth.resolve_connection(
-                        cli_url=getattr(args, "url", "") or "",
-                        cli_pair_secret=getattr(args, "pair_secret", "") or "",
-                        cli_admin_key=getattr(args, "admin_key", "") or "",
+                    import repo_federation as rfed
+                    t_timeout = int(getattr(args, "termux_timeout", 18))
+                    termux_repo_path = args.repo or "/root/.gemini/antigravity/scratch/Cavern"
+                    res["termuxSync"] = rfed.sync_termux_repos_batch(
+                        [
+                            {
+                                "alias": owner_repo.split("/")[-1].lower(),
+                                "termuxPath": termux_repo_path,
+                                "branch": args.branch,
+                                "remote": args.remote,
+                                "reconcileMirror": True,
+                            }
+                        ],
+                        timeout_sec=t_timeout,
+                        url_arg=getattr(args, "url", "") or "",
+                        pair_secret_arg=getattr(args, "pair_secret", "") or "",
+                        admin_key_arg=getattr(args, "admin_key", "") or "",
+                        progress_cb=progress_cb,
                     )
-                    if conn["relayUrl"] and conn["pairSecret"] and _is_channel_online(conn["relayUrl"], conn["pairSecret"], "termux", conn["adminKey"]):
-                        termux_sync["attempted"] = True
-                        import flight_recorder as fr
-                        script_b64 = base64.b64encode(
-                            fr.build_termux_reconcile_pull_script(args.remote, args.branch).encode("utf-8")
-                        ).decode("ascii")
-                        reconcile_cmd = f"python3 -B -c \"import base64; exec(base64.b64decode('{script_b64}').decode('utf-8'))\""
-                        pull_res = send_agent_command(
-                            conn["relayUrl"],
-                            conn["pairSecret"],
-                            "shell_exec",
-                            {"command": reconcile_cmd, "cwd": args.repo or "", "timeoutSec": 90},
-                            channel="termux",
-                            admin_key=conn["adminKey"],
-                            timeout_sec=100,
-                        )
-                        parsed_sync = None
-                        if pull_res.get("ok"):
-                            lines = [ln.strip() for ln in str(pull_res.get("stdout") or "").splitlines() if ln.strip()]
-                            if lines:
-                                try:
-                                    parsed_sync = json.loads(lines[-1])
-                                except Exception:
-                                    parsed_sync = None
-                        if isinstance(parsed_sync, dict):
-                            termux_sync["ok"] = bool(parsed_sync.get("ok"))
-                            termux_sync["head"] = parsed_sync.get("head", "")
-                            if parsed_sync.get("reconciled"):
-                                termux_sync["reconciledMirrored"] = parsed_sync["reconciled"]
-                            if parsed_sync.get("preservedManual"):
-                                termux_sync["preservedManual"] = parsed_sync["preservedManual"]
-                            if not parsed_sync.get("ok"):
-                                termux_sync["error"] = parsed_sync.get("stderr") or "git_pull failed"
-                        else:
-                            # Fallback to legacy git_pull command
-                            legacy = send_agent_command(
-                                conn["relayUrl"],
-                                conn["pairSecret"],
-                                "git_pull",
-                                {"repo": args.repo or "", "remote": args.remote, "branch": args.branch},
-                                channel="termux",
-                                admin_key=conn["adminKey"],
-                                timeout_sec=60,
-                            )
-                            termux_sync["ok"] = bool(legacy.get("ok"))
-                            termux_sync["head"] = legacy.get("head", "")
-                            if not legacy.get("ok"):
-                                termux_sync["error"] = legacy.get("error") or legacy.get("stderr") or "git_pull failed"
                 except Exception as exc:
-                    termux_sync["ok"] = False
-                    termux_sync["error"] = str(exc)
-                res["termuxSync"] = termux_sync
-            print(json.dumps(res, indent=2, ensure_ascii=False))
-            return 0 if res.get("ok") else 1
+                    res["termuxSync"] = {"attempted": True, "ok": False, "error": str(exc)}
+            if emit_json:
+                print(json.dumps(res, indent=2, ensure_ascii=False), flush=True)
+            return (0 if res.get("ok") else 1), res
         except RuntimeError as exc:
             if via == "github" or "HTTP 403" not in str(exc):
                 raise
@@ -452,6 +467,7 @@ def cmd_push_workspace(args: argparse.Namespace) -> int:
                 f"WARN: Local GITHUB_TOKEN lacks repository Contents:Write permission ({exc}). "
                 "Falling back automatically to OmniAgent phone git push...",
                 file=sys.stderr,
+                flush=True,
             )
 
     if (
@@ -461,20 +477,23 @@ def cmd_push_workspace(args: argparse.Namespace) -> int:
         and any(os.environ.get(k, "").strip() for k in ("ANTIGRAVITY_AGENT", "ANTIGRAVITY_CONVERSATION_ID"))
     ):
         msg = "Local Antigravity host has native .git repo; run `git commit && git push` directly (or pass `--via phone` to force relay push)."
-        print(f"INFO: {msg}", file=sys.stderr)
-        print(json.dumps({"ok": False, "host": "antigravity", "routing": "native_git", "message": msg}, indent=2))
-        return 1
+        print(f"INFO: {msg}", file=sys.stderr, flush=True)
+        out = {"ok": False, "host": "antigravity", "routing": "native_git", "message": msg}
+        if emit_json:
+            print(json.dumps(out, indent=2), flush=True)
+        return 1, out
 
     relay, secret, admin = _resolve_auth(args, allow_knock=True)
     channel = pick_channel(relay, secret, args.channel, admin)
 
     if not explicit_files:
         # Ask phone repo for its exact manifest so we only transmit changed/added/deleted files!
-        print(f"Fetching remote manifest from channel '{channel}'...", file=sys.stderr)
+        print(f"Fetching remote manifest from channel '{channel}'...", file=sys.stderr, flush=True)
         m_res = send_agent_command(relay, secret, "git_manifest", {"repo": args.repo or ""}, channel=channel, admin_key=admin, timeout_sec=90)
         if not m_res.get("ok"):
-            print(json.dumps(m_res, indent=2))
-            return 1
+            if emit_json:
+                print(json.dumps(m_res, indent=2), flush=True)
+            return 1, m_res
         if m_res.get("manifestBlobId"):
             remote_manifest = proto.download_encrypted_blob(relay, secret, m_res["manifestBlobId"], admin_key=admin).get("manifest", {})
         else:
@@ -484,9 +503,6 @@ def cmd_push_workspace(args: argparse.Namespace) -> int:
             rem = remote_manifest.get(rel)
             if not rem or rem.get("sha256") != meta["sha256"]:
                 explicit_files.append(rel)
-        # If files were ALREADY live-mirrored to the phone repo by live_sync_watcher.py,
-        # their working-tree SHA-256 matches local_manifest, so also include tracked live-mirrored
-        # files when committing so git_commit_push stages & commits them cleanly!
         if args.commit:
             try:
                 import flight_recorder as fr
@@ -506,13 +522,15 @@ def cmd_push_workspace(args: argparse.Namespace) -> int:
                     deleted_files.append(rel)
 
     if not explicit_files and not deleted_files:
-        print(json.dumps({"ok": True, "message": "Workspace already 100% identical to remote repo (0 changed files)."}, indent=2))
-        return 0
+        out = {"ok": True, "changedCount": 0, "deletedCount": 0, "message": "Workspace already 100% identical to remote repo (0 changed files)."}
+        if emit_json:
+            print(json.dumps(out, indent=2), flush=True)
+        return 0, out
 
     bundle = proto.pack_delta_bundle(repo_root, explicit_files, deleted_files)
-    print(f"Packing delta bundle: {len(bundle['files'])} modified/added, {len(bundle['deleted'])} deleted...", file=sys.stderr)
+    print(f"Packing delta bundle: {len(bundle['files'])} modified/added, {len(bundle['deleted'])} deleted...", file=sys.stderr, flush=True)
     blob = proto.upload_encrypted_blob(relay, secret, bundle, admin_key=admin)
-    print(f"Uploaded encrypted blob {blob['blobId']} ({blob['bytes']} bytes, {blob['totalChunks']} chunk(s)).", file=sys.stderr)
+    print(f"Uploaded encrypted blob {blob['blobId']} ({blob['bytes']} bytes, {blob['totalChunks']} chunk(s)).", file=sys.stderr, flush=True)
 
     target_cmd = "github_push_bundle" if channel == "android" else ("git_commit_push" if args.commit else "git_apply_bundle")
     res = send_agent_command(
@@ -539,8 +557,14 @@ def cmd_push_workspace(args: argparse.Namespace) -> int:
             fr.save_local_baseline(fr.DEFAULT_LOCAL_DIR, repo_root)
         except Exception:
             pass
-    print(json.dumps(res, indent=2, ensure_ascii=False))
-    return 0 if res.get("ok") else 1
+    if emit_json:
+        print(json.dumps(res, indent=2, ensure_ascii=False), flush=True)
+    return (0 if res.get("ok") else 1), res
+
+
+def cmd_push_workspace(args: argparse.Namespace) -> int:
+    rc, _ = _push_workspace_impl(args, emit_json=True)
+    return rc
 
 
 def cmd_pull_workspace(args: argparse.Namespace) -> int:
@@ -933,29 +957,96 @@ def _needs_apk_ci(paths: list[str]) -> bool:
 
 
 def cmd_ship(args: argparse.Namespace) -> int:
-    """One-shot quota-saving ship pipeline: verify + file-budget + push + Termux sync + Flight Recorder close."""
-    ws = Path(args.workspace or REPO_ROOT).resolve()
+    """Fast 1-shot ship pipeline (<30s): parallel diff+budget -> scoped verify -> parallel blob push -> parallel fleet push -> batched bounded Termux sync + Flight Recorder close."""
     import subprocess as sp
 
-    if not args.no_verify:
-        checks = [
-            ("file_budget", [sys.executable, "-B", str(ws / ".agents/scripts/file_budget_guard.py"), "--check", "--warn", "850", "--fail", "920"]),
-            ("verify_universal", [sys.executable, "-B", str(ws / ".agents/plugins/dynamic-fractal-planner/scripts/verify_universal.py"), "--all"]),
-        ]
-        for label, cmd in checks:
-            r = sp.run(cmd, cwd=str(ws), capture_output=True, text=True, timeout=120, check=False)
-            if r.returncode != 0:
-                print(json.dumps({"ok": False, "stage": label, "stdout": r.stdout[-1500:], "stderr": r.stderr[-1500:]}, indent=2))
-                return r.returncode
-
+    t0 = time.monotonic()
+    ws = Path(args.workspace or REPO_ROOT).resolve()
     owner_repo = args.owner_repo or "guumachadooo/Cavern"
     branch = args.branch or "master"
-    diff = ghdirect.diff_workspace_against_github(ws, owner_repo=owner_repo, branch=branch, sync_deletes=bool(args.sync_deletes))
-    touched = list(diff["changed"]) + list(diff["deleted"])
+    termux_timeout = int(getattr(args, "termux_timeout", 18))
+    full_verify = bool(getattr(args, "full_verify", False))
+    timings_ms: dict[str, int] = {}
+
+    def _progress(msg: str) -> None:
+        _ship_log(msg, t0)
+
+    # Stage 1: Run GitHub diff + file_budget_guard concurrently (~1.0-1.5s)
+    _progress(f"diffing workspace against {owner_repo}@{branch}" + (" + file_budget..." if not args.no_verify else "..."))
+    t_s1 = time.monotonic()
+    budget_res = None
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        f_diff = pool.submit(
+            ghdirect.diff_workspace_against_github,
+            ws,
+            owner_repo=owner_repo,
+            branch=branch,
+            sync_deletes=bool(args.sync_deletes),
+        )
+        f_budget = (
+            pool.submit(
+                sp.run,
+                [sys.executable, "-B", str(ws / ".agents/scripts/file_budget_guard.py"), "--check", "--warn", "850", "--fail", "920"],
+                cwd=str(ws),
+                capture_output=True,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+            if not args.no_verify
+            else None
+        )
+        diff = f_diff.result()
+        if f_budget is not None:
+            budget_res = f_budget.result()
+    timings_ms["diffAndBudget"] = int((time.monotonic() - t_s1) * 1000)
+
+    if budget_res is not None and budget_res.returncode != 0:
+        print(
+            json.dumps(
+                {"ok": False, "stage": "file_budget", "stdout": budget_res.stdout[-1500:], "stderr": budget_res.stderr[-1500:]},
+                indent=2,
+            ),
+            flush=True,
+        )
+        return budget_res.returncode
+
+    changed = list(diff["changed"])
+    deleted = list(diff["deleted"])
+    touched = changed + deleted
+    _progress(f"diff ready ({len(changed)} modified/added, {len(deleted)} deleted) in {timings_ms['diffAndBudget']}ms")
+
+    # Stage 2: Scoped verify_universal (--files <changed> takes ~0.5s non-plugin / ~6s plugin vs 43s for --all!)
+    if not args.no_verify:
+        t_v = time.monotonic()
+        vu_script = ws / ".agents/plugins/dynamic-fractal-planner/scripts/verify_universal.py"
+        if full_verify or len(changed) > 120:
+            vu_cmd = [sys.executable, "-B", str(vu_script), "--all"]
+            vu_mode = "all"
+        else:
+            vu_cmd = [sys.executable, "-B", str(vu_script), "--files", *changed]
+            vu_mode = f"scoped({len(changed)})"
+        _progress(f"running verify_universal ({vu_mode})...")
+        vr = sp.run(vu_cmd, cwd=str(ws), capture_output=True, text=True, timeout=180, check=False)
+        timings_ms["verifyUniversal"] = int((time.monotonic() - t_v) * 1000)
+        if vr.returncode != 0:
+            _progress(f"verify_universal FAILED in {timings_ms['verifyUniversal']}ms")
+            print(
+                json.dumps(
+                    {"ok": False, "stage": "verify_universal", "stdout": vr.stdout[-1500:], "stderr": vr.stderr[-1500:]},
+                    indent=2,
+                ),
+                flush=True,
+            )
+            return vr.returncode
+        _progress(f"verify_universal PASS ({vu_mode}) in {timings_ms['verifyUniversal']}ms")
+
     commit_msg = args.commit.strip()
     if args.auto_skip_ci and "[skip ci]" not in commit_msg.lower() and not _needs_apk_ci(touched):
         commit_msg = f"{commit_msg} [skip ci]"
 
+    # Stage 3: Push primary repo directly reusing precomputed_diff (defer Termux sync to single batched RPC in Stage 5!)
+    t_p1 = time.monotonic()
     push_ns = argparse.Namespace(
         workspace=str(ws),
         commit=commit_msg,
@@ -964,7 +1055,7 @@ def cmd_ship(args: argparse.Namespace) -> int:
         branch=branch,
         remote="origin",
         no_push=False,
-        no_sync_termux=bool(args.no_sync_termux),
+        no_sync_termux=True,
         pull_first=False,
         sync_deletes=bool(args.sync_deletes),
         files=None,
@@ -975,38 +1066,156 @@ def cmd_ship(args: argparse.Namespace) -> int:
         channel=args.channel,
         repo=args.repo,
         timeout=args.timeout,
+        termux_timeout=termux_timeout,
     )
-    rc = cmd_push_workspace(push_ns)
+    rc, push_res = _push_workspace_impl(push_ns, precomputed_diff=diff, progress_cb=_progress, emit_json=False)
+    timings_ms["primaryPush"] = int((time.monotonic() - t_p1) * 1000)
     if rc != 0:
+        print(json.dumps(push_res, indent=2, ensure_ascii=False), flush=True)
         return rc
 
-    # Keep dynamic-fractal-planner automatically synchronized across fractal + omniagent + Termux global
+    # Stage 4: Keep dynamic-fractal-planner synchronized across fractal + omniagent IN PARALLEL (still deferring Termux sync!)
     plugin_touched = any(p.replace("\\", "/").startswith(".agents/plugins/dynamic-fractal-planner/") for p in touched)
+    plugin_sync_res: dict[str, Any] | None = None
+    fleet_pushed_aliases: list[str] = []
+    manifest: dict[str, Any] = {}
     try:
         import repo_federation as rfed
 
-        cav_ver = rfed._read_plugin_version(ws / ".agents" / "plugins" / "dynamic-fractal-planner")
         manifest = rfed.load_manifest(ws)
+        cav_ver = rfed._read_plugin_version(ws / ".agents" / "plugins" / "dynamic-fractal-planner")
         mroot = rfed.get_mount_root(manifest)
         frac_ver = rfed._read_plugin_version(rfed.get_repo_path("fractal", ws, manifest, mroot))
         if plugin_touched or (cav_ver and frac_ver and rfed._semver_tuple(cav_ver) > rfed._semver_tuple(frac_ver)):
-            sync_res = rfed.auto_sync_plugin_fleet(
+            t_fl = time.monotonic()
+            plugin_sync_res = rfed.auto_sync_plugin_fleet(
                 ws,
                 force=plugin_touched,
-                no_sync_termux=bool(args.no_sync_termux),
+                no_sync_termux=True,
+                progress_cb=_progress,
             )
-            print(json.dumps({"pluginFleetAutoSync": sync_res}, indent=2, ensure_ascii=False))
+            timings_ms["pluginFleetPush"] = int((time.monotonic() - t_fl) * 1000)
+            fleet_pushed_aliases = list(plugin_sync_res.get("pushedAliases") or [])
     except Exception as exc:
-        print(json.dumps({"pluginFleetAutoSync": {"ok": False, "error": str(exc)}}, indent=2, ensure_ascii=False))
+        plugin_sync_res = {"ok": False, "error": str(exc)}
 
+    # Stage 5: Finalize Termux batched pull + Flight Recorder close IN PARALLEL (hard-bounded timeout so ship never hangs!)
+    t_fin = time.monotonic()
+    primary_changed = int(push_res.get("changedCount") or 0) > 0 or int(push_res.get("deletedCount") or 0) > 0
+    termux_entries: list[dict[str, Any]] = []
+    if not bool(args.no_sync_termux):
+        repos_cfg = manifest.get("repos") or {}
+        if primary_changed:
+            cav_spec = repos_cfg.get("cavern") or {}
+            termux_entries.append(
+                {
+                    "alias": "cavern",
+                    "termuxPath": args.repo or str(cav_spec.get("termuxPath") or "/root/.gemini/antigravity/scratch/Cavern"),
+                    "branch": branch,
+                    "remote": "origin",
+                    "reconcileMirror": True,
+                }
+            )
+        for alias in fleet_pushed_aliases:
+            sp_cfg = repos_cfg.get(alias) or {}
+            if sp_cfg.get("termuxPath"):
+                termux_entries.append(
+                    {
+                        "alias": alias,
+                        "termuxPath": str(sp_cfg["termuxPath"]),
+                        "branch": str(sp_cfg.get("branch") or "main"),
+                        "remote": "origin",
+                        "reconcileMirror": False,
+                        "globalPluginPath": str(sp_cfg.get("termuxGlobalPluginPath") or ""),
+                    }
+                )
+
+    def _run_termux_batch() -> dict[str, Any]:
+        if not termux_entries:
+            return {"attempted": False, "ok": True, "reason": "no_sync_needed"}
+        import repo_federation as rfed
+        return rfed.sync_termux_repos_batch(
+            termux_entries,
+            timeout_sec=termux_timeout,
+            url_arg=args.url or "",
+            pair_secret_arg=args.pair_secret or "",
+            admin_key_arg=args.admin_key or "",
+            progress_cb=_progress,
+        )
+
+    def _run_fr_close() -> dict[str, Any]:
+        if args.no_close_fr:
+            return {"skipped": True}
+        try:
+            import flight_recorder as fr
+
+            head_sha = str(push_res.get("head") or "")
+            # Write Tier 1 local immediately (<15ms) + flush Cloud synchronously (~0.3s) + spawn background Termux flush so ship never stalls!
+            res_loc = fr.close_session(
+                workspace=ws,
+                local_dir=fr.DEFAULT_LOCAL_DIR,
+                commit=head_sha,
+                note=commit_msg,
+                next_step=args.next_step or "",
+                use_remote=False,
+            )
+            cp = res_loc.get("checkpoint") or {}
+            cloud_res: dict[str, Any] = {"skipped": True}
+            auth = fr._try_resolve_remote_auth(args.url or "", args.pair_secret or "", args.admin_key or "")
+            if auth:
+                relay_u, sec_h, adm_k = auth
+                try:
+                    cloud_res = fr.write_cloud_tier(relay_u, sec_h, cp, None, admin_key=adm_k)
+                    sem_cp = fr.extract_semantic_record(cp)
+                    fr.write_cloud_tier(
+                        relay_u,
+                        sec_h,
+                        sem_cp,
+                        None,
+                        admin_key=adm_k,
+                        task_id=fr.CLOUD_SEMANTIC_TASK_ID,
+                        env_ctx=fr.CLOUD_SEMANTIC_CTX,
+                    )
+                except Exception as exc_c:
+                    cloud_res = {"ok": False, "error": str(exc_c)}
+            bg_res = fr._spawn_background_remote_flush(
+                fr.DEFAULT_LOCAL_DIR,
+                apply_live_mirror=False,
+                clear_mirror_state=True,
+                url_arg=args.url or "",
+                pair_secret_arg=args.pair_secret or "",
+                admin_key_arg=args.admin_key or "",
+            )
+            return {
+                "ok": True,
+                "seq": cp.get("seq"),
+                "status": cp.get("status"),
+                "cloudOk": bool(cloud_res.get("ok")),
+                "termuxBg": bg_res,
+            }
+        except Exception as exc_fr:
+            return {"ok": False, "error": str(exc_fr)}
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        f_termux = pool.submit(_run_termux_batch)
+        f_fr = pool.submit(_run_fr_close)
+        termux_sync_res = f_termux.result()
+        fr_close_res = f_fr.result()
+    timings_ms["finalize"] = int((time.monotonic() - t_fin) * 1000)
+    timings_ms["total"] = int((time.monotonic() - t0) * 1000)
+
+    final_out = dict(push_res)
+    final_out["termuxSync"] = termux_sync_res
+    if plugin_sync_res is not None:
+        final_out["pluginFleetAutoSync"] = plugin_sync_res
     if not args.no_close_fr:
-        fr_script = ws / ".agents/scripts/flight_recorder.py"
-        if fr_script.is_file():
-            fr_cmd = [sys.executable, "-B", str(fr_script), "close", "--note", commit_msg]
-            if args.next_step:
-                fr_cmd += ["--next", args.next_step]
-            sp.run(fr_cmd, cwd=str(ws), check=False)
-    return 0
+        final_out["flightRecorderClose"] = fr_close_res
+    final_out["shipTimingsMs"] = timings_ms
+
+    _progress(f"DONE in {timings_ms['total'] / 1000:.1f}s (head={final_out.get('head', '?')}, termux={termux_sync_res.get('mode', termux_sync_res.get('reason', '?'))})")
+    print(json.dumps(final_out, indent=2, ensure_ascii=False), flush=True)
+    fleet_ok = True if plugin_sync_res is None else bool(plugin_sync_res.get("ok", True))
+    return 0 if (final_out.get("ok") and fleet_ok) else 1
 
 
 def main() -> int:
@@ -1149,7 +1358,7 @@ def main() -> int:
     p_pin = sub.add_parser("pin", help="Zero-friction semantic breadcrumb write (forwards to flight_recorder.py pin)")
     p_pin.add_argument("fr_args", nargs=argparse.REMAINDER, help="Flags forwarded to flight_recorder.py pin (-b|--goal|--done|--pending|--next)")
 
-    p_ship = sub.add_parser("ship", help="1-shot quota-saving pipeline: verify + file-budget + auto [skip ci] push + Termux sync + Flight Recorder close")
+    p_ship = sub.add_parser("ship", help="Fast 1-shot pipeline (<30s): parallel diff+budget -> scoped verify -> parallel push -> batched Termux sync + FR close")
     p_ship.add_argument("--commit", required=True, help="Commit message")
     p_ship.add_argument("--next", dest="next_step", default="", help="Next step saved to Flight Recorder & Antigravity handoff")
     p_ship.add_argument("--workspace", default=str(REPO_ROOT))
@@ -1159,7 +1368,9 @@ def main() -> int:
     p_ship.add_argument("--sync-deletes", action="store_true")
     p_ship.add_argument("--auto-skip-ci", action="store_true", help="Automatically append [skip ci] if no Android C#/C++/BuildAndroid.yml files changed")
     p_ship.add_argument("--no-verify", action="store_true")
+    p_ship.add_argument("--full-verify", action="store_true", help="Run full-repo verify_universal --all instead of fast scoped --files check")
     p_ship.add_argument("--no-sync-termux", action="store_true")
+    p_ship.add_argument("--termux-timeout", type=int, default=18, help="Max seconds to wait for batched Termux pull (0=fire-and-forget async, default=18)")
     p_ship.add_argument("--no-close-fr", action="store_true")
 
     p_rep = sub.add_parser("repos", help="3-Repo Federation manager (status|hydrate|diff|push|sync-mirrors across Cavern, OmniAgent & Fractal)")

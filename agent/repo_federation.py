@@ -18,6 +18,7 @@ Pure Python 3 stdlib (zero pip dependencies). Never stores secrets in any repo.
 from __future__ import annotations
 
 import argparse
+import base64
 import concurrent.futures
 import fnmatch
 import hashlib
@@ -27,12 +28,19 @@ import os
 import shutil
 import sys
 import tarfile
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(line_buffering=True)
+    except Exception:
+        pass
 
 AGENT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = AGENT_DIR.parents[1] if AGENT_DIR.parent.name == ".agents" else AGENT_DIR.parent
@@ -42,6 +50,8 @@ if str(AGENT_DIR) not in sys.path:
 import github_direct as ghdirect
 import local_capabilities as lcap
 import omni_protocol as proto
+
+_STATE_LOCK = threading.Lock()
 
 DEFAULT_MOUNT_ROOT = Path("/tmp/cavern-federation")
 STATE_FILENAME = ".federation_state.json"
@@ -684,8 +694,10 @@ def push_federated_repo(
     mount_root: Path | None = None,
     sync_deletes: bool = False,
     no_sync_termux: bool = False,
+    termux_timeout_sec: int = 18,
     explicit_files: list[str] | None = None,
     explicit_deletes: list[str] | None = None,
+    progress_cb: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     """Push any federated repo (`cavern`, `omniagent`, `fractal`) directly via GitHub API or Termux fallback."""
     ws = Path(workspace_root).resolve()
@@ -713,28 +725,35 @@ def push_federated_repo(
                 explicit_files=explicit_files or None,
                 explicit_deletes=explicit_deletes or None,
                 sync_deletes=sync_deletes,
+                progress_cb=progress_cb,
             )
             # Update federation baseline for non-active hydrated repos so future warms see clean state
             current = detect_current_repo(ws, manifest)
             if res.get("ok") and alias != current:
-                state = _read_state(mroot)
-                st_repos = state.setdefault("repos", {})
-                st_repos[alias] = {
-                    "ownerRepo": owner_repo,
-                    "branch": branch,
-                    "headSha": res.get("headFull") or "",
-                    "hydratedUtc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                    "baselineHashes": _compute_dir_hashes(repo_dir),
-                }
-                _write_state(mroot, state)
+                baseline_hashes = _compute_dir_hashes(repo_dir)
+                with _STATE_LOCK:
+                    state = _read_state(mroot)
+                    st_repos = state.setdefault("repos", {})
+                    st_repos[alias] = {
+                        "ownerRepo": owner_repo,
+                        "branch": branch,
+                        "headSha": res.get("headFull") or "",
+                        "hydratedUtc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        "baselineHashes": baseline_hashes,
+                    }
+                    _write_state(mroot, state)
 
             if not no_sync_termux and spec.get("termuxPath"):
-                res["termuxSync"] = _try_sync_termux_repo(spec, branch)
+                res["termuxSync"] = _try_sync_termux_repo(spec, branch, timeout_sec=termux_timeout_sec)
             return res
         except RuntimeError as exc:
             if "HTTP 403" not in str(exc) and "Resource not accessible" not in str(exc):
                 raise
-            print(f"WARN: Local GITHUB_TOKEN lacks Contents:Write for {owner_repo} ({exc}). Falling back to OmniAgent phone git push...")
+            print(
+                f"WARN: Local GITHUB_TOKEN lacks Contents:Write for {owner_repo} ({exc}). Falling back to OmniAgent phone git push...",
+                file=sys.stderr,
+                flush=True,
+            )
 
     # Fallback: push via OmniAgent phone Termux (works even when GITHUB_TOKEN is missing or read-only!)
     return _push_via_omniagent_phone(
@@ -747,47 +766,294 @@ def push_federated_repo(
     )
 
 
-def _try_sync_termux_repo(spec: dict[str, Any], branch: str) -> dict[str, Any]:
-    termux_path = str(spec.get("termuxPath") or "").strip()
-    owner_repo = str(spec.get("ownerRepo") or "").strip()
-    global_plugin_path = str(spec.get("termuxGlobalPluginPath") or "").strip()
-    if not termux_path:
-        return {"attempted": False}
+def _build_termux_batch_sync_script(entries: list[dict[str, Any]]) -> str:
+    """Build a self-contained pure-stdlib Python script that syncs all pushed repos in parallel on Termux."""
+    payload_json = json.dumps(entries, separators=(",", ":"), ensure_ascii=False)
+    return f"""
+import concurrent.futures, hashlib, json, os, shutil, subprocess
+from pathlib import Path
+
+ENTRIES = json.loads({json.dumps(payload_json)})
+GLOBAL_EXCLUDES = {{".git", ".github", ".gitignore", "package.json", "AGENTS.md", ".workspaces.json", ".last_good_backup", "__pycache__", ".metrics.jsonl", ".model_modes.json", ".hook_state.json", ".diagnostics"}}
+
+def git_blob_sha1(raw: bytes) -> str:
+    return hashlib.sha1(f"blob {{len(raw)}}\\x00".encode("ascii") + raw).hexdigest()
+
+def sync_global_plugin(src_dir: Path, dst_dir: Path) -> dict:
+    if not src_dir.is_dir():
+        return {{"ok": False, "error": "source_missing"}}
+    copied = 0
+    for dirpath, dirnames, filenames in os.walk(src_dir):
+        cur = Path(dirpath)
+        rel_dir = cur.relative_to(src_dir).as_posix()
+        dirnames[:] = [d for d in sorted(dirnames) if d not in GLOBAL_EXCLUDES and (rel_dir != ".agents" or d != "preview")]
+        for fn in sorted(filenames):
+            if fn in GLOBAL_EXCLUDES or fn.endswith((".pyc", ".pyo")):
+                continue
+            rel_f = fn if rel_dir == "." else f"{{rel_dir}}/{{fn}}"
+            if rel_f.startswith((".agents/preview/", ".agents/federation.json", ".agents/bridge_profile.json", ".agents/env_manifest.json", ".agents/host_matrix.json", ".agents/planner_profile.json")):
+                continue
+            sf = cur / fn
+            df = dst_dir / rel_f
+            sb = sf.read_bytes()
+            if not df.is_file() or df.read_bytes() != sb:
+                df.parent.mkdir(parents=True, exist_ok=True)
+                df.write_bytes(sb)
+                if os.access(sf, os.X_OK):
+                    try:
+                        os.chmod(df, 0o755)
+                    except OSError:
+                        pass
+                copied += 1
+    return {{"ok": True, "copied": copied}}
+
+def sync_one(ent: dict) -> dict:
+    alias = ent.get("alias", "")
+    repo = Path(str(ent.get("termuxPath") or "")).expanduser()
+    remote = str(ent.get("remote") or "origin")
+    branch = str(ent.get("branch") or "main")
+    if not (repo / ".git").exists():
+        return {{"alias": alias, "ok": False, "status": "not_cloned"}}
+    r_fetch = subprocess.run(["git", "fetch", remote, branch], cwd=str(repo), capture_output=True, text=True, timeout=45, check=False)
+    if r_fetch.returncode != 0:
+        return {{"alias": alias, "ok": False, "error": (r_fetch.stderr or r_fetch.stdout)[-240:]}}
+
+    reconciled = []
+    preserved = []
+    stashed = False
+    if ent.get("reconcileMirror"):
+        remote_ref = f"{{remote}}/{{branch}}"
+        remote_blobs = {{}}
+        r_tree = subprocess.run(["git", "ls-tree", "-r", "-z", remote_ref], cwd=str(repo), capture_output=True, timeout=20, check=False)
+        if r_tree.returncode == 0:
+            for item in r_tree.stdout.split(b"\\x00"):
+                if not item or b"\\t" not in item:
+                    continue
+                mb, pb = item.split(b"\\t", 1)
+                ps = mb.decode("utf-8", errors="ignore").split()
+                if len(ps) >= 3 and ps[1] == "blob":
+                    remote_blobs[pb.decode("utf-8", errors="replace").replace("\\\\", "/")] = ps[2]
+        mirrored = {{}}
+        st_path = Path(str(ent.get("mirrorStatePath") or "/root/.gemini/antigravity/ai_studio_bridge/flight_recorder/live_mirror_state.json")).expanduser()
+        if st_path.is_file():
+            try:
+                loaded = json.loads(st_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict) and isinstance(loaded.get("mirrored"), dict):
+                    mirrored = loaded["mirrored"]
+            except Exception:
+                pass
+        r_st = subprocess.run(["git", "status", "--porcelain", "-z", "-uall"], cwd=str(repo), capture_output=True, timeout=15, check=False)
+        if r_st.returncode == 0:
+            parts = r_st.stdout.split(b"\\x00")
+            i = 0
+            while i < len(parts):
+                row = parts[i]
+                if len(row) >= 4:
+                    code = row[:2].decode("utf-8", errors="ignore")
+                    rel = row[3:].decode("utf-8", errors="replace").replace("\\\\", "/").lstrip("/")
+                    if "R" in code or "C" in code:
+                        i += 1
+                    full = repo / rel
+                    is_untracked = code == "??"
+                    match_mirror = False
+                    match_remote = False
+                    if full.is_file():
+                        raw = full.read_bytes()
+                        if rel in mirrored and hashlib.sha256(raw).hexdigest() == mirrored[rel].get("sha256"):
+                            match_mirror = True
+                        if remote_blobs.get(rel) == git_blob_sha1(raw):
+                            match_remote = True
+                    if match_mirror or match_remote:
+                        if is_untracked:
+                            try:
+                                full.unlink()
+                            except OSError:
+                                pass
+                        else:
+                            subprocess.run(["git", "checkout", "--", rel], cwd=str(repo), capture_output=True, timeout=10, check=False)
+                        reconciled.append(rel)
+                    elif rel:
+                        preserved.append(rel)
+                i += 1
+        if preserved:
+            r_sh = subprocess.run(["git", "stash", "push", "-u", "-m", "omni-ship-preserve"], cwd=str(repo), capture_output=True, text=True, timeout=20, check=False)
+            stashed = r_sh.returncode == 0 and "No local changes" not in (r_sh.stdout or "")
+
+    r_pull = subprocess.run(["git", "pull", "--ff-only", remote, branch], cwd=str(repo), capture_output=True, text=True, timeout=45, check=False)
+    mode = "ff-only"
+    if r_pull.returncode != 0:
+        r_pull = subprocess.run(["git", "pull", "--rebase", remote, branch], cwd=str(repo), capture_output=True, text=True, timeout=45, check=False)
+        mode = "rebase"
+    if stashed:
+        subprocess.run(["git", "stash", "pop"], cwd=str(repo), capture_output=True, text=True, timeout=20, check=False)
+    r_head = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=str(repo), capture_output=True, text=True, timeout=10, check=False)
+    out = {{
+        "alias": alias,
+        "ok": r_pull.returncode == 0,
+        "mode": mode,
+        "head": r_head.stdout.strip(),
+        "reconciled": len(reconciled),
+        "preservedManual": preserved[:10],
+    }}
+    if r_pull.returncode != 0:
+        out["error"] = (r_pull.stderr or r_pull.stdout)[-240:]
+    gpath = str(ent.get("globalPluginPath") or "").strip()
+    if out["ok"] and gpath:
+        out["globalSync"] = sync_global_plugin(repo, Path(gpath).expanduser())
+    return out
+
+results = {{}}
+with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(ENTRIES))) as pool:
+    futs = {{pool.submit(sync_one, e): e.get("alias", "") for e in ENTRIES}}
+    for fut in concurrent.futures.as_completed(futs):
+        a = futs[fut]
+        try:
+            results[a] = fut.result()
+        except Exception as exc:
+            results[a] = {{"alias": a, "ok": False, "error": str(exc)}}
+print(json.dumps({{"ok": all(v.get("ok") for v in results.values()), "repos": results}}, separators=(",", ":")))
+""".strip()
+
+
+def sync_termux_repos_batch(
+    repo_entries: list[dict[str, Any]],
+    *,
+    timeout_sec: int = 18,
+    url_arg: str = "",
+    pair_secret_arg: str = "",
+    admin_key_arg: str = "",
+    progress_cb: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
+    """Sync 1..N Termux repos in ONE batched parallel RPC with bounded wait (never hangs `ship`)."""
+    valid = [e for e in repo_entries if str(e.get("termuxPath") or "").strip()]
+    if not valid:
+        return {"attempted": False, "ok": True, "reason": "no_repos"}
+    t0 = time.monotonic()
     try:
         import bridge_auth as bauth
         import omni_agent_client as oac
 
-        conn = bauth.resolve_connection()
+        conn = bauth.resolve_connection(
+            cli_url=url_arg,
+            cli_pair_secret=pair_secret_arg,
+            cli_admin_key=admin_key_arg,
+        )
         if not (conn["relayUrl"] and conn["pairSecret"]):
-            return {"attempted": False, "reason": "no_pair_secret"}
+            return {"attempted": False, "ok": True, "reason": "no_pair_secret"}
         if not oac._is_channel_online(conn["relayUrl"], conn["pairSecret"], "termux", conn["adminKey"]):
-            return {"attempted": False, "reason": "termux_offline"}
-        # Pull if repo already cloned on Termux (fast & safe; never fails the GitHub push)
-        global_sync_snippet = ""
-        if global_plugin_path:
-            global_sync_snippet = (
-                f" && if [ -f {termux_path}/scripts/plan_tool.py ]; then "
-                f"python3 -B {termux_path}/scripts/plan_tool.py evolve sync-all --apply >/dev/null 2>&1 || true; fi"
+            return {"attempted": False, "ok": True, "reason": "termux_offline"}
+
+        aliases = [str(e.get("alias") or "") for e in valid]
+        script = _build_termux_batch_sync_script(valid)
+        script_b64 = base64.b64encode(script.encode("utf-8")).decode("ascii")
+        cmd = f"python3 -B -c \"import base64; exec(base64.b64decode('{script_b64}').decode('utf-8'))\""
+
+        if int(timeout_sec) <= 0:
+            if progress_cb:
+                progress_cb(f"termux: dispatching async batch sync for {','.join(aliases)}...")
+            req_id = oac.enqueue_agent_command(
+                conn["relayUrl"],
+                conn["pairSecret"],
+                "shell_exec",
+                {"command": cmd, "timeoutSec": 60},
+                channel="termux",
+                admin_key=conn["adminKey"],
             )
-        cmd = (
-            f"if [ -d {termux_path}/.git ]; then "
-            f"git -C {termux_path} fetch origin && git -C {termux_path} pull --rebase origin {branch} "
-            f"&& git -C {termux_path} rev-parse --short HEAD{global_sync_snippet}; "
-            f"else echo NOT_CLONED:{owner_repo}; fi"
-        )
-        r = oac.send_agent_command(
-            conn["relayUrl"],
-            conn["pairSecret"],
-            "shell_exec",
-            {"command": cmd, "timeoutSec": 60},
-            channel="termux",
-            admin_key=conn["adminKey"],
-            timeout_sec=70,
-        )
-        out = str(r.get("stdout") or "").strip()
-        return {"attempted": True, "ok": bool(r.get("ok")), "output": out[-240:]}
+            return {
+                "attempted": True,
+                "ok": True,
+                "mode": "async_queued",
+                "requestId": req_id,
+                "repos": aliases,
+                "elapsedMs": int((time.monotonic() - t0) * 1000),
+            }
+
+        if progress_cb:
+            progress_cb(f"termux: batch-pulling {','.join(aliases)} (max wait {timeout_sec}s)...")
+        try:
+            r = oac.send_agent_command(
+                conn["relayUrl"],
+                conn["pairSecret"],
+                "shell_exec",
+                {"command": cmd, "timeoutSec": 60},
+                channel="termux",
+                admin_key=conn["adminKey"],
+                timeout_sec=int(timeout_sec),
+                auto_wake=False,
+            )
+        except TimeoutError:
+            elapsed_ms = int((time.monotonic() - t0) * 1000)
+            if progress_cb:
+                progress_cb(f"termux: still running after {timeout_sec}s — continuing (sync completes on phone in background)")
+            return {
+                "attempted": True,
+                "ok": True,
+                "mode": "async_queued",
+                "repos": aliases,
+                "elapsedMs": elapsed_ms,
+                "note": f"Dispatched to Termux; continuing after {timeout_sec}s bounded wait.",
+            }
+
+        parsed = None
+        if r.get("ok"):
+            lines = [ln.strip() for ln in str(r.get("stdout") or "").splitlines() if ln.strip()]
+            if lines:
+                try:
+                    parsed = json.loads(lines[-1])
+                except Exception:
+                    parsed = None
+        elapsed_ms = int((time.monotonic() - t0) * 1000)
+        if isinstance(parsed, dict):
+            return {
+                "attempted": True,
+                "ok": bool(parsed.get("ok")),
+                "mode": "batched_sync",
+                "repos": parsed.get("repos") or {},
+                "elapsedMs": elapsed_ms,
+            }
+        return {
+            "attempted": True,
+            "ok": bool(r.get("ok")),
+            "mode": "batched_sync",
+            "output": str(r.get("stdout") or r.get("stderr") or r.get("error") or "")[-240:],
+            "elapsedMs": elapsed_ms,
+        }
     except Exception as exc:
-        return {"attempted": True, "ok": False, "error": str(exc)}
+        return {
+            "attempted": True,
+            "ok": False,
+            "error": str(exc),
+            "elapsedMs": int((time.monotonic() - t0) * 1000),
+        }
+
+
+def _try_sync_termux_repo(spec: dict[str, Any], branch: str, *, timeout_sec: int = 18) -> dict[str, Any]:
+    termux_path = str(spec.get("termuxPath") or "").strip()
+    if not termux_path:
+        return {"attempted": False}
+    owner_repo = str(spec.get("ownerRepo") or "").strip()
+    alias = owner_repo.split("/")[-1].lower() if owner_repo else "repo"
+    entry = {
+        "alias": alias,
+        "termuxPath": termux_path,
+        "branch": branch,
+        "remote": "origin",
+        "reconcileMirror": alias == "cavern",
+        "globalPluginPath": str(spec.get("termuxGlobalPluginPath") or "").strip(),
+    }
+    res = sync_termux_repos_batch([entry], timeout_sec=timeout_sec)
+    if isinstance(res.get("repos"), dict) and alias in res["repos"]:
+        sub = res["repos"][alias]
+        return {
+            "attempted": True,
+            "ok": bool(sub.get("ok")),
+            "mode": res.get("mode", "batched_sync"),
+            "head": sub.get("head", ""),
+            "elapsedMs": res.get("elapsedMs", 0),
+            **({"error": sub["error"]} if sub.get("error") else {}),
+            **({"globalSync": sub["globalSync"]} if sub.get("globalSync") else {}),
+        }
+    return res
 
 
 def _read_plugin_version(plugin_dir: Path) -> str:
@@ -813,10 +1079,13 @@ def auto_sync_plugin_fleet(
     *,
     force: bool = False,
     no_sync_termux: bool = False,
+    termux_timeout_sec: int = 18,
     manifest_path: Path | None = None,
     mount_root: Path | None = None,
+    progress_cb: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
-    """Automatically mirror newer embedded plugin from active Cavern workspace -> fractal & omniagent and push."""
+    """Mirror newer embedded plugin from Cavern -> fractal & omniagent locally, then push both in PARALLEL."""
+    t0 = time.monotonic()
     ws = Path(workspace_root).resolve()
     manifest = load_manifest(ws, manifest_path)
     mroot = get_mount_root(manifest, mount_root)
@@ -824,14 +1093,14 @@ def auto_sync_plugin_fleet(
     fractal_dir = get_repo_path("fractal", ws, manifest, mroot)
     omni_dir = get_repo_path("omniagent", ws, manifest, mroot)
     if not cavern_plugin.is_dir() or not fractal_dir.is_dir():
-        return {"attempted": False, "ok": True, "reason": "federation_not_hydrated"}
+        return {"attempted": False, "ok": True, "reason": "federation_not_hydrated", "pushedAliases": []}
 
     cav_ver = _read_plugin_version(cavern_plugin)
     frac_ver = _read_plugin_version(fractal_dir)
     omni_ver = _read_plugin_version(omni_dir / ".agents" / "plugins" / "dynamic-fractal-planner") if omni_dir.is_dir() else ""
 
     if not force and _semver_tuple(cav_ver) < _semver_tuple(frac_ver):
-        return {"attempted": False, "ok": True, "reason": f"fractal_newer({frac_ver}>{cav_ver})"}
+        return {"attempted": False, "ok": True, "reason": f"fractal_newer({frac_ver}>{cav_ver})", "pushedAliases": []}
 
     out: dict[str, Any] = {
         "attempted": True,
@@ -839,44 +1108,79 @@ def auto_sync_plugin_fleet(
         "version": cav_ver,
         "before": {"cavern": cav_ver, "fractal": frac_ver, "omniagent": omni_ver},
         "pushes": {},
+        "pushedAliases": [],
     }
 
-    # 1. Mirror Cavern embedded plugin -> standalone fractal repo
+    # 1. Perform BOTH local mirror copies first (<0.1s) so fractal & omniagent GitHub pushes can run in PARALLEL!
     m1 = sync_mirrors(ws, from_repo="cavern", mirror_name="fractal-embedded-plugin", apply=True, manifest_path=manifest_path, mount_root=mroot)
     c1 = sum(int(r.get("changedCount") or 0) for r in (m1.get("mirrors") or []))
-    if c1 > 0 or force:
-        # Push fractal WITHOUT [skip ci] so ReleasePlugin.yml tests & publishes GitHub Release v<ver>
-        p_frac = push_federated_repo(
-            "fractal",
-            f"chore(plugin): sync dynamic-fractal-planner v{cav_ver}",
-            ws,
-            manifest_path=manifest_path,
-            mount_root=mount_root,
-            sync_deletes=False,
-            no_sync_termux=no_sync_termux,
-        )
-        out["pushes"]["fractal"] = p_frac
-        if not p_frac.get("ok"):
-            out["ok"] = False
-
-    # 2. Mirror standalone fractal repo -> OmniAgent embedded copy (skip ci to avoid pointless APK build)
+    c2 = 0
     if omni_dir.is_dir():
         m2 = sync_mirrors(ws, from_repo="fractal", mirror_name="fractal-embedded-plugin-omniagent", apply=True, manifest_path=manifest_path, mount_root=mroot)
         c2 = sum(int(r.get("changedCount") or 0) for r in (m2.get("mirrors") or []))
-        if c2 > 0 or (force and _semver_tuple(omni_ver) < _semver_tuple(cav_ver)):
-            p_oa = push_federated_repo(
-                "omniagent",
-                f"chore(plugin): sync dynamic-fractal-planner v{cav_ver} [skip ci]",
-                ws,
-                manifest_path=manifest_path,
-                mount_root=mount_root,
-                sync_deletes=False,
-                no_sync_termux=no_sync_termux,
-            )
-            out["pushes"]["omniagent"] = p_oa
-            if not p_oa.get("ok"):
-                out["ok"] = False
 
+    push_jobs: list[tuple[str, str]] = []
+    if c1 > 0 or force:
+        # Push fractal WITHOUT [skip ci] so ReleasePlugin.yml tests & publishes GitHub Release v<ver>
+        push_jobs.append(("fractal", f"chore(plugin): sync dynamic-fractal-planner v{cav_ver}"))
+    if omni_dir.is_dir() and (c2 > 0 or force or _semver_tuple(omni_ver) < _semver_tuple(cav_ver)):
+        # Push omniagent WITH [skip ci] to avoid pointless APK rebuild on plugin sync
+        push_jobs.append(("omniagent", f"chore(plugin): sync dynamic-fractal-planner v{cav_ver} [skip ci]"))
+
+    if push_jobs:
+        if progress_cb:
+            progress_cb(f"plugin-fleet: pushing {', '.join(a for a, _ in push_jobs)} in parallel (mirrored fractal={c1}, omniagent={c2})...")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(push_jobs)) as pool:
+            futs = {
+                pool.submit(
+                    push_federated_repo,
+                    alias,
+                    msg,
+                    ws,
+                    manifest_path=manifest_path,
+                    mount_root=mount_root,
+                    sync_deletes=False,
+                    no_sync_termux=True,
+                    progress_cb=progress_cb,
+                ): alias
+                for alias, msg in push_jobs
+            }
+            for fut in concurrent.futures.as_completed(futs):
+                alias = futs[fut]
+                try:
+                    res = fut.result()
+                except Exception as exc:
+                    res = {"ok": False, "error": str(exc)}
+                out["pushes"][alias] = res
+                if res.get("ok"):
+                    if int(res.get("changedCount") or 0) > 0 or int(res.get("deletedCount") or 0) > 0:
+                        out["pushedAliases"].append(alias)
+                else:
+                    out["ok"] = False
+
+    out["pushedAliases"] = sorted(out["pushedAliases"])
+
+    # If invoked standalone (not deferred by cmd_ship), sync all pushed repos on Termux in ONE batched RPC.
+    if not no_sync_termux and out["pushedAliases"]:
+        repos_cfg = manifest.get("repos") or {}
+        batch_entries = [
+            {
+                "alias": a,
+                "termuxPath": str((repos_cfg.get(a) or {}).get("termuxPath") or ""),
+                "branch": str((repos_cfg.get(a) or {}).get("branch") or "main"),
+                "remote": "origin",
+                "reconcileMirror": False,
+                "globalPluginPath": str((repos_cfg.get(a) or {}).get("termuxGlobalPluginPath") or ""),
+            }
+            for a in out["pushedAliases"]
+        ]
+        out["termuxSync"] = sync_termux_repos_batch(
+            batch_entries,
+            timeout_sec=termux_timeout_sec,
+            progress_cb=progress_cb,
+        )
+
+    out["elapsedMs"] = int((time.monotonic() - t0) * 1000)
     return out
 
 
@@ -1013,13 +1317,12 @@ def main(argv: list[str] | None = None) -> int:
         aliases = list((manifest.get("repos") or {}).keys())
         targets = aliases if args.target == "all" else [args.target]
         tok = lcap.get_secret("GITHUB_TOKEN", aliases=("GH_TOKEN",))
-        out: dict[str, Any] = {}
-        for a in targets:
+
+        def _diff_one(a: str) -> dict[str, Any]:
             spec = manifest["repos"][a]
             rpath = get_repo_path(a, ws, manifest, mroot)
             if not rpath.is_dir():
-                out[a] = {"ok": False, "error": f"Not hydrated at {rpath}"}
-                continue
+                return {"ok": False, "error": f"Not hydrated at {rpath}"}
             d = ghdirect.diff_workspace_against_github(
                 rpath,
                 owner_repo=spec["ownerRepo"],
@@ -1027,7 +1330,7 @@ def main(argv: list[str] | None = None) -> int:
                 token=tok,
                 sync_deletes=True,
             )
-            out[a] = {
+            return {
                 "ok": True,
                 "ownerRepo": spec["ownerRepo"],
                 "branch": spec.get("branch", "main"),
@@ -1036,30 +1339,84 @@ def main(argv: list[str] | None = None) -> int:
                 "changed": d["changed"],
                 "deleted": d["deleted"],
             }
-        print(json.dumps({"ok": True, "diffs": out}, indent=2, ensure_ascii=False))
+
+        out: dict[str, Any] = {}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(targets))) as pool:
+            futs = {pool.submit(_diff_one, a): a for a in targets}
+            for fut in concurrent.futures.as_completed(futs):
+                a = futs[fut]
+                try:
+                    out[a] = fut.result()
+                except Exception as exc:
+                    out[a] = {"ok": False, "error": str(exc)}
+        ordered = {a: out[a] for a in targets if a in out}
+        print(json.dumps({"ok": True, "diffs": ordered}, indent=2, ensure_ascii=False), flush=True)
         return 0
 
     if action == "push":
         manifest = load_manifest(ws)
         aliases = list((manifest.get("repos") or {}).keys())
         targets = aliases if args.target == "all" else [args.target]
+        t_start = time.monotonic()
+
+        def _cb(msg: str) -> None:
+            print(f"[repos +{time.monotonic() - t_start:.1f}s] {msg}", file=sys.stderr, flush=True)
+
         pushed: dict[str, Any] = {}
         all_ok = True
-        for a in targets:
-            r = push_federated_repo(
-                a,
-                args.commit,
-                ws,
-                mount_root=mroot,
-                sync_deletes=bool(args.sync_deletes),
-                no_sync_termux=bool(args.no_sync_termux),
-                explicit_files=args.files,
-                explicit_deletes=args.delete,
-            )
-            pushed[a] = r
-            if not r.get("ok"):
-                all_ok = False
-        print(json.dumps({"ok": all_ok, "pushed": pushed}, indent=2, ensure_ascii=False))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(targets))) as pool:
+            futs = {
+                pool.submit(
+                    push_federated_repo,
+                    a,
+                    args.commit,
+                    ws,
+                    mount_root=mroot,
+                    sync_deletes=bool(args.sync_deletes),
+                    no_sync_termux=True,
+                    explicit_files=args.files,
+                    explicit_deletes=args.delete,
+                    progress_cb=_cb,
+                ): a
+                for a in targets
+            }
+            for fut in concurrent.futures.as_completed(futs):
+                a = futs[fut]
+                try:
+                    r = fut.result()
+                except Exception as exc:
+                    r = {"ok": False, "error": str(exc)}
+                pushed[a] = r
+                if not r.get("ok"):
+                    all_ok = False
+
+        termux_batch: dict[str, Any] | None = None
+        if not bool(args.no_sync_termux):
+            pushed_aliases = [
+                a for a in targets
+                if pushed.get(a, {}).get("ok")
+                and (int(pushed[a].get("changedCount") or 0) > 0 or int(pushed[a].get("deletedCount") or 0) > 0)
+            ]
+            if pushed_aliases:
+                repos_cfg = manifest.get("repos") or {}
+                batch_entries = [
+                    {
+                        "alias": a,
+                        "termuxPath": str((repos_cfg.get(a) or {}).get("termuxPath") or ""),
+                        "branch": str((repos_cfg.get(a) or {}).get("branch") or "main"),
+                        "remote": "origin",
+                        "reconcileMirror": a == "cavern",
+                        "globalPluginPath": str((repos_cfg.get(a) or {}).get("termuxGlobalPluginPath") or ""),
+                    }
+                    for a in pushed_aliases
+                ]
+                termux_batch = sync_termux_repos_batch(batch_entries, timeout_sec=18, progress_cb=_cb)
+
+        ordered_pushed = {a: pushed[a] for a in targets if a in pushed}
+        payload_out: dict[str, Any] = {"ok": all_ok, "pushed": ordered_pushed}
+        if termux_batch is not None:
+            payload_out["termuxSync"] = termux_batch
+        print(json.dumps(payload_out, indent=2, ensure_ascii=False), flush=True)
         return 0 if all_ok else 1
 
     if action == "sync-mirrors":

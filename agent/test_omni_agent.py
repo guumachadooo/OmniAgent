@@ -1435,6 +1435,261 @@ class OmniAgentProtocolTests(unittest.TestCase):
         self.assertFalse(w3["alive"])
         self.assertEqual(w3["state"], "UNRESPONSIVE_ANR")
 
+    def test_github_direct_parallel_blob_upload_retry_and_precomputed_diff(self) -> None:
+        import base64
+        import threading
+        from unittest import mock
+        import github_direct as ghdirect
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            files = [f"f_{i}.txt" for i in range(6)]
+            for idx, fn in enumerate(files):
+                (root / fn).write_text(f"payload-{idx}\n", encoding="utf-8")
+
+            precomputed = {
+                "headSha": "a" * 40,
+                "baseTreeSha": "b" * 40,
+                "ghBlobs": {"old.txt": ("c" * 40, "100644")},
+                "changed": files,
+                "deleted": ["old.txt"],
+            }
+            lock = threading.Lock()
+            blob_calls: dict[str, int] = {}
+            captured_tree: list[dict] = []
+
+            def _fake_gh_request(method, path, token, body=None, timeout=45):
+                if path.endswith("/git/blobs"):
+                    raw = base64.b64decode(body["content"]).decode("utf-8").strip()
+                    with lock:
+                        blob_calls[raw] = blob_calls.get(raw, 0) + 1
+                        attempt = blob_calls[raw]
+                    # Inject one transient 503 on payload-2 to verify retry
+                    if raw == "payload-2" and attempt == 1:
+                        return 503, {"message": "Service Unavailable"}
+                    return 201, {"sha": f"blob_{raw}"}
+                if path.endswith("/git/trees"):
+                    captured_tree.extend(body["tree"])
+                    return 201, {"sha": "t" * 40}
+                if path.endswith("/git/commits"):
+                    return 201, {"sha": "d" * 40}
+                if "/git/refs/heads/" in path:
+                    return 200, {"ref": "refs/heads/master"}
+                raise AssertionError(f"Unexpected GH API call: {method} {path}")
+
+            progress_msgs: list[str] = []
+            with mock.patch.object(ghdirect, "_gh_request", side_effect=_fake_gh_request), \
+                 mock.patch.object(ghdirect, "diff_workspace_against_github", side_effect=AssertionError("Should reuse precomputed_diff")), \
+                 mock.patch.object(ghdirect.time, "sleep", return_value=None):
+                res = ghdirect.push_workspace_direct(
+                    root,
+                    "feat: parallel blobs",
+                    owner_repo="guumachadooo/Cavern",
+                    branch="master",
+                    token="ghp_test",
+                    precomputed_diff=precomputed,
+                    max_blob_workers=4,
+                    progress_cb=progress_msgs.append,
+                )
+
+            self.assertTrue(res["ok"])
+            self.assertEqual(res["head"], "dddddddd")
+            self.assertEqual(res["changedCount"], 6)
+            self.assertEqual(res["deletedCount"], 1)
+            self.assertEqual(blob_calls["payload-2"], 2)  # retried once after 503
+            # Deterministic tree ordering: changed files in exact order, then delete tombstone
+            self.assertEqual([e["path"] for e in captured_tree], files + ["old.txt"])
+            self.assertIsNone(captured_tree[-1]["sha"])
+            self.assertIn("blobs", res["timingsMs"])
+            self.assertGreaterEqual(len(progress_msgs), 2)
+
+    def test_repo_federation_parallel_plugin_fleet_and_batched_termux_sync(self) -> None:
+        import shutil
+        import subprocess
+        import threading
+        from unittest import mock
+        import repo_federation as rfed
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ws_cav = root / "ws_cavern"
+            mount = root / "mount"
+            (ws_cav / "Cavern").mkdir(parents=True)
+            (ws_cav / "Cavern" / "Cavern.csproj").write_text("<Project/>", encoding="utf-8")
+            (ws_cav / "CavernSamples" / "CavernizeAndroid").mkdir(parents=True)
+            (ws_cav / "CavernSamples" / "CavernizeAndroid" / "CavernizeAndroid.csproj").write_text("<Project/>", encoding="utf-8")
+            (ws_cav / ".agents" / "plugins" / "dynamic-fractal-planner" / "scripts").mkdir(parents=True)
+            (ws_cav / ".agents" / "plugins" / "dynamic-fractal-planner" / "plugin.json").write_text('{"version":"2.21.0"}', encoding="utf-8")
+            (ws_cav / ".agents" / "plugins" / "dynamic-fractal-planner" / "scripts" / "verify_universal.py").write_text("# v2.21", encoding="utf-8")
+
+            (mount / "fractal" / "scripts").mkdir(parents=True)
+            (mount / "fractal" / "plugin.json").write_text('{"version":"2.20.0"}', encoding="utf-8")
+            (mount / "fractal" / "scripts" / "verify_universal.py").write_text("# v2.20", encoding="utf-8")
+            (mount / "omniagent" / ".agents" / "plugins" / "dynamic-fractal-planner" / "scripts").mkdir(parents=True)
+            (mount / "omniagent" / ".agents" / "plugins" / "dynamic-fractal-planner" / "plugin.json").write_text('{"version":"2.20.0"}', encoding="utf-8")
+
+            manifest = rfed.load_manifest()
+            pushed_calls: list[tuple[str, bool]] = []
+            lock = threading.Lock()
+
+            def _fake_push(alias, msg, ws, **kwargs):
+                with lock:
+                    pushed_calls.append((alias, bool(kwargs.get("no_sync_termux"))))
+                return {"ok": True, "head": f"{alias[:4]}1234", "changedCount": 2, "deletedCount": 0}
+
+            with mock.patch.object(rfed, "load_manifest", return_value=manifest), \
+                 mock.patch.object(rfed, "push_federated_repo", side_effect=_fake_push):
+                fl = rfed.auto_sync_plugin_fleet(ws_cav, force=True, no_sync_termux=True, mount_root=mount)
+
+            self.assertTrue(fl["ok"])
+            self.assertEqual(fl["pushedAliases"], ["fractal", "omniagent"])
+            self.assertEqual(sorted(a for a, _ in pushed_calls), ["fractal", "omniagent"])
+            self.assertTrue(all(no_sync for _, no_sync in pushed_calls))
+            # Verify BOTH fractal and omniagent received mirrored plugin.json BEFORE push
+            self.assertIn("2.21.0", (mount / "fractal" / "plugin.json").read_text(encoding="utf-8"))
+            self.assertIn("2.21.0", (mount / "omniagent" / ".agents" / "plugins" / "dynamic-fractal-planner" / "plugin.json").read_text(encoding="utf-8"))
+
+            # Verify sync_termux_repos_batch: (a) fire-and-forget when timeout_sec=0, (b) graceful async_queued on TimeoutError
+            fake_conn = {"relayUrl": "https://relay.test", "pairSecret": self.KEY, "adminKey": ""}
+            entries = [{"alias": "cavern", "termuxPath": "/tmp/fake_cavern", "branch": "master", "remote": "origin", "reconcileMirror": True}]
+            with mock.patch.object(bauth, "resolve_connection", return_value=fake_conn), \
+                 mock.patch.object(oac, "_is_channel_online", return_value=True), \
+                 mock.patch.object(oac, "enqueue_agent_command", return_value="req_async_1") as m_enq:
+                r_async = rfed.sync_termux_repos_batch(entries, timeout_sec=0)
+            self.assertTrue(r_async["ok"])
+            self.assertEqual(r_async["mode"], "async_queued")
+            self.assertEqual(r_async["requestId"], "req_async_1")
+            m_enq.assert_called_once()
+
+            with mock.patch.object(bauth, "resolve_connection", return_value=fake_conn), \
+                 mock.patch.object(oac, "_is_channel_online", return_value=True), \
+                 mock.patch.object(oac, "send_agent_command", side_effect=TimeoutError("slow phone")):
+                r_to = rfed.sync_termux_repos_batch(entries, timeout_sec=5)
+            self.assertTrue(r_to["ok"])
+            self.assertEqual(r_to["mode"], "async_queued")
+
+            # Verify _build_termux_batch_sync_script executes real pull + global plugin sync cleanly
+            if shutil.which("git"):
+                bare = root / "frac.git"
+                seed = root / "frac_seed"
+                phone_frac = root / "phone_frac"
+                global_plug = root / "global_plug"
+                subprocess.run(["git", "init", "--bare", str(bare)], check=True, capture_output=True)
+                subprocess.run(["git", "clone", str(bare), str(seed)], check=True, capture_output=True)
+                subprocess.run(["git", "config", "user.email", "t@local"], cwd=str(seed), check=True, capture_output=True)
+                subprocess.run(["git", "config", "user.name", "Test"], cwd=str(seed), check=True, capture_output=True)
+                subprocess.run(["git", "checkout", "-b", "main"], cwd=str(seed), check=True, capture_output=True)
+                (seed / "plugin.json").write_text('{"version":"2.20.0"}', encoding="utf-8")
+                (seed / ".github" / "workflows").mkdir(parents=True)
+                (seed / ".github" / "workflows" / "ReleasePlugin.yml").write_text("name: rel\n", encoding="utf-8")
+                subprocess.run(["git", "add", "."], cwd=str(seed), check=True, capture_output=True)
+                subprocess.run(["git", "commit", "-m", "v1"], cwd=str(seed), check=True, capture_output=True)
+                subprocess.run(["git", "push", "-u", "origin", "main"], cwd=str(seed), check=True, capture_output=True)
+                subprocess.run(["git", "clone", "-b", "main", str(bare), str(phone_frac)], check=True, capture_output=True)
+                (seed / "plugin.json").write_text('{"version":"2.21.0"}', encoding="utf-8")
+                subprocess.run(["git", "add", "."], cwd=str(seed), check=True, capture_output=True)
+                subprocess.run(["git", "commit", "-m", "v2"], cwd=str(seed), check=True, capture_output=True)
+                subprocess.run(["git", "push", "origin", "main"], cwd=str(seed), check=True, capture_output=True)
+
+                script = rfed._build_termux_batch_sync_script([
+                    {
+                        "alias": "fractal",
+                        "termuxPath": str(phone_frac),
+                        "branch": "main",
+                        "remote": "origin",
+                        "reconcileMirror": False,
+                        "globalPluginPath": str(global_plug),
+                    }
+                ])
+                proc = subprocess.run([sys.executable, "-B", "-c", script], capture_output=True, text=True, check=True)
+                out = json.loads(proc.stdout.strip().splitlines()[-1])
+                self.assertTrue(out["ok"], out)
+                self.assertIn("2.21.0", (global_plug / "plugin.json").read_text(encoding="utf-8"))
+                self.assertFalse((global_plug / ".github" / "workflows" / "ReleasePlugin.yml").exists())
+
+    def test_cmd_ship_scoped_verify_precomputed_diff_and_batched_termux(self) -> None:
+        import argparse
+        import io
+        import subprocess
+        from unittest import mock
+        import github_direct as ghdirect
+        import repo_federation as rfed
+
+        fake_diff = {
+            "headSha": "1" * 40,
+            "baseTreeSha": "2" * 40,
+            "ghBlobs": {},
+            "changed": [".agents/agent/omni_agent_client.py"],
+            "deleted": [],
+        }
+        sp_cmds: list[list[str]] = []
+
+        def _fake_sp_run(cmd, **kwargs):
+            sp_cmds.append(list(cmd))
+            return subprocess.CompletedProcess(cmd, 0, stdout="OK", stderr="")
+
+        def _fake_push_impl(push_ns, *, precomputed_diff=None, progress_cb=None, emit_json=True):
+            self.assertIs(precomputed_diff, fake_diff)
+            self.assertTrue(push_ns.no_sync_termux)
+            if progress_cb:
+                progress_cb("mocked push ok")
+            return 0, {
+                "ok": True,
+                "head": "abcd1234",
+                "headFull": "abcd1234" + "0" * 32,
+                "changedCount": 1,
+                "deletedCount": 0,
+            }
+
+        ship_args = argparse.Namespace(
+            workspace=str(oac.REPO_ROOT),
+            commit="perf(ship): test fast ship",
+            next_step="Continue W55.1b",
+            owner_repo="guumachadooo/Cavern",
+            branch="master",
+            via="auto",
+            sync_deletes=True,
+            auto_skip_ci=True,
+            no_verify=False,
+            full_verify=False,
+            no_sync_termux=False,
+            termux_timeout=12,
+            no_close_fr=True,
+            url="",
+            pair_secret="",
+            admin_key="",
+            channel="auto",
+            repo="",
+            timeout=120,
+        )
+
+        stdout_buf = io.StringIO()
+        stderr_buf = io.StringIO()
+        with mock.patch.object(ghdirect, "diff_workspace_against_github", return_value=fake_diff) as m_diff, \
+             mock.patch.object(subprocess, "run", side_effect=_fake_sp_run), \
+             mock.patch.object(oac, "_push_workspace_impl", side_effect=_fake_push_impl), \
+             mock.patch.object(rfed, "sync_termux_repos_batch", return_value={"attempted": True, "ok": True, "mode": "batched_sync"}) as m_tsync, \
+             mock.patch("sys.stdout", stdout_buf), \
+             mock.patch("sys.stderr", stderr_buf):
+            rc = oac.cmd_ship(ship_args)
+
+        self.assertEqual(rc, 0)
+        m_diff.assert_called_once()
+        # Verify verify_universal ran with scoped --files instead of --all!
+        vu_calls = [c for c in sp_cmds if any("verify_universal.py" in x for x in c)]
+        self.assertEqual(len(vu_calls), 1)
+        self.assertIn("--files", vu_calls[0])
+        self.assertNotIn("--all", vu_calls[0])
+        self.assertIn(".agents/agent/omni_agent_client.py", vu_calls[0])
+        # Verify single batched Termux sync with configured timeout
+        m_tsync.assert_called_once()
+        self.assertEqual(m_tsync.call_args.kwargs["timeout_sec"], 12)
+        # Verify progress logs emitted to stderr and timings JSON emitted to stdout
+        self.assertIn("[ship +", stderr_buf.getvalue())
+        parsed = json.loads(stdout_buf.getvalue())
+        self.assertIn("shipTimingsMs", parsed)
+        self.assertEqual(parsed["head"], "abcd1234")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
