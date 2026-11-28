@@ -490,9 +490,9 @@ class BugHunterUnitTests(unittest.TestCase):
                 if name == "ui_audit":
                     return {"ok": True, "elapsedMs": 10, "body": "{}", "json": {"checks": []}, "error": ""}
                 if name == "ui_tree":
-                    # Inject a real Q1 button ellipsis defect on Tab 4
+                    # Inject a real Q1 button ellipsis defect on Tab 2 (Export in V4 3-tab shell)
                     children = []
-                    if self.active_tab == 4:
+                    if self.active_tab == 2:
                         children.append({
                             "type": "Button", "text": "A/B Compare: ACTIVE", "clickable": True,
                             "x": 40, "y": 100, "w": 220, "h": 128, "ell": 7, "ellMode": "end", "fg": -1, "sp": 13.0,
@@ -516,10 +516,10 @@ class BugHunterUnitTests(unittest.TestCase):
             rep_seed = h_seed.run_hunt(selected_vectors=["V6"])
             self.assertTrue(rep_seed["ok"])
             ui_tree_calls = [a for n, a in fb_seed.history if n == "ui_tree"]
-            self.assertEqual(len(ui_tree_calls), 5)
+            self.assertEqual(len(ui_tree_calls), 3)
             self.assertTrue(all(a.get("geometry") is True and a.get("maxDepth") == 12 for a in ui_tree_calls))
 
-            # Second run detects BOTH Q1 Tab4 button ellipsis AND Tab2 Golden SSIM regression
+            # Second run detects BOTH Q1 Tab2 button ellipsis AND Tab2 Golden SSIM regression
             fb_chk = V6Q1MockBridge(fail_tab2_ssim=True)
             h_chk = bh.LiveBugHunter(fb_chk, mode="quick", allow_mutate=False, verbose=False, golden_dir=td, update_goldens=False)
             rep_chk = h_chk.run_hunt(selected_vectors=["V6"])
@@ -1089,6 +1089,9 @@ class BugHunterUnitTests(unittest.TestCase):
         src = (AGENT_DIR / "cavern_bug_hunter.py").read_text(encoding="utf-8")
         self.assertIn('"Tab0:PlayButton"', src)
         self.assertIn('"type": "FrameLayout", "text": "Play"', src)
+        self.assertIn('"Tab2:ExportButton"', src)
+        self.assertIn('((0, "Tab0"), (1, "Tab1"), (2, "Tab2"))', src)
+        self.assertNotIn('"Tab4:SettingsButton"', src)
 
 
 if __name__ == "__main__":
